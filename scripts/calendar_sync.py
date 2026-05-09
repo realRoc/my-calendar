@@ -14,7 +14,7 @@ import json
 import sys
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,7 @@ import objc
 from EventKit import (  # type: ignore[import-not-found]
     EKEventStore,
     EKEvent,
+    EKAlarm,
     EKCalendar,
     EKEntityTypeEvent,
     EKSpanThisEvent,
@@ -129,8 +130,13 @@ def _to_nsdate(d: date) -> NSDate:
 
 
 def _next_day_nsdate(d: date) -> NSDate:
-    from datetime import timedelta
     return _to_nsdate(d + timedelta(days=1))
+
+
+def _make_immediate_alarm() -> EKAlarm:
+    """Alarm firing ~10s after now — gives macOS a small buffer to register and pop the notification."""
+    fire_at = datetime.now() + timedelta(seconds=10)
+    return EKAlarm.alarmWithAbsoluteDate_(NSDate.dateWithTimeIntervalSince1970_(fire_at.timestamp()))
 
 
 def upsert_events(
@@ -156,7 +162,8 @@ def upsert_events(
         if existing_id:
             ek_event = store.eventWithIdentifier_(existing_id)
 
-        if ek_event is None:
+        is_new = ek_event is None
+        if is_new:
             ek_event = EKEvent.eventWithEventStore_(store)
             ek_event.setCalendar_(cal)
             action = "created"
@@ -168,6 +175,11 @@ def upsert_events(
         ek_event.setStartDate_(_to_nsdate(e.on_date))
         ek_event.setEndDate_(_next_day_nsdate(e.on_date))
         ek_event.setAllDay_(True)
+
+        if is_new:
+            # Pop a system notification ~10s after creation. Only on initial create —
+            # re-syncs of an existing event don't re-fire the alarm.
+            ek_event.addAlarm_(_make_immediate_alarm())
 
         ok, err = store.saveEvent_span_error_(ek_event, EKSpanThisEvent, None)
         if not ok:
