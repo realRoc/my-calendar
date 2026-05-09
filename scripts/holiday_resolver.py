@@ -60,6 +60,8 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 def load_holidays(root: Path) -> list[Holiday]:
     out: list[Holiday] = []
     for path in sorted((root / "holidays").rglob("*.md")):
+        if path.name == "README.md":
+            continue                              # placeholder docs, not holiday data
         try:
             fm, _body = _parse_frontmatter(path.read_text(encoding="utf-8"))
         except Exception as e:
