@@ -51,11 +51,17 @@ my-calendar/
 │   └── YYYY/                       # 按年分目录
 ├── scripts/
 │   ├── holiday_resolver.py         # 解析阴历/可变日期、列出未来 N 天节日
-│   ├── calendar_sync.py            # EventKit 写入苹果日历
-│   ├── daily_check.py              # 每日入口：解析+查历史+写日历
-│   └── state.json                  # 已创建事件 ID 索引（去重用）
+│   ├── calendar_sync.py            # EventKit 写入苹果日历（支持多日历名）
+│   ├── daily_check.py              # 节日入口：解析+查历史+写日历（launchd 每天 06:00）
+│   ├── state.json                  # 节日已创建事件 ID 索引
+│   ├── pr_watcher.py               # PR 监控入口：扫 open PR → codex review → 写日历（launchd 每 2 min）
+│   ├── pr_prompt.md                # codex review 用的 prompt 模板（含 {pr_link} 占位）
+│   ├── pr_state.json               # 每个 PR 的 head_sha / thread_id / comment_url
+│   ├── pr_calendar_state.json      # "PR 监控" 日历的事件 ID 索引
+│   └── pr_logs/                    # codex JSONL + 最终回复，每次运行一份
 ├── logs/                           # launchd stdout/stderr
-├── com.YOURNAME.calendar.daily.plist  # 由 install_launchd.sh 从 template 生成
+├── com.YOURNAME.calendar.daily.plist        # 节日任务（install_launchd.sh 渲染）
+├── com.YOURNAME.calendar.pr-watcher.plist   # PR 监控任务（同上）
 └── .venv/                          # Python 依赖（pyobjc + lunardate）
 ```
 
@@ -230,3 +236,117 @@ ls history/*/*__mothers-day__mom.md
 - 强制重建某事件：删 `scripts/state.json` 里对应条目，再跑 daily_check
 - 临时禁用某节日：在它的 frontmatter 加 `disabled: true`
 - 首次运行会弹"日历访问"权限对话框；如果误点拒绝，去**系统设置 → 隐私与安全性 → 日历**手动勾选 Terminal/Python
+
+---
+
+## PR 监控（pr_watcher）
+
+第二条独立功能：自动 review 自己跨 org 提交的 PR。
+
+### 触发模型（双通道）
+
+**主通道 — 全局 git pre-push hook（即时）**
+
+- `git config --global core.hooksPath ~/.config/my-calendar/git-hooks`
+- 每次本地 `git push` 到 GitHub remote 时，hook 异步 fork 一个后台进程
+- 后台进程 8 次 × 7.5s ≈ 60s 内轮询 `gh pr list --head <branch>` 找 PR
+- 找到 PR + 验证 `base == default` → `pr_watcher.py --force <pr-url>`
+- hook 本身立刻返回 0，不阻塞 push
+
+**兜底通道 — launchd 30 min 轮询**
+
+- `com.<user>.calendar.pr-watcher`，`StartInterval=1800`
+- 抓本地 hook 漏掉的事件：网页创建的 PR、异机 push、bot 自动 commit、push 时网络抖动导致 hook 失败等
+- 休眠不唤醒 Mac
+- 每次 tick 单次最长 25 分钟，超时杀掉 codex
+
+### 已知不被 hook 抓到的场景
+
+| 触发源 | hook 抓到？ | launchd 兜底？ |
+|---|---|---|
+| 本机 `git push` | ✅ 立即 | — |
+| 本机 `gh pr create`（无新 push） | ⚠️ 只有同时 push 才行 | ✅ ≤30min |
+| GitHub 网页 UI 创建/编辑 PR | ❌ | ✅ ≤30min |
+| 其他机器 push | ❌ | ✅ ≤30min |
+| PR bot 自动 commit | ❌ | ✅ ≤30min |
+
+### 单次 tick 流程
+
+1. `gh api graphql` 一次拉所有 open PR（跨 org，author=@me）
+2. 过滤：`baseRefName == repository.defaultBranchRef.name`
+3. 与 `scripts/pr_state.json` 比对：
+   - 首次见到 → seed 落 head_sha，**不评论**
+   - head_sha 未变 → 跳过
+   - head_sha 变了 → 触发 codex
+4. codex 调用：`codex exec --json --dangerously-bypass-approvals-and-sandbox -s danger-full-access --skip-git-repo-check -C /tmp/codex-pr-runs/<uuid> "<prompt>"`
+5. 从 JSONL 第一行抓 `thread_id`（用于 `codex resume`）
+6. codex 自己用 `gh pr comment` 发评论；watcher 用 `gh api ...issues/<n>/comments` 兜底取 URL
+7. EventKit 写到独立日历 **"PR 监控"**，UID = `my-calendar:pr-comment:<pr_url>:<sha>`
+
+### 关键文件
+
+| 路径 | 作用 |
+|---|---|
+| `scripts/pr_watcher.py` | 入口 |
+| `scripts/pr_prompt.md` | codex prompt 模板（含 `{pr_link}` 占位） |
+| `scripts/pr_local_trigger.sh` | hook 后台 worker：轮询找 PR → 调 pr_watcher --force |
+| `scripts/install_git_hook.sh` | 一次性安装：设 global core.hooksPath |
+| `scripts/install_launchd.sh` | 安装两个 LaunchAgent（daily + pr-watcher 兜底） |
+| `~/.config/my-calendar/git-hooks/pre-push` | 全局 hook 本体（不在 repo 里，由 install_git_hook.sh 写入） |
+| `~/.config/my-calendar/git-hooks/logs/trigger.log` | 每次 push 触发的轨迹日志 |
+| `scripts/pr_state.json` | 每个 PR 的 last_commented_sha / thread_id / comment_url |
+| `scripts/pr_calendar_state.json` | "PR 监控" 日历的 event_id 索引（与节日 state.json 隔离） |
+| `scripts/pr_logs/<ts>__<owner>_<repo>_<n>.jsonl` | codex 每次完整 JSONL 输出 |
+| `scripts/pr_logs/<ts>__<owner>_<repo>_<n>.last.txt` | codex 最终消息（写日历正文用） |
+| `logs/pr-watcher.log` / `.err` | launchd 标准输出/错误 |
+
+### 手动入口
+
+```bash
+# 一次性安装（已装过则幂等）
+bash scripts/install_git_hook.sh         # 全局 pre-push hook
+bash scripts/install_launchd.sh          # 节日 daily + PR 兜底 launchd
+
+# 看候选 PR（不调 codex、不写日历）
+.venv/bin/python scripts/pr_watcher.py --dry-run
+
+# 首轮 seed：把现有 open PR 的 head_sha 全部记下，永远不评论
+.venv/bin/python scripts/pr_watcher.py --seed-only
+
+# 真跑：扫 → 触发 codex → 写日历
+.venv/bin/python scripts/pr_watcher.py
+
+# 对指定 PR 强制跑一次（绕过 state 检查；base 校验在 trigger 脚本里做了）
+.venv/bin/python scripts/pr_watcher.py --force https://github.com/<owner>/<repo>/pull/<n>
+
+# 忽略夜间节流，立即执行
+.venv/bin/python scripts/pr_watcher.py --ignore-throttle
+```
+
+### per-repo opt-out
+
+某个 repo 不想被 hook 触发：
+
+```bash
+git -C <repo-path> config core.hooksPath .git/hooks
+```
+
+某个 repo 已有自己的 pre-push（CI 校验等）想保留：把它改名为 `.git/hooks/pre-push.local`，全局 hook 会自动 exec 它，失败也会让 push 失败（保持原语义）。
+
+### 调试
+
+- `tail -f logs/pr-watcher.log` 实时看 launchd 兜底
+- `tail -f ~/.config/my-calendar/git-hooks/logs/trigger.log` 看每次 push 的触发链路
+- 验证 hook 装好：`git config --global --get core.hooksPath` 应该返回 `~/.config/my-calendar/git-hooks`
+- 某个 PR 想要 re-review：删 `pr_state.json` 里那条记录，下次 tick 会重新 seed → 下下次有 commit 才会真跑（如果想直接跑，用 `--force`）
+- codex 单次卡死：进程会被 25min 超时杀掉，state 不会更新，下轮会重试
+- 想 resume 某次 codex session：日历事件描述里有 `codex resume <thread_id>` 命令，直接复制执行
+- 模拟 push 测试 hook：`echo "refs/heads/<branch> sha refs/heads/<branch> sha" | bash ~/.config/my-calendar/git-hooks/pre-push origin <remote-url>`
+
+### 设计取舍
+
+- 用 `(pr_url, head_sha)` 作为幂等键。force-push 改了 SHA 才会重新触发评论——这就是"同一 commit 只评论一次"的语义
+- 日历事件用独立日历 "PR 监控"，避免和节日提醒混在一起
+- 不过滤 draft PR（用户当前选择）。如果以后想跳过 draft，在 `fetch_open_prs` 后加 `if pr.is_draft: continue`
+- 不主动跑历史 PR：首轮所有 open PR 进 seed，不评论；只有后续 commit 才触发
+- codex 用 `-s danger-full-access` + `--dangerously-bypass-approvals-and-sandbox`，cwd 隔离在 `/tmp/codex-pr-runs/<uuid>` 但 sandbox 实际是 full access。prompt 模板里明确写了"只读 diff、只发评论、不改文件、不 push"——如果 PR 描述/diff 里有 prompt injection 试图让 codex 干别的，理论上 codex 可能被诱导。这是 yolo 模式的固有 trade-off

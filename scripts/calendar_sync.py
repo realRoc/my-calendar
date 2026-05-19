@@ -31,7 +31,8 @@ from EventKit import (  # type: ignore[import-not-found]
 )
 from Foundation import NSDate, NSCalendar, NSCalendarUnitDay  # noqa: F401
 
-CALENDAR_NAME = "节日提醒"
+CALENDAR_NAME = "节日提醒"          # 节日 daily_check 默认写入
+PR_CALENDAR_NAME = "PR 监控"        # pr_watcher 默认写入
 STATE_FILENAME = "state.json"
 
 
@@ -74,9 +75,9 @@ def _request_access(store: EKEventStore) -> bool:
 # ─── calendar lookup / creation ────────────────────────────────────────────────
 
 
-def _find_or_create_calendar(store: EKEventStore) -> EKCalendar:
+def _find_or_create_calendar(store: EKEventStore, name: str = CALENDAR_NAME) -> EKCalendar:
     for cal in store.calendarsForEntityType_(EKEntityTypeEvent):
-        if cal.title() == CALENDAR_NAME:
+        if cal.title() == name:
             return cal
 
     # Need a writable source. Prefer Local, fall back to iCloud (CalDAV).
@@ -98,12 +99,12 @@ def _find_or_create_calendar(store: EKEventStore) -> EKCalendar:
         raise RuntimeError("No writable calendar source found (no Local/iCloud).")
 
     cal = EKCalendar.calendarForEntityType_eventStore_(EKEntityTypeEvent, store)
-    cal.setTitle_(CALENDAR_NAME)
+    cal.setTitle_(name)
     cal.setSource_(source)
     err = objc.nil
     ok, err = store.saveCalendar_commit_error_(cal, True, None)
     if not ok:
-        raise RuntimeError(f"Failed to create calendar {CALENDAR_NAME!r}: {err}")
+        raise RuntimeError(f"Failed to create calendar {name!r}: {err}")
     return cal
 
 
@@ -143,6 +144,7 @@ def upsert_events(
     events: list[ReminderEvent],
     state_path: Path,
     dry_run: bool = False,
+    calendar_name: str = CALENDAR_NAME,
 ) -> dict[str, str]:
     """Upsert each event. Returns {key: action} where action is created/updated/unchanged."""
     actions: dict[str, str] = {}
@@ -153,7 +155,7 @@ def upsert_events(
 
     store = EKEventStore.alloc().init()
     _request_access(store)
-    cal = _find_or_create_calendar(store)
+    cal = _find_or_create_calendar(store, calendar_name)
     state = _load_state(state_path)
 
     for e in events:

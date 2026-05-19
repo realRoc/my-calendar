@@ -7,6 +7,11 @@ __pycache__/
 
 # Local state (calendar event IDs are unique to your machine)
 scripts/state.json
+scripts/pr_state.json
+scripts/pr_calendar_state.json
+
+# PR-watcher codex runs (raw JSONL transcripts may contain private diffs)
+scripts/pr_logs/
 
 # Auto-generated
 MISSING.md
@@ -27,9 +32,11 @@ history/*
 holidays/custom/*
 !holidays/custom/README.md
 
-# User-specific generated plist (use install_launchd.sh to regenerate)
+# User-specific generated plists (use install_launchd.sh to regenerate)
 com.*.calendar.daily.plist
+com.*.calendar.pr-watcher.plist
 !com.calendar.daily.plist.template
+!com.calendar.pr-watcher.plist.template
 
 # OS / editor
 .DS_Store
