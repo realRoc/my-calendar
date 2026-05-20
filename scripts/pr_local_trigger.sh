@@ -50,17 +50,35 @@ fi
 log "push detected: $OWNER_REPO  (remote=$REMOTE_URL)"
 
 # ── Collect distinct pushed branches from stdin payload ──
+# Same branch may appear twice if pushed via multiple refs in one invocation
+# (rare but possible, e.g. pushing the same branch under two names). We want
+# to poll/trigger watcher only once per distinct branch.
+#
+# NOTE: macOS ships bash 3.2 — no associative arrays. A linear in-array scan
+# is fine here: N is tiny (refs per push, basically always 1-2). Tried
+# `declare -A` once; it silently breaks the whole hook on macOS.
 BRANCHES=()
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     # fields: local_ref local_sha remote_ref remote_sha
     read -ra parts <<< "$line"
+    local_sha="${parts[1]:-}"
     remote_ref="${parts[2]:-}"
-    remote_sha="${parts[3]:-}"
-    # skip deletions (remote_sha all zeros) and non-branch refs
-    [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]] && continue
+    # git pre-push protocol:
+    #   - branch deletion → local_sha is all-zeros (the local ref no longer exists)
+    #   - new branch push → remote_sha is all-zeros (the remote ref doesn't exist yet)
+    # We want to skip deletions and keep new-branch pushes, so test local_sha.
+    [[ "$local_sha" == "0000000000000000000000000000000000000000" ]] && continue
     [[ "$remote_ref" != refs/heads/* ]] && continue
-    BRANCHES+=("${remote_ref#refs/heads/}")
+    branch="${remote_ref#refs/heads/}"
+    is_dup=0
+    if [[ "${#BRANCHES[@]}" -gt 0 ]]; then
+        for existing in "${BRANCHES[@]}"; do
+            if [[ "$existing" == "$branch" ]]; then is_dup=1; break; fi
+        done
+    fi
+    [[ "$is_dup" == 1 ]] && continue
+    BRANCHES+=("$branch")
 done < "$STDIN_FILE"
 
 if [[ "${#BRANCHES[@]}" -eq 0 ]]; then

@@ -380,6 +380,29 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
     cal_action = actions.get(event.key, "?")
 
+    # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
+    meta = {
+        "started_at": started_at,
+        "repo": pr.repo,
+        "pr_number": pr.number,
+        "pr_url": pr.url,
+        "pr_title": pr.title,
+        "head_sha": pr.head_sha,
+        "thread_id": result.thread_id,
+        "comment_url": comment_url,
+        "comment_body": comment_body or "",
+        "codex_exit": result.exit_code,
+        "jsonl_path": str(result.jsonl_path),
+    }
+    meta_path = result.jsonl_path.with_suffix(".meta.json")
+    try:
+        meta_path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
+
     entry = state["prs"].setdefault(pr.url, {})
     entry.update({
         "repo": pr.repo,
