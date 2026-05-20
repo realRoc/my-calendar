@@ -50,7 +50,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -298,60 +298,85 @@ def run_codex(prompt: str, pr_url: str) -> CodexResult:
 # ─── calendar event ────────────────────────────────────────────────────────────
 
 
+def parse_verdict(comment_body: str | None) -> str:
+    """Return the verdict emoji (✅ / ⚠️ / ❌) from a codex review comment.
+
+    Looks for the conclusion line `结论：…` that `pr_prompt.md` requires codex
+    to output. Falls back to 🤖 when neither the comment body nor the verdict
+    line is available.
+    """
+    if not comment_body:
+        return "🤖"
+    for line in reversed(comment_body.splitlines()):
+        s = line.strip()
+        if not s.startswith("结论"):
+            continue
+        if "❌" in s:
+            return "❌"
+        if "⚠" in s:
+            return "⚠️"
+        if "✅" in s:
+            return "✅"
+    # Last resort: scan whole body for any of the three.
+    if "❌" in comment_body:
+        return "❌"
+    if "⚠" in comment_body:
+        return "⚠️"
+    if "✅" in comment_body:
+        return "✅"
+    return "🤖"
+
+
 def build_event(
     pr: PRSnap,
     result: CodexResult,
     comment_url: str | None,
     comment_body: str | None,
-    today: date,
+    now: datetime,
 ) -> ReminderEvent:
     sha_short = pr.head_sha[:8]
-    title = f"🤖 已评论 PR #{pr.number} · {pr.repo}"
+    verdict = parse_verdict(comment_body)
+    title = f"{verdict} #{pr.number} · {pr.repo}"
 
-    # ── 顶部：链接 + session_id + commit + 日志路径 ──
-    header: list[str] = [
-        f"PR：       {pr.url}",
-        f"标题：     {pr.title}",
+    # ── body 第一：完整评论内容 ──
+    body_section: list[str] = []
+    if comment_body:
+        body_section.append(comment_body.strip())
+    elif result.last_message:
+        body_section.append("（comment body 未抓到，以下是 codex 最终回复）")
+        body_section.append("")
+        body_section.append(result.last_message)
+    else:
+        body_section.append("（未抓到评论内容）")
+
+    # ── metadata 折到最后 ──
+    metadata: list[str] = [
+        "",
+        "─" * 40,
+        f"PR 标题：  {pr.title}",
+        f"PR 链接：  {pr.url}",
         f"commit：   {sha_short}",
     ]
     if comment_url:
-        header.append(f"评论：     {comment_url}")
+        metadata.append(f"评论：     {comment_url}")
     else:
-        header.append("评论：     （未抓到 URL，请到 PR 页面查看）")
-
+        metadata.append("评论：     （未抓到 URL，请到 PR 页面查看）")
     if result.thread_id:
-        header.append(f"session：  {result.thread_id}")
-        header.append(f"resume：   codex resume {result.thread_id}")
+        metadata.append(f"session：  {result.thread_id}")
+        metadata.append(f"resume：   codex resume {result.thread_id}")
     else:
-        header.append("session：  （未抓到 thread_id）")
+        metadata.append("session：  （未抓到 thread_id）")
+    metadata.append(f"JSONL：    {result.jsonl_path}")
 
-    header.append(f"JSONL：    {result.jsonl_path}")
-
-    # ── 正文：完整评论内容 ──
-    body_section: list[str] = []
-    if comment_body:
-        body_section.append("")
-        body_section.append("═" * 50)
-        body_section.append("评论原文")
-        body_section.append("═" * 50)
-        body_section.append("")
-        body_section.append(comment_body.strip())
-    elif result.last_message:
-        # 如果 gh api 没抓到 comment body（少见），退回到 codex 最后输出
-        body_section.append("")
-        body_section.append("═" * 50)
-        body_section.append("codex 最终回复（comment body 未抓到，用此兜底）")
-        body_section.append("═" * 50)
-        body_section.append("")
-        body_section.append(result.last_message)
-
-    notes = "\n".join(header + body_section)
+    notes = "\n".join(body_section + metadata)
 
     return ReminderEvent(
         key=f"my-calendar:pr-comment:{pr.url}:{pr.head_sha}",
         title=title,
         notes=notes,
-        on_date=today,
+        on_date=now.date(),
+        start_at=now,
+        duration_min=15,
     )
 
 
@@ -375,8 +400,8 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     body_preview = (comment_body or "")[:80].replace("\n", " ")
     print(f"      comment_url={comment_url}  body={len(comment_body or '')}B  preview={body_preview!r}", flush=True)
 
-    today = date.today()
-    event = build_event(pr, result, comment_url, comment_body, today)
+    now = datetime.now()
+    event = build_event(pr, result, comment_url, comment_body, now)
     actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
     cal_action = actions.get(event.key, "?")
 

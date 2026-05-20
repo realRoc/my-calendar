@@ -41,7 +41,9 @@ class ReminderEvent:
     key: str            # deterministic: e.g. "mothers-day:2026:lead7"
     title: str
     notes: str
-    on_date: date       # the calendar day the all-day event sits on
+    on_date: date       # used when start_at is None: the calendar day for the all-day event
+    start_at: datetime | None = None  # if set, event is timed (not all-day) and starts at this instant
+    duration_min: int = 15            # only used when start_at is set
 
 
 # ─── permission ────────────────────────────────────────────────────────────────
@@ -174,9 +176,17 @@ def upsert_events(
 
         ek_event.setTitle_(e.title)
         ek_event.setNotes_(e.notes)
-        ek_event.setStartDate_(_to_nsdate(e.on_date))
-        ek_event.setEndDate_(_next_day_nsdate(e.on_date))
-        ek_event.setAllDay_(True)
+        if e.start_at is not None:
+            start_ns = NSDate.dateWithTimeIntervalSince1970_(e.start_at.timestamp())
+            end_dt = e.start_at + timedelta(minutes=e.duration_min)
+            end_ns = NSDate.dateWithTimeIntervalSince1970_(end_dt.timestamp())
+            ek_event.setStartDate_(start_ns)
+            ek_event.setEndDate_(end_ns)
+            ek_event.setAllDay_(False)
+        else:
+            ek_event.setStartDate_(_to_nsdate(e.on_date))
+            ek_event.setEndDate_(_next_day_nsdate(e.on_date))
+            ek_event.setAllDay_(True)
 
         if is_new:
             # Pop a system notification ~10s after creation. Only on initial create —
