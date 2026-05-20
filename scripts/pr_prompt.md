@@ -4,9 +4,10 @@
 
 请按以下步骤进行：
 
-1. 用 `gh pr view {pr_link} --json title,body,additions,deletions,changedFiles,files,baseRefName,headRefName` 了解 PR 的基本信息和涉及文件。
+1. 用 `gh pr view {pr_link} --json title,body,additions,deletions,changedFiles,files,baseRefName,headRefName,mergeable,mergeStateStatus` 了解 PR 的基本信息、涉及文件，并**记下 `mergeable` 和 `mergeStateStatus` 的值**（后面 Blocker 判定要用）。
 2. 用 `gh pr diff {pr_link}` 拉取完整 diff。如果 diff 过大（>3000 行），优先聚焦在关键改动文件上，并明确说明你抽样了哪些部分。
 3. 评审重点（按优先级）：
+   - **合并状态（强制检查）**：如果 step 1 拿到的 `mergeable == "CONFLICTING"` 或 `mergeStateStatus == "DIRTY"`，**必须**在 `## Blocker / 必须修正` 里列出一条"与 base 分支 `<baseRefName>` 存在合并冲突，需先 rebase / merge 解决"，并把最终结论强制改成 `⚠️ 修正后可合并`（即使 diff 内容没有其它 blocker，也不能给 ✅）。`mergeStateStatus == "UNKNOWN"` 时不阻断，但在评论里提一句 GitHub 还没算完合并状态、建议人工复核。
    - **Blocker / 必须修正**（两者等价，任意一条都算 blocker）：可能导致生产事故、数据丢失、安全漏洞、API 破坏性变更、明显的逻辑错误、未处理的失败路径、并发/竞态问题；以及代码正确性 bug、错误的边界条件、误用 API、错误的错误处理、缺失的关键测试。**只要存在任意一条"必须修正"，就视为存在 PR blocker**，开头总结和结论必须按"存在 blocker"表述，不要写"未发现 blocker；但有必须修正"这种自相矛盾的话。
    - **后端成本与机器资源评测**（即使没有 blocker 也必须给出）：判断改动会不会让后端成本/机器资源暴涨。具体看：
      - **内存**：是否新增常驻数据（大文件加载、cache、in-memory index）？如果按 worker / 进程数放大，估算稳态额外占用（如 `文件大小 × worker 数`）。
