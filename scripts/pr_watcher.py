@@ -10,9 +10,18 @@ Single-pass flow:
   1. GraphQL: list all open PRs authored by @me across every org.
   2. Filter: keep only PRs whose base == repo default branch.
   3. Compare each PR's head_sha against scripts/pr_state.json.
-       - PR not in state → first-run seed: record head_sha, DO NOT comment.
+       - PR not in state:
+           * if PR.createdAt > _meta.installed_at  → trigger codex review (newly opened PR)
+           * else (PR existed before install, or seed-only mode) → record head_sha, DO NOT comment
        - PR in state and head_sha unchanged → skip.
        - PR in state and head_sha changed → trigger codex review.
+
+  _meta.installed_at is stamped on the very first run; it's the cutoff that
+  distinguishes "PRs that already existed when the tool was installed" (just
+  seed them to avoid back-reviewing history) from "PRs created after install"
+  (treat as actionable, even if the local git pre-push hook didn't fire — e.g.
+  PR was created via GitHub web UI, gh pr create, or pushed from another
+  machine).
   4. For each triggered PR:
        a. Render prompt = pr_prompt.md.replace("{pr_link}", url)
        b. codex exec --json --dangerously-bypass-approvals-and-sandbox \
@@ -41,7 +50,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime, time as dtime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -73,6 +82,7 @@ query($q: String!) {
         number
         title
         isDraft
+        createdAt
         baseRefName
         headRefOid
         repository {
@@ -99,6 +109,7 @@ class PRSnap:
     base: str
     default_branch: str
     head_sha: str
+    created_at: str = ""      # ISO-8601 UTC (e.g. "2026-05-20T03:56:40Z")
 
 
 def load_state() -> dict:
@@ -162,8 +173,22 @@ def fetch_open_prs() -> list[PRSnap]:
             base=n.get("baseRefName", ""),
             default_branch=default_ref,
             head_sha=n.get("headRefOid", ""),
+            created_at=n.get("createdAt", "") or "",
         ))
     return out
+
+
+def _parse_iso_utc(s: str) -> datetime | None:
+    """Parse an ISO-8601 string (with or without trailing Z) into a UTC-aware datetime."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc)
 
 
 def fetch_latest_comment(repo: str, number: int) -> tuple[str | None, str | None]:
@@ -395,13 +420,22 @@ def main() -> int:
             print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  夜间节流：距上次运行不足 5min，跳过")
             return 0
 
+    # First-ever run stamps installed_at as the "new PR vs pre-existing PR" cutoff.
+    # PRs created after this timestamp are treated as actionable on first sight;
+    # PRs created before are seeded silently (the original behaviour).
+    if not args.dry_run and "installed_at" not in state.get("_meta", {}):
+        state.setdefault("_meta", {})["installed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        print(f"[pr-watcher] first run: stamped installed_at = {state['_meta']['installed_at']}")
+
+    installed_at_dt = _parse_iso_utc(state.get("_meta", {}).get("installed_at", ""))
+
     print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  daytime={in_daytime(now)}  dry_run={args.dry_run}  seed_only={args.seed_only}")
 
     if args.force:
         # Bypass GraphQL listing; fetch this single PR's metadata
         forced = subprocess.run(
             ["gh", "pr", "view", args.force,
-             "--json", "url,number,title,isDraft,baseRefName,headRefOid"],
+             "--json", "url,number,title,isDraft,baseRefName,headRefOid,createdAt"],
             capture_output=True, text=True, check=True,
         )
         data = json.loads(forced.stdout)
@@ -416,6 +450,7 @@ def main() -> int:
             base=data.get("baseRefName", ""),
             default_branch=data.get("baseRefName", ""),
             head_sha=data.get("headRefOid", ""),
+            created_at=data.get("createdAt", "") or "",
         )
         action = process_pr(pr, state, dry_run=False)
         save_state(state)
@@ -438,17 +473,34 @@ def main() -> int:
 
     for pr in candidates:
         prev = state["prs"].get(pr.url)
-        # 首次见到 → 仅 seed
+        # 首次见到此 PR：根据它是 install 之前就存在的旧 PR 还是之后新建的 PR 来决定
         if prev is None:
-            print(f"    seed  {pr.url}  sha={pr.head_sha[:8]}")
-            if not args.dry_run:
-                state["prs"][pr.url] = {
-                    "repo": pr.repo,
-                    "number": pr.number,
-                    "last_seen_sha": pr.head_sha,
-                    "last_commented_sha": None,    # 首轮不评论
-                    "seeded_at": now.isoformat(timespec="seconds"),
-                }
+            pr_created_dt = _parse_iso_utc(pr.created_at)
+            is_post_install = (
+                not args.seed_only
+                and installed_at_dt is not None
+                and pr_created_dt is not None
+                and pr_created_dt > installed_at_dt
+            )
+
+            if not is_post_install:
+                # 装好工具之前就存在的旧 PR / 或显式 --seed-only：只 seed
+                reason = "seed-only" if args.seed_only else "pre-install"
+                print(f"    seed ({reason})  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
+                if not args.dry_run:
+                    state["prs"][pr.url] = {
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_seen_sha": pr.head_sha,
+                        "last_commented_sha": None,
+                        "seeded_at": now.isoformat(timespec="seconds"),
+                    }
+                continue
+
+            # 装好之后才创建的 PR → 即便 git pre-push hook 没抓到（网页 UI、异机 push、gh pr create…），也直接评论
+            print(f"    NEW PR (post-install)  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
+            action = process_pr(pr, state, dry_run=args.dry_run)
+            print(f"      → {action}")
             continue
 
         if args.seed_only:
