@@ -55,10 +55,13 @@ while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     # fields: local_ref local_sha remote_ref remote_sha
     read -ra parts <<< "$line"
+    local_sha="${parts[1]:-}"
     remote_ref="${parts[2]:-}"
-    remote_sha="${parts[3]:-}"
-    # skip deletions (remote_sha all zeros) and non-branch refs
-    [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]] && continue
+    # git pre-push protocol:
+    #   - branch deletion → local_sha is all-zeros (the local ref no longer exists)
+    #   - new branch push → remote_sha is all-zeros (the remote ref doesn't exist yet)
+    # We want to skip deletions and keep new-branch pushes, so test local_sha.
+    [[ "$local_sha" == "0000000000000000000000000000000000000000" ]] && continue
     [[ "$remote_ref" != refs/heads/* ]] && continue
     BRANCHES+=("${remote_ref#refs/heads/}")
 done < "$STDIN_FILE"
