@@ -65,6 +65,9 @@ PROMPT_PATH = HERE / "pr_prompt.md"
 LOG_DIR = HERE / "pr_logs"
 SCRATCH_BASE = Path("/tmp/codex-pr-runs")
 
+# terminal-notifier: absolute paths so this works under launchd's stripped PATH.
+NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
+
 # launchd-friendly: 工作时间窗口（本地时间）
 DAYTIME_START = dtime(9, 0)
 DAYTIME_END = dtime(22, 0)
@@ -146,6 +149,42 @@ def should_skip_this_tick(state: dict, now: datetime) -> bool:
     except Exception:
         return False
     return delta < NIGHT_MIN_INTERVAL_SEC
+
+
+# ─── mac notifications ─────────────────────────────────────────────────────────
+
+
+def _find_notifier() -> str | None:
+    for p in NOTIFIER_CANDIDATES:
+        if Path(p).exists():
+            return p
+    return shutil.which("terminal-notifier")
+
+
+def notify(title: str, message: str, *, subtitle: str = "", open_url: str | None = None, group: str | None = None) -> None:
+    """Fire-and-forget Mac notification. No-op if terminal-notifier is missing."""
+    notifier = _find_notifier()
+    if not notifier:
+        return
+    cmd = [notifier, "-title", title, "-message", message]
+    if subtitle:
+        cmd += ["-subtitle", subtitle]
+    if open_url:
+        cmd += ["-open", open_url]
+    if group:
+        cmd += ["-group", group]
+    try:
+        subprocess.run(cmd, check=False, capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def fmt_duration(sec: float) -> str:
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    return f"{m}m{s:02d}s"
 
 
 # ─── gh / GraphQL ──────────────────────────────────────────────────────────────
@@ -393,8 +432,20 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
 
     print(f"    → codex exec on {pr.url}", flush=True)
     started_at = datetime.now().isoformat(timespec="seconds")
+
+    notify_group = f"pr-watcher:{pr.url}"
+    notify(
+        title="🔍 PR review 开始",
+        subtitle=pr.repo,
+        message=f"#{pr.number} {pr.title}",
+        open_url=pr.url,
+        group=notify_group,
+    )
+
+    t0 = time.time()
     result = run_codex(prompt, pr.url)
-    print(f"      exit={result.exit_code} thread_id={result.thread_id} log={result.jsonl_path.name}", flush=True)
+    elapsed = time.time() - t0
+    print(f"      exit={result.exit_code} thread_id={result.thread_id} log={result.jsonl_path.name} elapsed={fmt_duration(elapsed)}", flush=True)
 
     comment_url, comment_body = fetch_latest_comment(pr.repo, pr.number)
     body_preview = (comment_body or "")[:80].replace("\n", " ")
