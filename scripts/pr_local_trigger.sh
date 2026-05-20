@@ -52,10 +52,12 @@ log "push detected: $OWNER_REPO  (remote=$REMOTE_URL)"
 # ── Collect distinct pushed branches from stdin payload ──
 # Same branch may appear twice if pushed via multiple refs in one invocation
 # (rare but possible, e.g. pushing the same branch under two names). We want
-# to poll/trigger watcher only once per distinct branch — track with an
-# associative-array set.
+# to poll/trigger watcher only once per distinct branch.
+#
+# NOTE: macOS ships bash 3.2 — no associative arrays. A linear in-array scan
+# is fine here: N is tiny (refs per push, basically always 1-2). Tried
+# `declare -A` once; it silently breaks the whole hook on macOS.
 BRANCHES=()
-declare -A SEEN_BRANCHES
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     # fields: local_ref local_sha remote_ref remote_sha
@@ -69,8 +71,13 @@ while IFS= read -r line; do
     [[ "$local_sha" == "0000000000000000000000000000000000000000" ]] && continue
     [[ "$remote_ref" != refs/heads/* ]] && continue
     branch="${remote_ref#refs/heads/}"
-    [[ -n "${SEEN_BRANCHES[$branch]:-}" ]] && continue
-    SEEN_BRANCHES[$branch]=1
+    is_dup=0
+    if [[ "${#BRANCHES[@]}" -gt 0 ]]; then
+        for existing in "${BRANCHES[@]}"; do
+            if [[ "$existing" == "$branch" ]]; then is_dup=1; break; fi
+        done
+    fi
+    [[ "$is_dup" == 1 ]] && continue
     BRANCHES+=("$branch")
 done < "$STDIN_FILE"
 
