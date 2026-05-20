@@ -50,7 +50,12 @@ fi
 log "push detected: $OWNER_REPO  (remote=$REMOTE_URL)"
 
 # ── Collect distinct pushed branches from stdin payload ──
+# Same branch may appear twice if pushed via multiple refs in one invocation
+# (rare but possible, e.g. pushing the same branch under two names). We want
+# to poll/trigger watcher only once per distinct branch — track with an
+# associative-array set.
 BRANCHES=()
+declare -A SEEN_BRANCHES
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     # fields: local_ref local_sha remote_ref remote_sha
@@ -63,7 +68,10 @@ while IFS= read -r line; do
     # We want to skip deletions and keep new-branch pushes, so test local_sha.
     [[ "$local_sha" == "0000000000000000000000000000000000000000" ]] && continue
     [[ "$remote_ref" != refs/heads/* ]] && continue
-    BRANCHES+=("${remote_ref#refs/heads/}")
+    branch="${remote_ref#refs/heads/}"
+    [[ -n "${SEEN_BRANCHES[$branch]:-}" ]] && continue
+    SEEN_BRANCHES[$branch]=1
+    BRANCHES+=("$branch")
 done < "$STDIN_FILE"
 
 if [[ "${#BRANCHES[@]}" -eq 0 ]]; then

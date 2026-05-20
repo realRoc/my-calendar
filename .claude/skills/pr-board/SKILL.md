@@ -20,7 +20,8 @@ description: 打开本地 PR review 看板。生成一个单文件 HTML，把 pr
 1. 默认行为：生成并打开看板
 
    ```bash
-   cd /Users/wuyupeng/Desktop/my-calendar
+   # 从 my-calendar repo 根目录运行。如果当前不在那里，
+   # 调用方需要先 cd 过去（路径因机器而异，不要写死）。
    .venv/bin/python scripts/dashboard.py --open
    ```
 

@@ -212,8 +212,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <div id="content"></div>
 
+  <script id="reviews-data" type="application/json">__REVIEWS_JSON__</script>
   <script>
-    const reviews = __REVIEWS_JSON__;
+    // Data island pattern: read JSON from a <script type="application/json">
+    // tag via textContent + JSON.parse. This keeps PR-controlled strings
+    // (titles, comment bodies) out of the JS source position. Defense in
+    // depth: render_html also escapes "<\/" before substitution, so an
+    // attacker cannot terminate the data island with a literal end tag
+    // even if the parser ignores JS-comment semantics (which it does — it
+    // ends ANY <script> on the next end tag regardless of context).
+    const reviews = JSON.parse(document.getElementById('reviews-data').textContent);
     const generatedAt = "__GENERATED_AT__";
 
     document.getElementById('generated-at').textContent = generatedAt;
@@ -254,6 +262,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       return div.innerHTML;
     }
 
+    function escapeAttr(s) {
+      return String(s == null ? '' : s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }
+
+    function safeUrl(u) {
+      if (u == null) return '';
+      try {
+        const url = new URL(u);
+        if (url.protocol !== 'https:' && url.protocol !== 'http:') return '';
+        return url.toString();
+      } catch (e) {
+        return '';
+      }
+    }
+
     function exitBadge(exit) {
       if (exit === 0) return '<span class="badge badge-ok">OK</span>';
       if (exit == null) return '<span class="badge badge-skip">no-meta</span>';
@@ -264,8 +292,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const sha = (r.head_sha || '').slice(0, 8);
       const ts = (r.timestamp || '').replace('T', ' ').slice(0, 19);
       const links = [];
-      if (r.comment_url) links.push('<a href="' + r.comment_url + '" target="_blank">评论</a>');
-      links.push('<a href="' + r.pr_url + '" target="_blank">PR</a>');
+      const sCommentUrl = safeUrl(r.comment_url);
+      if (sCommentUrl) {
+        links.push('<a href="' + escapeAttr(sCommentUrl) + '" target="_blank" rel="noopener noreferrer">评论</a>');
+      }
+      const sPrUrl = safeUrl(r.pr_url);
+      if (sPrUrl) {
+        links.push('<a href="' + escapeAttr(sPrUrl) + '" target="_blank" rel="noopener noreferrer">PR</a>');
+      }
       if (r.thread_id) links.push('<code>codex resume ' + escapeHtml(r.thread_id) + '</code>');
       return (
         '<div class="review" onclick="this.classList.toggle(\'open\')">' +
@@ -279,10 +313,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     function prHeader(repo, number, title, url, extra) {
       const titleHtml = title ? ' · <span class="pr-title">' + escapeHtml(title) + '</span>' : '';
+      const safe = safeUrl(url);
+      const open = safe ? '<a href="' + escapeAttr(safe) + '" target="_blank" rel="noopener noreferrer">' : '<span>';
+      const close = safe ? '</a>' : '</span>';
       return (
-        '<a href="' + url + '" target="_blank">' + escapeHtml(repo) + ' #' + number + '</a>' +
+        open + escapeHtml(repo) + ' #' + escapeHtml(number) + close +
         titleHtml +
-        (extra ? ' <span class="group-count">' + extra + '</span>' : '')
+        (extra ? ' <span class="group-count">' + escapeHtml(extra) + '</span>' : '')
       );
     }
 
@@ -358,7 +395,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 
 def render_html(reviews: list[dict]) -> str:
+    # The data island is still inside a <script> tag, and the HTML parser
+    # ends ANY <script> on the next literal "</script>" — even inside what
+    # looks like a JSON string. Neutralize "</" → "<\/" before substitution
+    # (legal in JSON, harmless to JSON.parse, but no longer matches the
+    # HTML end-tag scanner). This is the defense paired with the
+    # JSON.parse(textContent) island in HTML_TEMPLATE.
     payload = json.dumps(reviews, ensure_ascii=False, default=str)
+    payload = payload.replace("</", "<\\/")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return (HTML_TEMPLATE
             .replace("__REVIEWS_JSON__", payload)
