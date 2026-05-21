@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -49,18 +48,7 @@ from holiday_resolver import (  # noqa: E402
     find_missing_records,
 )
 from calendar_sync import ReminderEvent, upsert_events  # noqa: E402
-
-
-def _redirect_stdio_to_log() -> None:
-    # See pr_watcher._redirect_stdio_to_log for the why.
-    log_file = os.environ.get("MY_CAL_LOG_FILE")
-    if not log_file:
-        return
-    p = Path(log_file)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    f = open(p, "a", buffering=1)
-    sys.stdout = f
-    sys.stderr = f
+from log_setup import redirect_stdio_to_log  # noqa: E402
 
 
 _NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
@@ -292,7 +280,7 @@ def write_missing_md(path: Path, missing: list[tuple[Holiday, date, str]], today
 
 
 def main() -> int:
-    _redirect_stdio_to_log()
+    redirect_stdio_to_log()
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -359,16 +347,20 @@ def main() -> int:
         else:
             print("  ✓ 无待补记录")
 
-    # PR watcher health check: if its log hasn't been touched in >2h while we're
-    # awake, launchd probably failed to spawn it (see 2026-05-20 incident).
+    # PR watcher health check: a missing log or one untouched >2h while we're
+    # awake usually means launchd failed to spawn it (see 2026-05-20 incident).
     pr_log = ROOT / "logs" / "pr-watcher.log"
-    if pr_log.exists():
+    msg: str | None = None
+    if not pr_log.exists():
+        msg = "logs/pr-watcher.log 缺失，launchd 可能从未成功启动 pr-watcher"
+    else:
         age_h = (time.time() - pr_log.stat().st_mtime) / 3600
         if age_h > 2:
             msg = f"pr-watcher.log 已 {age_h:.1f}h 未更新，launchd 可能 spawn 失败"
-            print(f"\n  ⚠️ {msg}")
-            if not args.dry_run:
-                _notify("my-calendar: PR 监控可能挂了", msg)
+    if msg:
+        print(f"\n  ⚠️ {msg}")
+        if not args.dry_run:
+            _notify("my-calendar: PR 监控可能挂了", msg)
 
     return 0
 
