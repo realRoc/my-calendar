@@ -28,6 +28,12 @@ HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / "pr_logs"
 OUTPUT_PATH = LOG_DIR / "pr-dashboard.html"
 
+# A codex run is treated as "in progress" if its .jsonl was touched within
+# this window AND no sibling .meta.json exists yet. .meta.json is written
+# only after codex returns and the comment/calendar are persisted, so its
+# absence + a fresh jsonl is a strong signal that codex is still streaming.
+RUNNING_FRESH_SECONDS = 300
+
 # Matches  20260519-234207__floatmiracle_askmanyai_pull_41
 FILENAME_RE = re.compile(r"^(\d{8}-\d{6})__(.+)_pull_(\d+)$")
 
@@ -110,6 +116,37 @@ def collect_reviews() -> list[dict]:
     return reviews
 
 
+def collect_running(now: datetime) -> list[dict]:
+    if not LOG_DIR.exists():
+        return []
+    cutoff = now.timestamp() - RUNNING_FRESH_SECONDS
+    running: list[dict] = []
+    for path in LOG_DIR.iterdir():
+        name = path.name
+        if not name.endswith(".jsonl"):
+            continue
+        stem = name[: -len(".jsonl")]
+        if (LOG_DIR / f"{stem}.meta.json").exists():
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if st.st_mtime < cutoff:
+            continue
+        fn_info = parse_filename(stem)
+        if not fn_info:
+            continue
+        running.append({
+            **fn_info,
+            "jsonl_path": str(path),
+            "jsonl_size": st.st_size,
+            "last_active": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+        })
+    running.sort(key=lambda r: r["last_active"], reverse=True)
+    return running
+
+
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -176,6 +213,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .badge-ok  { background: #e2f6e8; color: #1d6f3d; }
     .badge-err { background: #fde6e6; color: #a4262c; }
     .badge-skip{ background: #eee; color: #666; }
+    .running-section {
+      margin: 1rem 0; padding: .75rem 1rem; border: 1px solid #ffd58a;
+      background: #fff8e6; border-radius: 6px;
+    }
+    .running-section h2 {
+      margin: 0 0 .5rem; font-size: .95rem; color: #8a5a00;
+      display: flex; align-items: center; gap: .5rem;
+    }
+    .pulse {
+      display: inline-block; width: .55rem; height: .55rem; border-radius: 50%;
+      background: #e07a00; box-shadow: 0 0 0 0 rgba(224, 122, 0, 0.6);
+      animation: pulse 1.4s infinite;
+    }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0   rgba(224, 122, 0, 0.55); }
+      70%  { box-shadow: 0 0 0 8px rgba(224, 122, 0, 0);    }
+      100% { box-shadow: 0 0 0 0   rgba(224, 122, 0, 0);    }
+    }
+    .running-item {
+      padding: .35rem 0; border-bottom: 1px dashed #f0d9a8;
+      font-size: .88rem; display: flex; gap: .6rem; flex-wrap: wrap;
+      align-items: baseline;
+    }
+    .running-item:last-child { border-bottom: none; }
+    .running-item .meta { color: #8a5a00; }
     code {
       background: #f0f0f0; padding: .05rem .3rem; border-radius: 3px;
       font-family: ui-monospace, monospace; font-size: .78rem;
@@ -187,12 +249,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <h1>PR Review 看板</h1>
   <div class="meta">生成于 <span id="generated-at"></span> · 共 <span id="total"></span> 条 review</div>
 
+  <div id="running"></div>
+
   <div class="filter-bar">
     <label>时间范围：
       <select id="range">
-        <option value="7">近 7 天</option>
-        <option value="30" selected>近 30 天</option>
-        <option value="90">近 90 天</option>
+        <option value="today" selected>今天</option>
+        <option value="week">本周</option>
         <option value="all">全部</option>
       </select>
     </label>
@@ -213,6 +276,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="content"></div>
 
   <script id="reviews-data" type="application/json">__REVIEWS_JSON__</script>
+  <script id="running-data" type="application/json">__RUNNING_JSON__</script>
   <script>
     // Data island pattern: read JSON from a <script type="application/json">
     // tag via textContent + JSON.parse. This keeps PR-controlled strings
@@ -222,6 +286,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     // even if the parser ignores JS-comment semantics (which it does — it
     // ends ANY <script> on the next end tag regardless of context).
     const reviews = JSON.parse(document.getElementById('reviews-data').textContent);
+    const running = JSON.parse(document.getElementById('running-data').textContent);
     const generatedAt = "__GENERATED_AT__";
 
     document.getElementById('generated-at').textContent = generatedAt;
@@ -237,13 +302,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     let currentView = 'repo';
 
+    function rangeCutoff(range) {
+      if (range === 'today') {
+        const d = new Date(); d.setHours(0, 0, 0, 0);
+        return d;
+      }
+      if (range === 'week') {
+        // 本周一 00:00（中国习惯：周一为一周第一天）
+        const d = new Date();
+        const day = d.getDay() || 7;  // 周日(0) 视作 7
+        d.setDate(d.getDate() - day + 1);
+        d.setHours(0, 0, 0, 0);
+        return d;
+      }
+      return null;  // all
+    }
+
     function getFiltered() {
       const range = document.getElementById('range').value;
       const repo = document.getElementById('repo-filter').value;
       const q = document.getElementById('q').value.trim().toLowerCase();
       let out = reviews;
-      if (range !== 'all') {
-        const cutoff = new Date(Date.now() - parseInt(range, 10) * 86400000);
+      const cutoff = rangeCutoff(range);
+      if (cutoff) {
         out = out.filter(r => new Date(r.timestamp) >= cutoff);
       }
       if (repo) out = out.filter(r => r.repo === repo);
@@ -375,6 +456,52 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
 
+    function fmtElapsed(iso) {
+      const t = new Date(iso).getTime();
+      if (!t) return '';
+      const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+      if (sec < 60) return sec + 's 前';
+      const m = Math.floor(sec / 60);
+      if (m < 60) return m + 'min 前';
+      const h = Math.floor(m / 60);
+      return h + 'h' + (m % 60) + 'min 前';
+    }
+
+    function fmtBytes(n) {
+      if (n < 1024) return n + 'B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + 'KB';
+      return (n / 1024 / 1024).toFixed(1) + 'MB';
+    }
+
+    function renderRunning() {
+      const root = document.getElementById('running');
+      if (!running || running.length === 0) {
+        root.innerHTML = '';
+        return;
+      }
+      const items = running.map(r => {
+        const sPrUrl = safeUrl(r.pr_url);
+        const link = sPrUrl
+          ? '<a href="' + escapeAttr(sPrUrl) + '" target="_blank" rel="noopener noreferrer">' +
+            escapeHtml(r.repo) + ' #' + escapeHtml(r.pr_number) + '</a>'
+          : escapeHtml(r.repo) + ' #' + escapeHtml(r.pr_number);
+        return (
+          '<div class="running-item">' +
+            link +
+            ' <span class="meta">started ' + escapeHtml((r.timestamp || '').replace('T', ' ').slice(11, 19)) +
+            ' · 最近活动 ' + escapeHtml(fmtElapsed(r.last_active)) +
+            ' · jsonl ' + escapeHtml(fmtBytes(r.jsonl_size || 0)) + '</span>' +
+          '</div>'
+        );
+      }).join('');
+      root.innerHTML = (
+        '<div class="running-section">' +
+          '<h2><span class="pulse"></span>运行中 (' + running.length + ')</h2>' +
+          items +
+        '</div>'
+      );
+    }
+
     document.querySelectorAll('.tab').forEach(t => {
       t.addEventListener('click', () => {
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -387,6 +514,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     document.getElementById('repo-filter').addEventListener('change', render);
     document.getElementById('q').addEventListener('input', render);
 
+    renderRunning();
     render();
   </script>
 </body>
@@ -394,18 +522,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 
-def render_html(reviews: list[dict]) -> str:
+def _safe_json(obj) -> str:
     # The data island is still inside a <script> tag, and the HTML parser
     # ends ANY <script> on the next literal "</script>" — even inside what
     # looks like a JSON string. Neutralize "</" → "<\/" before substitution
     # (legal in JSON, harmless to JSON.parse, but no longer matches the
     # HTML end-tag scanner). This is the defense paired with the
     # JSON.parse(textContent) island in HTML_TEMPLATE.
-    payload = json.dumps(reviews, ensure_ascii=False, default=str)
-    payload = payload.replace("</", "<\\/")
+    return json.dumps(obj, ensure_ascii=False, default=str).replace("</", "<\\/")
+
+
+def render_html(reviews: list[dict], running: list[dict]) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return (HTML_TEMPLATE
-            .replace("__REVIEWS_JSON__", payload)
+            .replace("__REVIEWS_JSON__", _safe_json(reviews))
+            .replace("__RUNNING_JSON__", _safe_json(running))
             .replace("__GENERATED_AT__", generated_at))
 
 
@@ -416,9 +547,10 @@ def main() -> int:
     args = parser.parse_args()
 
     reviews = collect_reviews()
+    running = collect_running(datetime.now())
 
     if args.dry_run:
-        print(f"[dashboard] dry-run: would render {len(reviews)} review(s)")
+        print(f"[dashboard] dry-run: would render {len(reviews)} review(s), {len(running)} running")
         by_repo: dict[str, int] = {}
         with_sidecar = 0
         for r in reviews:
@@ -431,13 +563,15 @@ def main() -> int:
             print(f"  with sidecar: {with_sidecar}/{len(reviews)}")
             print(f"  newest: {reviews[0]['timestamp']}  ({reviews[0]['repo']} #{reviews[0].get('pr_number')})")
             print(f"  oldest: {reviews[-1]['timestamp']}  ({reviews[-1]['repo']} #{reviews[-1].get('pr_number')})")
+        for r in running:
+            print(f"  running: {r['repo']} #{r['pr_number']}  last_active={r['last_active']}  jsonl={r['jsonl_size']}B")
         print(f"  output (skipped): {OUTPUT_PATH}")
         return 0
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    html = render_html(reviews)
+    html = render_html(reviews, running)
     OUTPUT_PATH.write_text(html, encoding="utf-8")
-    print(f"[dashboard] wrote {len(reviews)} review(s) → {OUTPUT_PATH}")
+    print(f"[dashboard] wrote {len(reviews)} review(s), {len(running)} running → {OUTPUT_PATH}")
 
     if args.open:
         subprocess.run(["open", str(OUTPUT_PATH)], check=False)
