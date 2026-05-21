@@ -42,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -65,6 +66,8 @@ CAL_STATE_PATH = HERE / "pr_calendar_state.json"   # EventKit event_id index (se
 PROMPT_PATH = HERE / "pr_prompt.md"
 LOG_DIR = HERE / "pr_logs"
 SCRATCH_BASE = Path("/tmp/codex-pr-runs")
+LOCK_PATH = HERE / "pr_watcher.lock"          # flock target — serialises hook + launchd runs
+FORCE_LOCK_WAIT_SEC = 30 * 60                 # --force willingly waits up to 30min for the lock
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
 NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
@@ -98,6 +101,43 @@ query($q: String!) {
   }
 }
 """.strip()
+
+
+# ─── lock ──────────────────────────────────────────────────────────────────────
+#
+# Two trigger channels (git pre-push hook + launchd 30-min tick) can fire on the
+# same PR within seconds. codex runs ~1–2 min, so without serialisation both
+# processes race past the state check, run codex on the same head_sha, and post
+# duplicate comments. flock() is held for the full run; kernel releases it on
+# exit (including SIGKILL by the watchdog timeout).
+#
+# Behaviour:
+#   --force (hook-triggered, user just pushed)  → wait up to 30min for the lock
+#   anything else (launchd tick, --seed-only)   → try once, exit cleanly if held
+
+
+def acquire_lock(*, blocking: bool, timeout_sec: int = FORCE_LOCK_WAIT_SEC) -> int | None:
+    """Return an open fd holding an exclusive flock on LOCK_PATH, or None if it
+    could not be acquired. Keep the returned fd alive for the rest of the
+    process — flock is released when the fd closes."""
+    fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o644)
+    if not blocking:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            os.close(fd)
+            return None
+    deadline = time.time() + timeout_sec
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(3)
 
 
 # ─── state ─────────────────────────────────────────────────────────────────────
@@ -480,6 +520,19 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     except OSError as e:
         print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
 
+    # Refresh the static dashboard so any open browser tab picks up this run
+    # on its next 5s auto-reload. Best-effort: never break the review loop.
+    try:
+        subprocess.run(
+            [sys.executable, str(HERE / "dashboard.py")],
+            timeout=15,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"      warn: dashboard refresh failed: {e}", flush=True)
+
     entry = state["prs"].setdefault(pr.url, {})
     entry.update({
         "repo": pr.repo,
@@ -521,6 +574,22 @@ def main() -> int:
             print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  夜间节流：距上次运行不足 5min，跳过")
             return 0
 
+    # Serialise concurrent runs (hook + launchd tick can fire ~seconds apart).
+    # --dry-run doesn't mutate, so it skips the lock. --force is user-initiated
+    # via the pre-push hook and we want it to actually run, so it waits;
+    # everything else (the periodic tick, --seed-only) is best-effort and exits
+    # cleanly if another run is already in flight.
+    lock_fd: int | None = None
+    if not args.dry_run:
+        lock_fd = acquire_lock(blocking=bool(args.force))
+        if lock_fd is None:
+            mode = "force" if args.force else ("seed-only" if args.seed_only else "tick")
+            print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  another pr_watcher holds the lock ({mode}) — skipping")
+            return 0
+        # Reload state: a blocking --force run may have waited while another
+        # process updated head_sha / last_commented_sha.
+        state = load_state()
+
     # First-ever run stamps installed_at as the "new PR vs pre-existing PR" cutoff.
     # PRs created after this timestamp are treated as actionable on first sight;
     # PRs created before are seeded silently (the original behaviour).
@@ -553,6 +622,13 @@ def main() -> int:
             head_sha=data.get("headRefOid", ""),
             created_at=data.get("createdAt", "") or "",
         )
+        # Even with --force, suppress a duplicate review when the launchd tick we
+        # just waited on already covered this exact sha. To re-review the same
+        # sha intentionally, delete the PR's entry from pr_state.json first.
+        prev = state.get("prs", {}).get(pr.url) or {}
+        if prev.get("last_commented_sha") == pr.head_sha:
+            print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
+            return 0
         action = process_pr(pr, state, dry_run=False)
         save_state(state)
         print(f"  forced: {pr.url}  → {action}")

@@ -247,7 +247,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body>
   <h1>PR Review 看板</h1>
-  <div class="meta">生成于 <span id="generated-at"></span> · 共 <span id="total"></span> 条 review</div>
+  <div class="meta">生成于 <span id="generated-at"></span> · 共 <span id="total"></span> 条 review · 每 5s 自动刷新</div>
 
   <div id="running"></div>
 
@@ -516,6 +516,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     renderRunning();
     render();
+
+    // 静态 HTML：reload 只在 dashboard.py 被重新跑过之后才会看到新数据。
+    // pr_watcher 写完 sidecar 会自动重生成，所以 review 一落盘 ≤5s 就可见。
+    setInterval(() => location.reload(), 5000);
   </script>
 </body>
 </html>
