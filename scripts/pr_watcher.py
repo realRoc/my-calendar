@@ -309,15 +309,75 @@ class CodexResult:
     scratch_dir: Path
 
 
-def run_codex(prompt: str, pr_url: str) -> CodexResult:
+def _refresh_dashboard(*, reason: str) -> None:
+    """Best-effort regenerate the static HTML dashboard so an open browser tab
+    picks up the new state on its next 5s auto-reload. Never break the caller."""
+    try:
+        subprocess.run(
+            [sys.executable, str(HERE / "dashboard.py")],
+            timeout=15,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"      warn: dashboard refresh ({reason}) failed: {e}", flush=True)
+
+
+def _sweep_stale_running_sidecars(now_ts: float) -> None:
+    """Remove .running sidecars older than MAX_RUNTIME_PER_TICK_SEC + buffer.
+    A previous pr_watcher that died (SIGKILL, panic, OOM) would otherwise pin
+    a phantom "running" row in the dashboard forever."""
+    cutoff = now_ts - (MAX_RUNTIME_PER_TICK_SEC + 5 * 60)
+    if not LOG_DIR.exists():
+        return
+    for p in LOG_DIR.iterdir():
+        if p.name.endswith(".running"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe_id = pr_url.replace("https://github.com/", "").replace("/", "_")
+    safe_id = pr.url.replace("https://github.com/", "").replace("/", "_")
     jsonl_path = LOG_DIR / f"{stamp}__{safe_id}.jsonl"
     last_msg_path = LOG_DIR / f"{stamp}__{safe_id}.last.txt"
+    running_path = LOG_DIR / f"{stamp}__{safe_id}.running"
     scratch = SCRATCH_BASE / f"{stamp}-{uuid.uuid4().hex[:8]}"
     scratch.mkdir(parents=True, exist_ok=True)
+
+    # Drop the .running sidecar BEFORE codex starts so the dashboard's
+    # collect_running() can find it during the 1–2min codex run. Cleaned up
+    # in the finally below. Reviewer dashboard refreshes every 5s, so a single
+    # synchronous dashboard.py call here is enough to make this PR show up
+    # in the "运行中" section as soon as the next browser tick fires.
+    _sweep_stale_running_sidecars(time.time())
+    started_at = datetime.now().isoformat(timespec="seconds")
+    running_meta = {
+        "started_at": started_at,
+        "repo": pr.repo,
+        "pr_number": pr.number,
+        "pr_url": pr.url,
+        "pr_title": pr.title,
+        "head_sha": pr.head_sha,
+        "jsonl_path": str(jsonl_path),
+    }
+    try:
+        running_path.write_text(
+            json.dumps(running_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"      warn: failed to write running sidecar {running_path}: {e}", flush=True)
+        running_path = None  # type: ignore[assignment]
+
+    if running_path is not None:
+        _refresh_dashboard(reason="run-start")
 
     cmd = [
         "codex", "exec",
@@ -335,32 +395,42 @@ def run_codex(prompt: str, pr_url: str) -> CodexResult:
     env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
     thread_id: str | None = None
-    with jsonl_path.open("w", encoding="utf-8") as f:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-            cwd=str(scratch),
-        )
-        start = time.time()
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            f.write(line)
-            f.flush()
-            s = line.strip()
-            if thread_id is None and s.startswith("{") and '"thread.started"' in s:
-                try:
-                    obj = json.loads(s)
-                    thread_id = obj.get("thread_id")
-                except Exception:
-                    pass
-            if time.time() - start > MAX_RUNTIME_PER_TICK_SEC:
-                proc.kill()
-                f.write('{"type":"_killed_by_watcher","reason":"timeout"}\n')
-                break
-        proc.wait()
+    try:
+        with jsonl_path.open("w", encoding="utf-8") as f:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                cwd=str(scratch),
+            )
+            start = time.time()
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                f.write(line)
+                f.flush()
+                s = line.strip()
+                if thread_id is None and s.startswith("{") and '"thread.started"' in s:
+                    try:
+                        obj = json.loads(s)
+                        thread_id = obj.get("thread_id")
+                    except Exception:
+                        pass
+                if time.time() - start > MAX_RUNTIME_PER_TICK_SEC:
+                    proc.kill()
+                    f.write('{"type":"_killed_by_watcher","reason":"timeout"}\n')
+                    break
+            proc.wait()
+    finally:
+        # Whether codex exited cleanly, errored, or got killed by the watchdog,
+        # the .running sidecar must go away — otherwise the dashboard's running
+        # section would still show this PR after the run is over.
+        if running_path is not None:
+            try:
+                running_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     last_msg = ""
     if last_msg_path.exists():
@@ -484,7 +554,7 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     )
 
     t0 = time.time()
-    result = run_codex(prompt, pr.url)
+    result = run_codex(prompt, pr)
     elapsed = time.time() - t0
     print(f"      exit={result.exit_code} thread_id={result.thread_id} log={result.jsonl_path.name} elapsed={fmt_duration(elapsed)}", flush=True)
 
@@ -520,18 +590,9 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     except OSError as e:
         print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
 
-    # Refresh the static dashboard so any open browser tab picks up this run
-    # on its next 5s auto-reload. Best-effort: never break the review loop.
-    try:
-        subprocess.run(
-            [sys.executable, str(HERE / "dashboard.py")],
-            timeout=15,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        print(f"      warn: dashboard refresh failed: {e}", flush=True)
+    # Refresh again now that the .meta.json sidecar exists: this swaps the
+    # "running" row out of the dashboard and shows the finished review.
+    _refresh_dashboard(reason="run-end")
 
     entry = state["prs"].setdefault(pr.url, {})
     entry.update({
@@ -628,6 +689,10 @@ def main() -> int:
         prev = state.get("prs", {}).get(pr.url) or {}
         if prev.get("last_commented_sha") == pr.head_sha:
             print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
+            # Persist installed_at if this was the first-ever run; otherwise
+            # the stamp gets recomputed on the next tick and the "new vs
+            # pre-existing PR" cutoff drifts.
+            save_state(state)
             return 0
         action = process_pr(pr, state, dry_run=False)
         save_state(state)
