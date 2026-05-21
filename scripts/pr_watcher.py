@@ -42,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -65,6 +66,8 @@ CAL_STATE_PATH = HERE / "pr_calendar_state.json"   # EventKit event_id index (se
 PROMPT_PATH = HERE / "pr_prompt.md"
 LOG_DIR = HERE / "pr_logs"
 SCRATCH_BASE = Path("/tmp/codex-pr-runs")
+LOCK_PATH = HERE / "pr_watcher.lock"          # flock target — serialises hook + launchd runs
+FORCE_LOCK_WAIT_SEC = 30 * 60                 # --force willingly waits up to 30min for the lock
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
 NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
@@ -98,6 +101,43 @@ query($q: String!) {
   }
 }
 """.strip()
+
+
+# ─── lock ──────────────────────────────────────────────────────────────────────
+#
+# Two trigger channels (git pre-push hook + launchd 30-min tick) can fire on the
+# same PR within seconds. codex runs ~1–2 min, so without serialisation both
+# processes race past the state check, run codex on the same head_sha, and post
+# duplicate comments. flock() is held for the full run; kernel releases it on
+# exit (including SIGKILL by the watchdog timeout).
+#
+# Behaviour:
+#   --force (hook-triggered, user just pushed)  → wait up to 30min for the lock
+#   anything else (launchd tick, --seed-only)   → try once, exit cleanly if held
+
+
+def acquire_lock(*, blocking: bool, timeout_sec: int = FORCE_LOCK_WAIT_SEC) -> int | None:
+    """Return an open fd holding an exclusive flock on LOCK_PATH, or None if it
+    could not be acquired. Keep the returned fd alive for the rest of the
+    process — flock is released when the fd closes."""
+    fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o644)
+    if not blocking:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            os.close(fd)
+            return None
+    deadline = time.time() + timeout_sec
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(3)
 
 
 # ─── state ─────────────────────────────────────────────────────────────────────
@@ -269,15 +309,75 @@ class CodexResult:
     scratch_dir: Path
 
 
-def run_codex(prompt: str, pr_url: str) -> CodexResult:
+def _refresh_dashboard(*, reason: str) -> None:
+    """Best-effort regenerate the static HTML dashboard so an open browser tab
+    picks up the new state on its next 5s auto-reload. Never break the caller."""
+    try:
+        subprocess.run(
+            [sys.executable, str(HERE / "dashboard.py")],
+            timeout=15,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"      warn: dashboard refresh ({reason}) failed: {e}", flush=True)
+
+
+def _sweep_stale_running_sidecars(now_ts: float) -> None:
+    """Remove .running sidecars older than MAX_RUNTIME_PER_TICK_SEC + buffer.
+    A previous pr_watcher that died (SIGKILL, panic, OOM) would otherwise pin
+    a phantom "running" row in the dashboard forever."""
+    cutoff = now_ts - (MAX_RUNTIME_PER_TICK_SEC + 5 * 60)
+    if not LOG_DIR.exists():
+        return
+    for p in LOG_DIR.iterdir():
+        if p.name.endswith(".running"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe_id = pr_url.replace("https://github.com/", "").replace("/", "_")
+    safe_id = pr.url.replace("https://github.com/", "").replace("/", "_")
     jsonl_path = LOG_DIR / f"{stamp}__{safe_id}.jsonl"
     last_msg_path = LOG_DIR / f"{stamp}__{safe_id}.last.txt"
+    running_path = LOG_DIR / f"{stamp}__{safe_id}.running"
     scratch = SCRATCH_BASE / f"{stamp}-{uuid.uuid4().hex[:8]}"
     scratch.mkdir(parents=True, exist_ok=True)
+
+    # Drop the .running sidecar BEFORE codex starts so the dashboard's
+    # collect_running() can find it during the 1–2min codex run. Cleaned up
+    # in the finally below. Reviewer dashboard refreshes every 5s, so a single
+    # synchronous dashboard.py call here is enough to make this PR show up
+    # in the "运行中" section as soon as the next browser tick fires.
+    _sweep_stale_running_sidecars(time.time())
+    started_at = datetime.now().isoformat(timespec="seconds")
+    running_meta = {
+        "started_at": started_at,
+        "repo": pr.repo,
+        "pr_number": pr.number,
+        "pr_url": pr.url,
+        "pr_title": pr.title,
+        "head_sha": pr.head_sha,
+        "jsonl_path": str(jsonl_path),
+    }
+    try:
+        running_path.write_text(
+            json.dumps(running_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"      warn: failed to write running sidecar {running_path}: {e}", flush=True)
+        running_path = None  # type: ignore[assignment]
+
+    if running_path is not None:
+        _refresh_dashboard(reason="run-start")
 
     cmd = [
         "codex", "exec",
@@ -295,32 +395,42 @@ def run_codex(prompt: str, pr_url: str) -> CodexResult:
     env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
     thread_id: str | None = None
-    with jsonl_path.open("w", encoding="utf-8") as f:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-            cwd=str(scratch),
-        )
-        start = time.time()
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            f.write(line)
-            f.flush()
-            s = line.strip()
-            if thread_id is None and s.startswith("{") and '"thread.started"' in s:
-                try:
-                    obj = json.loads(s)
-                    thread_id = obj.get("thread_id")
-                except Exception:
-                    pass
-            if time.time() - start > MAX_RUNTIME_PER_TICK_SEC:
-                proc.kill()
-                f.write('{"type":"_killed_by_watcher","reason":"timeout"}\n')
-                break
-        proc.wait()
+    try:
+        with jsonl_path.open("w", encoding="utf-8") as f:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                cwd=str(scratch),
+            )
+            start = time.time()
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                f.write(line)
+                f.flush()
+                s = line.strip()
+                if thread_id is None and s.startswith("{") and '"thread.started"' in s:
+                    try:
+                        obj = json.loads(s)
+                        thread_id = obj.get("thread_id")
+                    except Exception:
+                        pass
+                if time.time() - start > MAX_RUNTIME_PER_TICK_SEC:
+                    proc.kill()
+                    f.write('{"type":"_killed_by_watcher","reason":"timeout"}\n')
+                    break
+            proc.wait()
+    finally:
+        # Whether codex exited cleanly, errored, or got killed by the watchdog,
+        # the .running sidecar must go away — otherwise the dashboard's running
+        # section would still show this PR after the run is over.
+        if running_path is not None:
+            try:
+                running_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     last_msg = ""
     if last_msg_path.exists():
@@ -444,7 +554,7 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     )
 
     t0 = time.time()
-    result = run_codex(prompt, pr.url)
+    result = run_codex(prompt, pr)
     elapsed = time.time() - t0
     print(f"      exit={result.exit_code} thread_id={result.thread_id} log={result.jsonl_path.name} elapsed={fmt_duration(elapsed)}", flush=True)
 
@@ -479,6 +589,10 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
         )
     except OSError as e:
         print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
+
+    # Refresh again now that the .meta.json sidecar exists: this swaps the
+    # "running" row out of the dashboard and shows the finished review.
+    _refresh_dashboard(reason="run-end")
 
     entry = state["prs"].setdefault(pr.url, {})
     entry.update({
@@ -521,6 +635,22 @@ def main() -> int:
             print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  夜间节流：距上次运行不足 5min，跳过")
             return 0
 
+    # Serialise concurrent runs (hook + launchd tick can fire ~seconds apart).
+    # --dry-run doesn't mutate, so it skips the lock. --force is user-initiated
+    # via the pre-push hook and we want it to actually run, so it waits;
+    # everything else (the periodic tick, --seed-only) is best-effort and exits
+    # cleanly if another run is already in flight.
+    lock_fd: int | None = None
+    if not args.dry_run:
+        lock_fd = acquire_lock(blocking=bool(args.force))
+        if lock_fd is None:
+            mode = "force" if args.force else ("seed-only" if args.seed_only else "tick")
+            print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  another pr_watcher holds the lock ({mode}) — skipping")
+            return 0
+        # Reload state: a blocking --force run may have waited while another
+        # process updated head_sha / last_commented_sha.
+        state = load_state()
+
     # First-ever run stamps installed_at as the "new PR vs pre-existing PR" cutoff.
     # PRs created after this timestamp are treated as actionable on first sight;
     # PRs created before are seeded silently (the original behaviour).
@@ -553,6 +683,17 @@ def main() -> int:
             head_sha=data.get("headRefOid", ""),
             created_at=data.get("createdAt", "") or "",
         )
+        # Even with --force, suppress a duplicate review when the launchd tick we
+        # just waited on already covered this exact sha. To re-review the same
+        # sha intentionally, delete the PR's entry from pr_state.json first.
+        prev = state.get("prs", {}).get(pr.url) or {}
+        if prev.get("last_commented_sha") == pr.head_sha:
+            print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
+            # Persist installed_at if this was the first-ever run; otherwise
+            # the stamp gets recomputed on the next tick and the "new vs
+            # pre-existing PR" cutoff drifts.
+            save_state(state)
+            return 0
         action = process_pr(pr, state, dry_run=False)
         save_state(state)
         print(f"  forced: {pr.url}  → {action}")

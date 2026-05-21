@@ -28,11 +28,13 @@ HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / "pr_logs"
 OUTPUT_PATH = LOG_DIR / "pr-dashboard.html"
 
-# A codex run is treated as "in progress" if its .jsonl was touched within
-# this window AND no sibling .meta.json exists yet. .meta.json is written
-# only after codex returns and the comment/calendar are persisted, so its
-# absence + a fresh jsonl is a strong signal that codex is still streaming.
-RUNNING_FRESH_SECONDS = 300
+# A codex run advertises itself by writing a `.running` sidecar at start and
+# removing it at end (see pr_watcher.run_codex). collect_running() walks those
+# sidecars. The mtime cap below is purely defensive — if pr_watcher dies
+# (SIGKILL, panic, …) before unlinking, we still want the row to disappear
+# after a sane upper bound. MAX_RUNTIME_PER_TICK_SEC in pr_watcher is 25min;
+# we pad to 30min so a slow but live run never gets falsely hidden.
+RUNNING_SIDECAR_MAX_AGE_SEC = 30 * 60
 
 # Matches  20260519-234207__floatmiracle_askmanyai_pull_41
 FILENAME_RE = re.compile(r"^(\d{8}-\d{6})__(.+)_pull_(\d+)$")
@@ -117,15 +119,22 @@ def collect_reviews() -> list[dict]:
 
 
 def collect_running(now: datetime) -> list[dict]:
+    """Return one entry per `<stem>.running` sidecar that's still live.
+
+    Live means: file exists, parses as JSON, is younger than the age cap,
+    and no sibling `.meta.json` (which would prove the run already finished
+    and the sidecar removal just hasn't propagated yet — race window of
+    O(ms), but we still want to be correct).
+    """
     if not LOG_DIR.exists():
         return []
-    cutoff = now.timestamp() - RUNNING_FRESH_SECONDS
+    cutoff = now.timestamp() - RUNNING_SIDECAR_MAX_AGE_SEC
     running: list[dict] = []
     for path in LOG_DIR.iterdir():
         name = path.name
-        if not name.endswith(".jsonl"):
+        if not name.endswith(".running"):
             continue
-        stem = name[: -len(".jsonl")]
+        stem = name[: -len(".running")]
         if (LOG_DIR / f"{stem}.meta.json").exists():
             continue
         try:
@@ -134,15 +143,41 @@ def collect_running(now: datetime) -> list[dict]:
             continue
         if st.st_mtime < cutoff:
             continue
-        fn_info = parse_filename(stem)
-        if not fn_info:
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
             continue
-        running.append({
-            **fn_info,
-            "jsonl_path": str(path),
-            "jsonl_size": st.st_size,
-            "last_active": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
-        })
+        # Resilience: if older sidecars (or hand-edited ones) are missing
+        # fields, derive what we can from the filename so the dashboard
+        # row is still useful.
+        fn_info = parse_filename(stem) or {}
+        for key in ("repo", "pr_number", "pr_url"):
+            if not rec.get(key) and key in fn_info:
+                rec[key] = fn_info[key]
+        if "timestamp" not in rec:
+            rec["timestamp"] = rec.get("started_at") or fn_info.get("timestamp") or ""
+
+        # The .jsonl is what codex is actively writing; surface its size +
+        # mtime so the UI can show real activity rather than the sidecar's
+        # frozen create-time.
+        jsonl = LOG_DIR / f"{stem}.jsonl"
+        if jsonl.exists():
+            try:
+                j_st = jsonl.stat()
+                rec["jsonl_size"] = j_st.st_size
+                rec["last_active"] = datetime.fromtimestamp(j_st.st_mtime).isoformat(timespec="seconds")
+            except OSError:
+                rec["jsonl_size"] = 0
+                rec["last_active"] = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+        else:
+            rec["jsonl_size"] = 0
+            rec["last_active"] = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+
+        if not rec.get("repo") or not rec.get("pr_url"):
+            # Without minimal identifiers there's nothing useful to display.
+            continue
+
+        running.append(rec)
     running.sort(key=lambda r: r["last_active"], reverse=True)
     return running
 
@@ -247,7 +282,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body>
   <h1>PR Review 看板</h1>
-  <div class="meta">生成于 <span id="generated-at"></span> · 共 <span id="total"></span> 条 review</div>
+  <div class="meta">生成于 <span id="generated-at"></span> · 共 <span id="total"></span> 条 review · 每 5s 自动刷新</div>
 
   <div id="running"></div>
 
@@ -516,6 +551,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     renderRunning();
     render();
+
+    // 静态 HTML：reload 只在 dashboard.py 被重新跑过之后才会看到新数据。
+    // pr_watcher 写完 sidecar 会自动重生成，所以 review 一落盘 ≤5s 就可见。
+    setInterval(() => location.reload(), 5000);
   </script>
 </body>
 </html>
