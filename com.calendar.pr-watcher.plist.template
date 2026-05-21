@@ -25,10 +25,14 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- /tmp/ only — Python redirects its own stdout to logs/pr-watcher.log
+         via MY_CAL_LOG_FILE below. This avoids the 2026-05-20 EX_CONFIG=78
+         trap where launchd refused to spawn after logs/*.log's
+         com.apple.macl xattr got corrupted by a system restart. -->
     <key>StandardOutPath</key>
-    <string>__INSTALL_DIR__/logs/pr-watcher.log</string>
+    <string>/tmp/__LABEL__.boot.log</string>
     <key>StandardErrorPath</key>
-    <string>__INSTALL_DIR__/logs/pr-watcher.err</string>
+    <string>/tmp/__LABEL__.boot.err</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -38,6 +42,8 @@
         <string>zh_CN.UTF-8</string>
         <key>HOME</key>
         <string>__HOME__</string>
+        <key>MY_CAL_LOG_FILE</key>
+        <string>__INSTALL_DIR__/logs/pr-watcher.log</string>
     </dict>
 
     <!-- Soft limits so a runaway codex run can't pin the box. -->

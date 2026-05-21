@@ -58,6 +58,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
 from calendar_sync import ReminderEvent, upsert_events, PR_CALENDAR_NAME  # noqa: E402
+from log_setup import redirect_stdio_to_log  # noqa: E402
 
 STATE_PATH = HERE / "pr_state.json"           # PR-level state (head_sha, thread_id, …)
 CAL_STATE_PATH = HERE / "pr_calendar_state.json"   # EventKit event_id index (separate from 节日提醒)
@@ -504,6 +505,7 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
 
 
 def main() -> int:
+    redirect_stdio_to_log()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="list candidates, do not invoke codex / write calendar / mutate state")
     parser.add_argument("--seed-only", action="store_true", help="record current head_shas in state without invoking codex")
