@@ -23,8 +23,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -45,6 +49,33 @@ from holiday_resolver import (  # noqa: E402
     find_missing_records,
 )
 from calendar_sync import ReminderEvent, upsert_events  # noqa: E402
+
+
+def _redirect_stdio_to_log() -> None:
+    # See pr_watcher._redirect_stdio_to_log for the why.
+    log_file = os.environ.get("MY_CAL_LOG_FILE")
+    if not log_file:
+        return
+    p = Path(log_file)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    f = open(p, "a", buffering=1)
+    sys.stdout = f
+    sys.stderr = f
+
+
+_NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
+
+
+def _notify(title: str, message: str) -> None:
+    notifier = next((p for p in _NOTIFIER_CANDIDATES if Path(p).exists()), None) \
+        or shutil.which("terminal-notifier")
+    if not notifier:
+        return
+    try:
+        subprocess.run([notifier, "-title", title, "-message", message],
+                       check=False, capture_output=True, timeout=5)
+    except Exception:
+        pass
 
 
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
@@ -261,6 +292,7 @@ def write_missing_md(path: Path, missing: list[tuple[Holiday, date, str]], today
 
 
 def main() -> int:
+    _redirect_stdio_to_log()
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -326,6 +358,17 @@ def main() -> int:
             print("  ✓ 无待补记录（已删除旧 MISSING.md）")
         else:
             print("  ✓ 无待补记录")
+
+    # PR watcher health check: if its log hasn't been touched in >2h while we're
+    # awake, launchd probably failed to spawn it (see 2026-05-20 incident).
+    pr_log = ROOT / "logs" / "pr-watcher.log"
+    if pr_log.exists():
+        age_h = (time.time() - pr_log.stat().st_mtime) / 3600
+        if age_h > 2:
+            msg = f"pr-watcher.log 已 {age_h:.1f}h 未更新，launchd 可能 spawn 失败"
+            print(f"\n  ⚠️ {msg}")
+            if not args.dry_run:
+                _notify("my-calendar: PR 监控可能挂了", msg)
 
     return 0
 

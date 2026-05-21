@@ -59,6 +59,22 @@ sys.path.insert(0, str(HERE))
 
 from calendar_sync import ReminderEvent, upsert_events, PR_CALENDAR_NAME  # noqa: E402
 
+
+def _redirect_stdio_to_log() -> None:
+    # Why: launchd's StandardOutPath redirection opens the target file at spawn
+    # time. After a 2026-05-20 restart, logs/pr-watcher.log's com.apple.macl
+    # xattr got corrupted and launchd silently refused to spawn (EX_CONFIG=78,
+    # zero diagnostics). By appending from inside Python instead, the plist's
+    # stdout only needs /tmp/ which has never shown the issue.
+    log_file = os.environ.get("MY_CAL_LOG_FILE")
+    if not log_file:
+        return
+    p = Path(log_file)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    f = open(p, "a", buffering=1)
+    sys.stdout = f
+    sys.stderr = f
+
 STATE_PATH = HERE / "pr_state.json"           # PR-level state (head_sha, thread_id, …)
 CAL_STATE_PATH = HERE / "pr_calendar_state.json"   # EventKit event_id index (separate from 节日提醒)
 PROMPT_PATH = HERE / "pr_prompt.md"
@@ -504,6 +520,7 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
 
 
 def main() -> int:
+    _redirect_stdio_to_log()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="list candidates, do not invoke codex / write calendar / mutate state")
     parser.add_argument("--seed-only", action="store_true", help="record current head_shas in state without invoking codex")
