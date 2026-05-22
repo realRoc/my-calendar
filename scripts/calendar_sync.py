@@ -29,7 +29,7 @@ from EventKit import (  # type: ignore[import-not-found]
     EKSourceTypeLocal,
     EKSourceTypeCalDAV,
 )
-from Foundation import NSDate, NSCalendar, NSCalendarUnitDay  # noqa: F401
+from Foundation import NSDate, NSCalendar, NSCalendarUnitDay, NSURL  # noqa: F401
 
 CALENDAR_NAME = "节日提醒"          # 节日 daily_check 默认写入
 PR_CALENDAR_NAME = "PR 监控"        # pr_watcher 默认写入
@@ -44,6 +44,7 @@ class ReminderEvent:
     on_date: date       # used when start_at is None: the calendar day for the all-day event
     start_at: datetime | None = None  # if set, event is timed (not all-day) and starts at this instant
     duration_min: int = 15            # only used when start_at is set
+    url: str | None = None            # EKEvent.url — Calendar.app surfaces this as a clickable link
 
 
 # ─── permission ────────────────────────────────────────────────────────────────
@@ -176,6 +177,10 @@ def upsert_events(
 
         ek_event.setTitle_(e.title)
         ek_event.setNotes_(e.notes)
+        # NSURL.URLWithString_ returns nil for invalid URLs; setURL_(nil) clears
+        # the field, which is what we want when e.url is None (verdict ✅ etc.).
+        ns_url = NSURL.URLWithString_(e.url) if e.url else None
+        ek_event.setURL_(ns_url)
         if e.start_at is not None:
             start_ns = NSDate.dateWithTimeIntervalSince1970_(e.start_at.timestamp())
             end_dt = e.start_at + timedelta(minutes=e.duration_min)
