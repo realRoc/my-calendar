@@ -1,0 +1,75 @@
+#!/bin/bash
+# my-calendar global pre-push hook.
+#
+# Two jobs:
+#   1. Chain-call the repo-local pre-push if .git/hooks/pre-push.local exists.
+#      If that hook fails, this hook ALSO fails (push is aborted) — preserve
+#      the safety semantics of per-repo hooks.
+#   2. After the local chain passes, spawn a detached background process that
+#      polls for the PR matching each pushed branch, then triggers pr_watcher
+#      --force <pr-url>. Returns 0 immediately so push proceeds without delay.
+#
+# git pre-push contract:
+#   $1 = remote name (e.g. "origin")
+#   $2 = remote URL (e.g. "git@github.com:owner/repo.git")
+#   stdin = lines of "<local_ref> <local_sha> <remote_ref> <remote_sha>"
+
+set -u
+
+REMOTE_NAME="${1:-}"
+REMOTE_URL="${2:-}"
+LOG_DIR="$HOME/.config/my-calendar/git-hooks/logs"
+# The TRIGGER_SCRIPT path on the next line is rendered by scripts/install_git_hook.sh
+# at deploy time with the absolute path to pr_local_trigger.sh inside the
+# installer's checkout. The placeholder token must stay on its own assignment
+# line so the installer can also use it to detect un-rendered templates.
+TRIGGER_SCRIPT="__TRIGGER_SCRIPT__"
+mkdir -p "$LOG_DIR"
+
+# ── 1. Drain stdin into a temp file so we can both chain-call and background-process it ──
+STDIN_TMP="$(mktemp -t my-calendar-pre-push.XXXXXX)"
+cat > "$STDIN_TMP"
+
+# ── 2. Chain-call repo-local hook if present ──
+# Discover the repo root regardless of cwd.
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || true)"
+LOCAL_HOOK=""
+if [[ -n "${GIT_DIR}" && -x "${GIT_DIR}/hooks/pre-push.local" ]]; then
+    LOCAL_HOOK="${GIT_DIR}/hooks/pre-push.local"
+fi
+
+if [[ -n "${LOCAL_HOOK}" ]]; then
+    # Run local hook and capture rc BEFORE any conditional — `if ! cmd; then`
+    # would clobber $? to 0 inside the then-branch and silently let push through.
+    "${LOCAL_HOOK}" "$REMOTE_NAME" "$REMOTE_URL" < "$STDIN_TMP"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$STDIN_TMP"
+        exit "$rc"
+    fi
+fi
+
+# ── 3. Only proceed for GitHub remotes ──
+if [[ "$REMOTE_URL" != *"github.com"* ]]; then
+    rm -f "$STDIN_TMP"
+    exit 0
+fi
+
+# ── 4. Resolve the local repo root to forward to the trigger ──
+# This is the cwd a future "/fix this PR" launcher should drop into. Prefer the
+# repo top-level over raw $PWD so it works no matter which subdir we pushed
+# from. Falls back to $PWD if the rev-parse fails (e.g. detached worktree).
+ORIGIN_CWD="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# ── 5. Spawn detached background trigger ──
+# Subshell + & detaches the process group from the hook; redirects close all
+# inherited fds. The trigger script owns the STDIN_TMP cleanup from here.
+if [[ -x "$TRIGGER_SCRIPT" ]]; then
+    ( "$TRIGGER_SCRIPT" "$REMOTE_URL" "$STDIN_TMP" "$ORIGIN_CWD" \
+        >>"$LOG_DIR/trigger.log" 2>&1 </dev/null &)
+else
+    echo "[my-calendar pre-push] WARNING: trigger script not found at $TRIGGER_SCRIPT" >&2
+    rm -f "$STDIN_TMP"
+fi
+
+exit 0
