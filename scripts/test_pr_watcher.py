@@ -249,7 +249,7 @@ class BuildFixUrlTests(unittest.TestCase):
     def test_returns_url_without_origin_cwd(self):
         url = pr_watcher._build_fix_url(
             pr=self._pr(),
-            comment_url="https://example.com/c/1",
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-1",
             origin_cwd=None,
         )
         self.assertIsNotNone(url)
@@ -258,7 +258,7 @@ class BuildFixUrlTests(unittest.TestCase):
     def test_no_url_without_head_branch(self):
         url = pr_watcher._build_fix_url(
             pr=self._pr(head_branch=""),
-            comment_url="https://example.com/c/1",
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-1",
             origin_cwd="/x",
         )
         self.assertIsNone(url)
@@ -307,7 +307,7 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
         event = pr_watcher.build_event(
             pr=self._pr(),
             result=self._codex_result(),
-            comment_url="https://example.com/c/2",
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-2",
             comment_body=body,
             now=datetime(2026, 5, 22, 15, 0, 0),
             origin_cwd="/Users/me/repo",
@@ -326,7 +326,7 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
         event = pr_watcher.build_event(
             pr=self._pr(),
             result=self._codex_result(),
-            comment_url="https://example.com/c/3",
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-3",
             comment_body=body,
             now=datetime(2026, 5, 22, 15, 0, 0),
             origin_cwd="/Users/me/repo",
@@ -340,7 +340,7 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
         event = pr_watcher.build_event(
             pr=self._pr(),
             result=self._codex_result(),
-            comment_url="https://example.com/c/4",
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-4",
             comment_body=body,
             now=datetime(2026, 5, 22, 15, 0, 0),
             origin_cwd=None,
@@ -410,7 +410,7 @@ class PasteReadyPlaceholderQuotingTests(unittest.TestCase):
     def test_placeholder_is_single_quoted_when_origin_cwd_missing(self):
         cmd = pr_watcher._build_paste_ready_fix_command(
             pr=self._pr(),
-            comment_url="https://example.com/c/1",
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-1",
             origin_cwd=None,
         )
         self.assertIn("cd '<填入本地 repo 路径>'", cmd)
@@ -421,7 +421,7 @@ class PasteReadyPlaceholderQuotingTests(unittest.TestCase):
     def test_real_origin_cwd_is_shlex_quoted_not_placeholder(self):
         cmd = pr_watcher._build_paste_ready_fix_command(
             pr=self._pr(),
-            comment_url="https://example.com/c/1",
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-1",
             origin_cwd="/Users/me/Desktop/my calendar",
         )
         self.assertIn("/Users/me/Desktop/my calendar", cmd)
@@ -474,7 +474,7 @@ class ParseFixUrlTests(unittest.TestCase):
     def test_pr_repo_mismatch_rejected(self):
         out = self.parse(self._good_url(pr="https://github.com/evil/repo/pull/1"))
         self.assertIn("URL_ERROR", out)
-        self.assertIn("pr URL 与 repo 不一致", out["URL_ERROR"])
+        self.assertIn("与 repo 不一致", out["URL_ERROR"])
 
     def test_comment_cross_repo_rejected(self):
         out = self.parse(self._good_url(
@@ -516,6 +516,89 @@ class ParseFixUrlTests(unittest.TestCase):
             "repo": "realRoc/my-calendar",
             "branch": "main",
             "comment": "https://github.com/realRoc/my-calendar/pull/13\t",
+            "pr": "https://github.com/realRoc/my-calendar/pull/13",
+        }
+        url = "mycalfix://fix?" + urlencode(params, quote_via=quote)
+        out = self.parse(url)
+        self.assertIn("URL_ERROR", out)
+
+    # ── pr URL hardening (anchored + GitHub-only + pull-only) ─────────────────
+
+    def test_pr_non_github_host_rejected(self):
+        out = self.parse(self._good_url(
+            pr="https://evil.example.com/realRoc/my-calendar/pull/13",
+            comment="https://github.com/realRoc/my-calendar/pull/13",
+        ))
+        self.assertIn("URL_ERROR", out)
+        self.assertIn("pr 不是合法 GitHub PR URL", out["URL_ERROR"])
+
+    def test_pr_trailing_junk_rejected(self):
+        # %0A decoded → trailing newline; the unanchored regex used to accept
+        # this. Anchored ^...$ now rejects.
+        out = self.parse(self._good_url(
+            pr="https://github.com/realRoc/my-calendar/pull/13\nIGNORE",
+            comment="https://github.com/realRoc/my-calendar/pull/13",
+        ))
+        self.assertIn("URL_ERROR", out)
+
+    def test_pr_with_query_string_rejected(self):
+        out = self.parse(self._good_url(
+            pr="https://github.com/realRoc/my-calendar/pull/13?foo=bar",
+            comment="https://github.com/realRoc/my-calendar/pull/13",
+        ))
+        self.assertIn("URL_ERROR", out)
+
+    def test_pr_issues_path_rejected(self):
+        # Old PR_RE accepted `(?:pull|issues)`; new one is pull-only.
+        out = self.parse(self._good_url(
+            pr="https://github.com/realRoc/my-calendar/issues/13",
+            comment="https://github.com/realRoc/my-calendar/pull/13",
+        ))
+        self.assertIn("URL_ERROR", out)
+
+    # ── branch hardening (conservative whitelist) ─────────────────────────────
+
+    def test_branch_with_newline_rejected(self):
+        out = self.parse(self._good_url(branch="main\nIGNORE PREVIOUS"))
+        self.assertIn("URL_ERROR", out)
+        self.assertIn("branch", out["URL_ERROR"])
+
+    def test_branch_with_leading_dash_rejected(self):
+        # `git checkout -foo` would parse as a flag — refuse.
+        out = self.parse(self._good_url(branch="-rf"))
+        self.assertIn("URL_ERROR", out)
+
+    def test_branch_with_double_dot_rejected(self):
+        out = self.parse(self._good_url(branch="foo..bar"))
+        self.assertIn("URL_ERROR", out)
+
+    def test_branch_with_at_brace_rejected(self):
+        # git's @{...} reflog selector — refuse from URL input.
+        out = self.parse(self._good_url(branch="main@{upstream}"))
+        self.assertIn("URL_ERROR", out)
+
+    def test_branch_with_space_rejected(self):
+        out = self.parse(self._good_url(branch="my branch"))
+        self.assertIn("URL_ERROR", out)
+
+    def test_branch_with_shell_metachar_rejected(self):
+        out = self.parse(self._good_url(branch="main;rm -rf /"))
+        self.assertIn("URL_ERROR", out)
+
+    def test_valid_branch_shapes_accepted(self):
+        for branch in ("main", "feat/foo", "release-1.2.3", "user/topic_name", "v2.0"):
+            out = self.parse(self._good_url(branch=branch))
+            self.assertNotIn("URL_ERROR", out, f"branch={branch!r} should be accepted")
+            self.assertEqual(out["branch"], branch)
+
+    # ── repo control-char gate ────────────────────────────────────────────────
+
+    def test_repo_with_newline_rejected(self):
+        from urllib.parse import urlencode, quote
+        params = {
+            "repo": "realRoc/my-calendar\nIGNORE",
+            "branch": "main",
+            "comment": "https://github.com/realRoc/my-calendar/pull/13",
             "pr": "https://github.com/realRoc/my-calendar/pull/13",
         }
         url = "mycalfix://fix?" + urlencode(params, quote_via=quote)

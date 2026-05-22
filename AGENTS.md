@@ -418,10 +418,10 @@ bash scripts/install_app.sh
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -dump | grep -A2 mycalfix:
 
 # 手动触发一次（无 .app 也能跑，直接调脚本）
-bash scripts/launch_fix.sh 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fexample.com&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1&origin_cwd=/path/to/repo'
+bash scripts/launch_fix.sh 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1%23issuecomment-1&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1&origin_cwd=/path/to/repo'
 
 # 模拟 .app 路径（经过 LaunchServices 派发）
-open 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fexample.com&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1&origin_cwd=/path/to/repo'
+open 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1%23issuecomment-1&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1&origin_cwd=/path/to/repo'
 ```
 
 ### 没有 origin_cwd 的事件

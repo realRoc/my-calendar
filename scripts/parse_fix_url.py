@@ -9,12 +9,16 @@ CLI contract:
 Stdout is shell-safe `key=shlex_quoted_value` lines (or `URL_ERROR=...` on
 failure). Exit code is always 0; the caller checks for URL_ERROR.
 
-Security: every field is untrusted. `comment` is constrained to a GitHub
-`https://github.com/<owner>/<repo>/pull/<n>(#issuecomment-<id>)?` URL that
-points at the same repo + PR as the `repo` and `pr` fields, with no control
-characters — because the launcher feeds it into a `claude` prompt and we
-don't want an attacker-controlled URL to redirect Claude at a malicious page
-or smuggle prompt-injection newlines.
+Security: every field is untrusted. All four prompt-bound fields (`pr`,
+`branch`, `comment`, `repo`) are validated:
+
+  - `pr` / `comment` must be anchored GitHub URLs (host == github.com,
+    pull-only, no trailing junk) pointing at the same repo + PR number.
+  - `branch` passes a conservative GitHub branch-name whitelist (alnum +
+    `. _ / -`, no leading `- / .`, no `..`, no `//`, no `@{`, ≤200 chars).
+  - Every field is rejected if it contains ASCII control characters
+    (`%0A`, `%09`, etc.) — those decode through `parse_qs` and would
+    otherwise smuggle prompt-injection newlines into the `claude` prompt.
 """
 
 from __future__ import annotations
@@ -25,10 +29,38 @@ import sys
 import urllib.parse
 
 
+# Anchored + GitHub-only + pull-only. Trailing junk (incl. %0A-decoded
+# newlines) cannot pass `^...$`.
 COMMENT_RE = re.compile(
     r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)(?:#issuecomment-\d+)?$"
 )
-PR_RE = re.compile(r"^https?://[^/]+/([^/]+/[^/]+)/(?:pull|issues)/(\d+)")
+PR_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)$")
+BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]+")
+
+
+def _has_control_chars(s: str) -> bool:
+    return any(ord(c) < 0x20 for c in s)
+
+
+def _is_valid_branch(name: str) -> bool:
+    """Conservative GitHub-shaped branch-name whitelist.
+
+    Stricter than `git check-ref-format --branch` in some places (e.g. we
+    refuse leading `.`, since GitHub rejects it too) and looser in others.
+    The aim is "anything GitHub UI lets you push" — not full git ref
+    grammar — because the launcher only checks out GitHub branches.
+    """
+    if not name or len(name) > 200:
+        return False
+    if _has_control_chars(name):
+        return False
+    if not BRANCH_RE.fullmatch(name):
+        return False
+    if name.startswith(("-", "/", ".")) or name.endswith("/"):
+        return False
+    if ".." in name or "//" in name or "@{" in name:
+        return False
+    return True
 
 
 def parse_and_validate(url: str) -> dict[str, str]:
@@ -49,14 +81,26 @@ def parse_and_validate(url: str) -> dict[str, str]:
     repo = first("repo")
     pr = first("pr")
     comment = first("comment")
+    branch = first("branch")
 
-    pr_m = PR_RE.match(pr) if pr else None
-    if pr and (not pr_m or pr_m.group(1) != repo):
-        return {"URL_ERROR": f"pr URL 与 repo 不一致: pr={pr!r} repo={repo!r}"}
-    pr_number = pr_m.group(2) if pr_m else None
+    if repo and _has_control_chars(repo):
+        return {"URL_ERROR": "repo 含控制字符，拒绝执行"}
+
+    if pr:
+        if _has_control_chars(pr):
+            return {"URL_ERROR": "pr 含控制字符，拒绝执行"}
+        pr_m = PR_RE.match(pr)
+        if not pr_m or pr_m.group(1) != repo:
+            return {"URL_ERROR": f"pr 不是合法 GitHub PR URL 或与 repo 不一致: pr={pr!r} repo={repo!r}"}
+        pr_number = pr_m.group(2)
+    else:
+        pr_number = None
+
+    if branch and not _is_valid_branch(branch):
+        return {"URL_ERROR": f"branch 名非法或含控制字符: {branch!r}"}
 
     if comment:
-        if any(ord(ch) < 0x20 for ch in comment):
+        if _has_control_chars(comment):
             return {"URL_ERROR": "comment 含控制字符（换行/制表符等），拒绝执行"}
         c_m = COMMENT_RE.match(comment)
         if not c_m:
