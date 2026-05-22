@@ -49,6 +49,7 @@ import argparse
 import fcntl
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -57,6 +58,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -95,6 +97,7 @@ query($q: String!) {
         isDraft
         createdAt
         baseRefName
+        headRefName
         headRefOid
         repository {
           nameWithOwner
@@ -158,6 +161,8 @@ class PRSnap:
     default_branch: str
     head_sha: str
     created_at: str = ""      # ISO-8601 UTC (e.g. "2026-05-20T03:56:40Z")
+    head_branch: str = ""     # source branch (headRefName); needed by the
+                              # "fix this PR" launcher to git checkout locally.
 
 
 def load_state() -> dict:
@@ -282,6 +287,7 @@ def fetch_open_prs() -> list[PRSnap]:
             default_branch=default_ref,
             head_sha=n.get("headRefOid", ""),
             created_at=n.get("createdAt", "") or "",
+            head_branch=n.get("headRefName", "") or "",
         ))
     return out
 
@@ -505,12 +511,66 @@ def parse_verdict(comment_body: str | None) -> str:
     return "🤖"
 
 
+def _build_fix_url(
+    *,
+    pr: PRSnap,
+    comment_url: str | None,
+    origin_cwd: str | None,
+) -> str | None:
+    """Compose a mycalfix://fix?... URL the MyCalFix.app handler can open.
+
+    Returns None when we lack the bare minimum (comment_url + head_branch); the
+    launcher needs both to do anything useful. origin_cwd is optional — the
+    .app falls back to a folder picker when missing.
+    """
+    if not comment_url or not pr.head_branch:
+        return None
+    params = {
+        "repo": pr.repo,
+        "branch": pr.head_branch,
+        "comment": comment_url,
+        "pr": pr.url,
+    }
+    if origin_cwd:
+        params["origin_cwd"] = origin_cwd
+    return "mycalfix://fix?" + urlencode(params, quote_via=quote)
+
+
+def _build_paste_ready_fix_command(
+    *,
+    pr: PRSnap,
+    comment_url: str | None,
+    origin_cwd: str | None,
+) -> str:
+    """One-liner the user can copy-paste if MyCalFix.app isn't installed.
+
+    Mirrors what launch_fix.sh does, but expanded inline so it works even on a
+    machine without the launcher. <REPO_ROOT> is a placeholder when origin_cwd
+    is unknown so the user notices they need to fill it in.
+    """
+    cwd = shlex.quote(origin_cwd) if origin_cwd else "<填入本地 repo 路径>"
+    branch = shlex.quote(pr.head_branch or "<branch>")
+    comment_ref = comment_url or pr.url
+    prompt = (
+        f"针对 {comment_ref} 这条 codex review 反馈做修复。"
+        f"只改 review 明确点名的位置；跑项目自检；commit + push 同分支（不要 --force）。"
+        f"diff 超 200 行就 abort。"
+    )
+    return (
+        f"cd {cwd} && "
+        f"git fetch origin {branch} && git checkout {branch} && git pull --ff-only origin {branch} && "
+        f"claude {shlex.quote(prompt)}"
+    )
+
+
 def build_event(
     pr: PRSnap,
     result: CodexResult,
     comment_url: str | None,
     comment_body: str | None,
     now: datetime,
+    *,
+    origin_cwd: str | None = None,
 ) -> ReminderEvent:
     sha_short = pr.head_sha[:8]
     verdict = parse_verdict(comment_body)
@@ -527,12 +587,41 @@ def build_event(
     else:
         body_section.append("（未抓到评论内容）")
 
+    # ── fix 入口（仅 ⚠️ / ❌；✅ 不需要修复） ──
+    # URL goes on EKEvent.url (Calendar.app surfaces as a clickable link); the
+    # paste-ready command is also dumped into notes as a degradation path for
+    # when MyCalFix.app isn't installed.
+    fix_url: str | None = None
+    fix_section: list[str] = []
+    if verdict in ("⚠️", "❌"):
+        fix_url = _build_fix_url(pr=pr, comment_url=comment_url, origin_cwd=origin_cwd)
+        paste_cmd = _build_paste_ready_fix_command(
+            pr=pr, comment_url=comment_url, origin_cwd=origin_cwd,
+        )
+        fix_section = [
+            "",
+            "─" * 40,
+            "🛠 修复入口（MyCalFix）",
+        ]
+        if fix_url:
+            fix_section.append(f"链接：{fix_url}")
+        else:
+            fix_section.append("链接：（缺 head_branch 或 comment_url，未能构造 mycalfix URL）")
+        fix_section.append("")
+        if not origin_cwd:
+            fix_section.append("⚠️  origin_cwd 未知（本次走的 launchd 兜底路径，没有 hook 喂数据）。")
+            fix_section.append("    .app 触发时会弹目录选择器；下次本地 push 同 PR 会自动落 origin_cwd。")
+            fix_section.append("")
+        fix_section.append("paste-ready 命令（无 .app 时降级用）：")
+        fix_section.append(paste_cmd)
+
     # ── metadata 折到最后 ──
     metadata: list[str] = [
         "",
         "─" * 40,
         f"PR 标题：  {pr.title}",
         f"PR 链接：  {pr.url}",
+        f"分支：     {pr.head_branch or '（未知）'}",
         f"commit：   {sha_short}",
     ]
     if comment_url:
@@ -546,7 +635,7 @@ def build_event(
         metadata.append("session：  （未抓到 thread_id）")
     metadata.append(f"JSONL：    {result.jsonl_path}")
 
-    notes = "\n".join(body_section + metadata)
+    notes = "\n".join(body_section + fix_section + metadata)
 
     return ReminderEvent(
         key=f"my-calendar:pr-comment:{pr.url}:{pr.head_sha}",
@@ -555,6 +644,7 @@ def build_event(
         on_date=now.date(),
         start_at=now,
         duration_min=15,
+        url=fix_url,
     )
 
 
@@ -590,17 +680,19 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     body_preview = (comment_body or "")[:80].replace("\n", " ")
     print(f"      comment_url={comment_url}  body={len(comment_body or '')}B  preview={body_preview!r}", flush=True)
 
+    # origin_cwd may have been recorded by --force on this run (hook path) or
+    # left over from a prior hook run; resolve once and pass it both into the
+    # calendar event (so the "fix this PR" URL/paste-ready command can encode
+    # it) and the sidecar (so dashboard / future consumers don't have to parse
+    # pr_state.json).
+    origin_cwd = (state.get("prs", {}).get(pr.url, {}) or {}).get("origin_cwd")
+
     now = datetime.now()
-    event = build_event(pr, result, comment_url, comment_body, now)
+    event = build_event(pr, result, comment_url, comment_body, now, origin_cwd=origin_cwd)
     actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
     cal_action = actions.get(event.key, "?")
 
     # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
-    # origin_cwd may have been recorded by --force on this run (hook path) or
-    # left over from a prior hook run; mirror whichever is current so the
-    # calendar event's "fix this PR" launcher can read it straight from the
-    # sidecar without parsing pr_state.json.
-    origin_cwd = (state.get("prs", {}).get(pr.url, {}) or {}).get("origin_cwd")
     meta = {
         "started_at": started_at,
         "repo": pr.repo,
@@ -716,7 +808,7 @@ def main() -> int:
         # Bypass GraphQL listing; fetch this single PR's metadata
         forced = subprocess.run(
             ["gh", "pr", "view", args.force,
-             "--json", "url,number,title,isDraft,baseRefName,headRefOid,createdAt"],
+             "--json", "url,number,title,isDraft,baseRefName,headRefName,headRefOid,createdAt"],
             capture_output=True, text=True, check=True,
         )
         data = json.loads(forced.stdout)
@@ -732,6 +824,7 @@ def main() -> int:
             default_branch=data.get("baseRefName", ""),
             head_sha=data.get("headRefOid", ""),
             created_at=data.get("createdAt", "") or "",
+            head_branch=data.get("headRefName", "") or "",
         )
 
         # Record origin_cwd as soon as the hook tells us — even when the

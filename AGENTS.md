@@ -56,10 +56,15 @@ my-calendar/
 │   ├── state.json                  # 节日已创建事件 ID 索引
 │   ├── pr_watcher.py               # PR 监控入口：扫 open PR → codex review → 写日历（launchd 每 2 min）
 │   ├── pr_prompt.md                # codex review 用的 prompt 模板（含 {pr_link} 占位）
-│   ├── pr_state.json               # 每个 PR 的 head_sha / thread_id / comment_url
+│   ├── pr_state.json               # 每个 PR 的 head_sha / thread_id / comment_url / origin_cwd
 │   ├── pr_calendar_state.json      # "PR 监控" 日历的事件 ID 索引
-│   └── pr_logs/                    # codex JSONL + 最终回复，每次运行一份
-├── logs/                           # launchd stdout/stderr
+│   ├── pr_logs/                    # codex JSONL + 最终回复，每次运行一份
+│   ├── launch_fix.sh               # mycalfix:// URL handler：解析参数 → Terminal → claude 修复会话
+│   ├── fix_prompt.md               # 修复 prompt 模板（含 {pr_url}/{comment_url}/{branch} 占位）
+│   └── install_app.sh              # 编译 + 安装 MyCalFix.app 到 ~/Applications + 注册 URL scheme
+├── app/
+│   └── MyCalFix/main.applescript   # MyCalFix.app 的 AppleScript 源（含 __LAUNCHER_PATH__ 占位）
+├── logs/                           # launchd stdout/stderr + launch_fix.log
 ├── com.YOURNAME.calendar.daily.plist        # 节日任务（install_launchd.sh 渲染）
 ├── com.YOURNAME.calendar.pr-watcher.plist   # PR 监控任务（同上）
 └── .venv/                          # Python 依赖（pyobjc + lunardate）
@@ -350,3 +355,103 @@ git -C <repo-path> config core.hooksPath .git/hooks
 - 不过滤 draft PR（用户当前选择）。如果以后想跳过 draft，在 `fetch_open_prs` 后加 `if pr.is_draft: continue`
 - 不主动跑历史 PR：首轮所有 open PR 进 seed，不评论；只有后续 commit 才触发
 - codex 用 `-s danger-full-access` + `--dangerously-bypass-approvals-and-sandbox`，cwd 隔离在 `/tmp/codex-pr-runs/<uuid>` 但 sandbox 实际是 full access。prompt 模板里明确写了"只读 diff、只发评论、不改文件、不 push"——如果 PR 描述/diff 里有 prompt injection 试图让 codex 干别的，理论上 codex 可能被诱导。这是 yolo 模式的固有 trade-off
+
+---
+
+## PR review 修复入口（MyCalFix.app + mycalfix:// URL scheme）
+
+第三条独立功能：codex 写了 review 之后，从日历事件直接一键起本地 `claude` 修复会话，不用手 cd / checkout / 拷链接。
+
+### 触发链路
+
+```
+PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
+  ├─ EKEvent.url = mycalfix://fix?repo=...&branch=...&comment=...&pr=...&origin_cwd=...
+  └─ 描述里同步贴一段 paste-ready bash 命令（无 .app 时降级）
+       ↓ 点链接
+  MyCalFix.app（on open location）
+       ↓ 调
+  scripts/launch_fix.sh '<url>'
+       ↓
+  - urldecode 参数（python3 helper）
+  - origin_cwd 缺失/无效 → osascript 弹"选择文件夹"
+  - 渲染 scripts/fix_prompt.md → 替换 {pr_url}/{comment_url}/{branch}
+  - osascript 起 Terminal：cd → git fetch origin <branch> → git checkout <branch>
+    → git pull --ff-only → claude '<rendered prompt>'
+       ↓
+  claude 交互模式起来，第一条消息已经是 fix prompt，订阅生效（不是 -p 走 API key）
+```
+
+### 触发条件（pr_watcher 里）
+
+`build_event` 根据 codex verdict 决定要不要塞 URL：
+
+| verdict | EKEvent.url | 描述里贴 paste-ready 命令？ |
+|---|---|---|
+| ✅ 可以合并 | None | 否（不需要修复） |
+| ⚠️ 修正后可合并 | mycalfix://... | 是 |
+| ❌ 暂不可合并 | mycalfix://... | 是 |
+| 🤖 fallback | None | 否（解析不出 verdict，可能 codex 自己跑挂了） |
+
+### 关键文件
+
+| 路径 | 作用 |
+|---|---|
+| `scripts/fix_prompt.md` | 修复 prompt 模板（含 `{pr_url}` / `{comment_url}` / `{branch}` 占位）。硬约束包括：diff >200 行 abort、只改 review 点名的地方、跑项目自检、commit + push 同分支不要 --force |
+| `scripts/launch_fix.sh` | URL handler 本体。所有 URL 都会落到 `logs/launch_fix.log` 方便排错 |
+| `app/MyCalFix/main.applescript` | AppleScript 源（含 `__LAUNCHER_PATH__` 占位，install 时替换） |
+| `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ `xattr -dr com.apple.quarantine` + `lsregister -f` |
+| `~/Applications/MyCalFix.app` | 部署后的 .app；`com.wuyupeng.mycalfix` bundle id，注册 `mycalfix:` scheme |
+| `logs/launch_fix.log` | 每次 URL 触发的解析参数 + Terminal 启动状况 |
+
+### 手动入口
+
+```bash
+# 第一次安装 / 每次改 launch_fix.sh 或 main.applescript 后重装
+bash scripts/install_app.sh
+
+# 验证 .app 已注册 mycalfix scheme
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -dump | grep -A2 mycalfix:
+
+# 手动触发一次（无 .app 也能跑，直接调脚本）
+bash scripts/launch_fix.sh 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fexample.com&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1&origin_cwd=/path/to/repo'
+
+# 模拟 .app 路径（经过 LaunchServices 派发）
+open 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fexample.com&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1&origin_cwd=/path/to/repo'
+```
+
+### 没有 origin_cwd 的事件
+
+launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 commit 等）没经过 pre-push hook，`pr_state.json` 里没有 `origin_cwd`。这种事件：
+
+- URL 还是有效的，只是少了 `origin_cwd` 参数
+- launcher 会弹一个 osascript 文件夹选择器让用户手动定位
+- 描述里贴的 paste-ready 命令会显示 `<填入本地 repo 路径>` 占位 + 一段"⚠️ origin_cwd 未知"提示
+- 一旦用户本地 push 同 PR 一次，pre-push hook 会把 `origin_cwd` 回写到 state + 上一次 review 的 `.meta.json` 里
+
+### 调试
+
+- `tail -f logs/launch_fix.log` 看每次 URL 被怎么解析的
+- 改了 `launch_fix.sh` 不需要重装 .app（.app 只是 wrapper），改了 `main.applescript` 必须 `bash scripts/install_app.sh` 重装
+- Gatekeeper 第一次警告：installer 已经做了 `xattr -dr com.apple.quarantine`，理论上不会再弹；如果还弹，**右键 → 打开**，之后永久放行
+- `claude` 命令找不到：launcher 在 Terminal 里跑，PATH 是用户 shell 的 PATH（不是 launchd 那个被剥光的）。如果你的 `claude` 装在 `~/bin` 或自定义 npm prefix，确认它在 shell PATH 里
+- Terminal 弹了但 git fetch/checkout 失败：检查 `origin_cwd` 是不是对的 repo、分支名是否真的存在、远端是否能访问
+
+### 单元测试覆盖
+
+`scripts/test_pr_watcher.py` 覆盖：
+
+- `_build_fix_url`：有 origin_cwd / 无 origin_cwd / 缺 head_branch / 缺 comment_url 四种情形
+- `build_event`：verdict 是 ❌/⚠️ 时 URL 设置 + paste-ready 命令含 origin_cwd；verdict 是 ✅ 时 URL=None 且无修复入口区块；origin_cwd 缺失时 paste 命令带 `<填入本地 repo 路径>` 占位
+
+`launch_fix.sh` URL 解析 + AppleScript 组装目前**没有自动测试**（依赖 macOS osascript），靠手动 smoke：用一个 stub osascript 跑一次，看 `/tmp/launch_fix_smoke.log` 和 `logs/launch_fix.log`。
+
+### 设计取舍
+
+- **走 .app + URL scheme，不走 Shortcuts**：URL 稳定可版本化、可塞进 repo、不依赖 Shortcuts.app；缺点是要 osacompile 编译，installer 略复杂
+- **走 `claude "<prompt>"` 交互模式，不走 `claude -p`**：`-p` 在某些环境会吃 `ANTHROPIC_API_KEY` 而不是订阅；交互式确认走订阅
+- **不自动跑修复**：只写日历、塞 URL，由人决定要不要点。修复也是普通的 claude 会话，受用户监督
+- **默认 Terminal 不侦测 iTerm2**：减少配置面；用户用 iTerm2 想接管，改 launch_fix.sh 末尾的 osascript 即可
+- **AppleScript 用 `__LAUNCHER_PATH__` 占位**：让 .app 不绑死 repo 位置；installer 替换成绝对路径再编译
+- **`LSUIElement=true`**：MyCalFix 是一次性 URL handler，不该出现在 Dock / 应用切换器里
+- **prompt 里硬约束 "diff >200 行 abort"**：safeguard，防止 claude 被 prompt injection 或误解 review 拐去做大重构

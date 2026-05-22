@@ -213,5 +213,142 @@ class OriginCwdWithoutForceTests(unittest.TestCase):
         self.assertIn("ignored without --force", captured.getvalue())
 
 
+class BuildFixUrlTests(unittest.TestCase):
+    """The mycalfix:// URL must encode the four required fields and optionally
+    origin_cwd. Missing head_branch or comment_url → no URL (launcher can't act)."""
+
+    def _pr(self, **overrides) -> pr_watcher.PRSnap:
+        defaults = dict(
+            url="https://github.com/realRoc/my-calendar/pull/11",
+            number=11,
+            title="Phase 3",
+            is_draft=False,
+            repo="realRoc/my-calendar",
+            base="main",
+            default_branch="main",
+            head_sha="abc12345",
+            head_branch="phase3-fix-launcher",
+        )
+        defaults.update(overrides)
+        return pr_watcher.PRSnap(**defaults)
+
+    def test_returns_url_with_origin_cwd_encoded(self):
+        url = pr_watcher._build_fix_url(
+            pr=self._pr(),
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-1",
+            origin_cwd="/Users/me/Desktop/my calendar",
+        )
+        self.assertIsNotNone(url)
+        self.assertTrue(url.startswith("mycalfix://fix?"))
+        # spaces and slashes in origin_cwd are percent-encoded
+        self.assertIn("origin_cwd=%2FUsers%2Fme%2FDesktop%2Fmy%20calendar", url)
+        self.assertIn("branch=phase3-fix-launcher", url)
+        self.assertIn("repo=realRoc%2Fmy-calendar", url)
+
+    def test_returns_url_without_origin_cwd(self):
+        url = pr_watcher._build_fix_url(
+            pr=self._pr(),
+            comment_url="https://example.com/c/1",
+            origin_cwd=None,
+        )
+        self.assertIsNotNone(url)
+        self.assertNotIn("origin_cwd=", url)
+
+    def test_no_url_without_head_branch(self):
+        url = pr_watcher._build_fix_url(
+            pr=self._pr(head_branch=""),
+            comment_url="https://example.com/c/1",
+            origin_cwd="/x",
+        )
+        self.assertIsNone(url)
+
+    def test_no_url_without_comment_url(self):
+        url = pr_watcher._build_fix_url(
+            pr=self._pr(),
+            comment_url=None,
+            origin_cwd="/x",
+        )
+        self.assertIsNone(url)
+
+
+class BuildEventVerdictRoutingTests(unittest.TestCase):
+    """build_event must:
+      - set event.url to a mycalfix:// URL on ⚠️ / ❌,
+      - leave event.url=None on ✅ / 🤖,
+      - always include a paste-ready degraded command on ⚠️ / ❌."""
+
+    def _pr(self):
+        return pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/11",
+            number=11,
+            title="Phase 3",
+            is_draft=False,
+            repo="realRoc/my-calendar",
+            base="main",
+            default_branch="main",
+            head_sha="deadbeef",
+            head_branch="phase3-fix-launcher",
+        )
+
+    def _codex_result(self):
+        return pr_watcher.CodexResult(
+            thread_id="t-1",
+            last_message="ok",
+            exit_code=0,
+            jsonl_path=Path("/tmp/x.jsonl"),
+            scratch_dir=Path("/tmp/scratch"),
+        )
+
+    def test_verdict_blocker_sets_url_and_paste_cmd(self):
+        body = "存在 blocker。\n\n结论：❌ 暂不可合并（存在 blocker）"
+        from datetime import datetime
+        event = pr_watcher.build_event(
+            pr=self._pr(),
+            result=self._codex_result(),
+            comment_url="https://example.com/c/2",
+            comment_body=body,
+            now=datetime(2026, 5, 22, 15, 0, 0),
+            origin_cwd="/Users/me/repo",
+        )
+        self.assertIsNotNone(event.url)
+        self.assertTrue(event.url.startswith("mycalfix://fix?"))
+        self.assertIn("origin_cwd=%2FUsers%2Fme%2Frepo", event.url)
+        self.assertIn("🛠 修复入口", event.notes)
+        self.assertIn("paste-ready 命令", event.notes)
+        # paste cmd should have actual cwd, not placeholder
+        self.assertIn("/Users/me/repo", event.notes)
+
+    def test_verdict_pass_clears_url(self):
+        body = "未发现 blocker。\n\n结论：✅ 可以合并"
+        from datetime import datetime
+        event = pr_watcher.build_event(
+            pr=self._pr(),
+            result=self._codex_result(),
+            comment_url="https://example.com/c/3",
+            comment_body=body,
+            now=datetime(2026, 5, 22, 15, 0, 0),
+            origin_cwd="/Users/me/repo",
+        )
+        self.assertIsNone(event.url)
+        self.assertNotIn("🛠 修复入口", event.notes)
+
+    def test_verdict_blocker_no_origin_cwd_uses_placeholder(self):
+        body = "结论：⚠️ 修正后可合并"
+        from datetime import datetime
+        event = pr_watcher.build_event(
+            pr=self._pr(),
+            result=self._codex_result(),
+            comment_url="https://example.com/c/4",
+            comment_body=body,
+            now=datetime(2026, 5, 22, 15, 0, 0),
+            origin_cwd=None,
+        )
+        # URL still valid (launcher will folder-pick), just no origin_cwd param
+        self.assertIsNotNone(event.url)
+        self.assertNotIn("origin_cwd=", event.url)
+        self.assertIn("<填入本地 repo 路径>", event.notes)
+        self.assertIn("origin_cwd 未知", event.notes)
+
+
 if __name__ == "__main__":
     unittest.main()
