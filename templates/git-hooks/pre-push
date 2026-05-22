@@ -35,10 +35,13 @@ if [[ -n "${GIT_DIR}" && -x "${GIT_DIR}/hooks/pre-push.local" ]]; then
 fi
 
 if [[ -n "${LOCAL_HOOK}" ]]; then
-    if ! "${LOCAL_HOOK}" "$REMOTE_NAME" "$REMOTE_URL" < "$STDIN_TMP"; then
-        rc=$?
+    # Run local hook and capture rc BEFORE any conditional — `if ! cmd; then`
+    # would clobber $? to 0 inside the then-branch and silently let push through.
+    "${LOCAL_HOOK}" "$REMOTE_NAME" "$REMOTE_URL" < "$STDIN_TMP"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
         rm -f "$STDIN_TMP"
-        exit $rc
+        exit "$rc"
     fi
 fi
 
