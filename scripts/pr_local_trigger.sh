@@ -5,6 +5,9 @@
 #   $1 = remote URL (e.g. git@github.com:owner/repo.git)
 #   $2 = path to a temp file containing the pre-push stdin payload
 #        (lines of "<local_ref> <local_sha> <remote_ref> <remote_sha>")
+#   $3 = (optional) origin cwd — the local repo root the push came from.
+#        Forwarded to pr_watcher --force --origin-cwd so the launcher in the
+#        calendar event knows where to open a "fix this PR" session.
 #
 # For each pushed branch:
 #   - parse owner/repo from the remote URL
@@ -16,6 +19,7 @@ set -u
 
 REMOTE_URL="${1:-}"
 STDIN_FILE="${2:-}"
+ORIGIN_CWD="${3:-}"
 ROOT="$HOME/Desktop/my-calendar"
 PYTHON="$ROOT/.venv/bin/python"
 WATCHER="$ROOT/scripts/pr_watcher.py"
@@ -139,10 +143,23 @@ for branch in "${BRANCHES[@]}"; do
     fi
 
     # ── Trigger codex review via pr_watcher --force ──
-    log "  triggering pr_watcher --force $pr_url  (base=$base)"
-    "$PYTHON" "$WATCHER" --force "$pr_url" >>"$LOG_DIR/trigger.log" 2>&1 \
-        && log "  → done" \
-        || log "  → pr_watcher exited non-zero"
+    # Pass --origin-cwd when the hook captured it, so the calendar event's
+    # "open a fix session" launcher knows which repo to drop into. Launchd
+    # tick path doesn't have this info and skips the flag entirely.
+    # Two explicit code paths instead of an "extra_args[@]" array — macOS
+    # bash 3.2 + `set -u` blows up on expanding an empty array.
+    log "  triggering pr_watcher --force $pr_url  (base=$base, origin_cwd=${ORIGIN_CWD:-<none>})"
+    if [[ -n "$ORIGIN_CWD" && -d "$ORIGIN_CWD" ]]; then
+        "$PYTHON" "$WATCHER" --force "$pr_url" --origin-cwd "$ORIGIN_CWD" \
+            >>"$LOG_DIR/trigger.log" 2>&1 \
+            && log "  → done" \
+            || log "  → pr_watcher exited non-zero"
+    else
+        "$PYTHON" "$WATCHER" --force "$pr_url" \
+            >>"$LOG_DIR/trigger.log" 2>&1 \
+            && log "  → done" \
+            || log "  → pr_watcher exited non-zero"
+    fi
 done
 
 log "trigger run complete"

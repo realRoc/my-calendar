@@ -33,10 +33,14 @@ Single-pass flow:
        f. Persist {head_sha, thread_id, comment_url, timestamp} into state.
 
 Usage:
-  python pr_watcher.py                  # one polling tick (the launchd entrypoint)
-  python pr_watcher.py --dry-run        # show what would happen, no codex, no calendar
-  python pr_watcher.py --seed-only      # populate state with current head_shas, never trigger codex
-  python pr_watcher.py --force <url>    # force-trigger codex for a specific PR (ignores state)
+  python pr_watcher.py                          # one polling tick (the launchd entrypoint)
+  python pr_watcher.py --dry-run                # show what would happen, no codex, no calendar
+  python pr_watcher.py --seed-only              # populate state with current head_shas, never trigger codex
+  python pr_watcher.py --force <url>            # force-trigger codex for a specific PR (ignores state)
+  python pr_watcher.py --force <url> --origin-cwd <path>
+                                                # forwarded by the pre-push hook: the local repo
+                                                # root the push came from; saved into state so a
+                                                # future "fix this PR" launcher knows where to drop in
 """
 
 from __future__ import annotations
@@ -568,6 +572,11 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     cal_action = actions.get(event.key, "?")
 
     # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
+    # origin_cwd may have been recorded by --force on this run (hook path) or
+    # left over from a prior hook run; mirror whichever is current so the
+    # calendar event's "fix this PR" launcher can read it straight from the
+    # sidecar without parsing pr_state.json.
+    origin_cwd = (state.get("prs", {}).get(pr.url, {}) or {}).get("origin_cwd")
     meta = {
         "started_at": started_at,
         "repo": pr.repo,
@@ -580,6 +589,7 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
         "comment_body": comment_body or "",
         "codex_exit": result.exit_code,
         "jsonl_path": str(result.jsonl_path),
+        "origin_cwd": origin_cwd,
     }
     meta_path = result.jsonl_path.with_suffix(".meta.json")
     try:
@@ -624,6 +634,12 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="list candidates, do not invoke codex / write calendar / mutate state")
     parser.add_argument("--seed-only", action="store_true", help="record current head_shas in state without invoking codex")
     parser.add_argument("--force", type=str, default=None, help="force trigger codex for a specific PR URL (bypass state check)")
+    parser.add_argument(
+        "--origin-cwd", type=str, default=None,
+        help="local repo root the pushed PR came from; persisted in pr_state.json[<pr_url>].origin_cwd"
+             " so the calendar event's 'fix this PR' launcher knows where to open a session."
+             " Typically passed by the pre-push hook; ignored on the launchd tick path.",
+    )
     parser.add_argument("--ignore-throttle", action="store_true", help="ignore nighttime throttle (useful for manual runs)")
     args = parser.parse_args()
 
@@ -683,6 +699,18 @@ def main() -> int:
             head_sha=data.get("headRefOid", ""),
             created_at=data.get("createdAt", "") or "",
         )
+
+        # Record origin_cwd as soon as the hook tells us — even when the
+        # rest of this run is a no-op (already-reviewed sha). Without this,
+        # a sha that was first seen by the launchd tick and only later
+        # re-pushed by the user would never get its origin_cwd backfilled.
+        if args.origin_cwd:
+            cwd_p = Path(args.origin_cwd).expanduser().resolve()
+            if cwd_p.is_dir():
+                state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = str(cwd_p)
+            else:
+                print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
+
         # Even with --force, suppress a duplicate review when the launchd tick we
         # just waited on already covered this exact sha. To re-review the same
         # sha intentionally, delete the PR's entry from pr_state.json first.
@@ -691,7 +719,8 @@ def main() -> int:
             print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
             # Persist installed_at if this was the first-ever run; otherwise
             # the stamp gets recomputed on the next tick and the "new vs
-            # pre-existing PR" cutoff drifts.
+            # pre-existing PR" cutoff drifts. Also persists any origin_cwd
+            # update we just made above.
             save_state(state)
             return 0
         action = process_pr(pr, state, dry_run=False)
