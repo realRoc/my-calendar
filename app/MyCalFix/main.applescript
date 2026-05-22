@@ -1,13 +1,16 @@
 -- MyCalFix: URL scheme handler for mycalfix://fix?...
 --
 -- Compiled into ~/Applications/MyCalFix.app by scripts/install_app.sh.
--- The placeholder __LAUNCHER_PATH__ is replaced with the absolute path of
--- scripts/launch_fix.sh at install time, so the .app remains independent of
--- the repo's location.
+-- install_app.sh also copies launch_fix.sh + fix_prompt.md into
+-- Contents/Resources/, so the .app is self-contained and never reads files
+-- from the user's repo location (which may sit under a TCC-protected folder
+-- like ~/Desktop, ~/Documents, or ~/Downloads — those would EPERM the .app).
 
 on open location this_URL
 	try
-		do shell script "__LAUNCHER_PATH__ " & quoted form of this_URL
+		set bundle_path to POSIX path of (path to me)
+		set launcher to bundle_path & "Contents/Resources/launch_fix.sh"
+		do shell script quoted form of launcher & " " & quoted form of this_URL
 	on error errMsg number errNum
 		display alert "MyCalFix 启动失败" message "URL: " & this_URL & return & return & "错误：" & errMsg & " (" & errNum & ")"
 	end try
