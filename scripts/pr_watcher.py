@@ -667,6 +667,16 @@ def main() -> int:
     parser.add_argument("--ignore-throttle", action="store_true", help="ignore nighttime throttle (useful for manual runs)")
     args = parser.parse_args()
 
+    if args.origin_cwd and not args.force:
+        # Easy mistake when debugging manually: passing --origin-cwd to a tick run
+        # silently drops the value. Be loud about it so users notice instead of
+        # assuming state was updated.
+        print(
+            f"[pr-watcher] WARNING: --origin-cwd {args.origin_cwd!r} ignored without --force "
+            "(origin_cwd is only persisted on the --force code path)",
+            file=sys.stderr,
+        )
+
     now = datetime.now()
     state = load_state()
 

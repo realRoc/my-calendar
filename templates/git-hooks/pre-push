@@ -19,7 +19,11 @@ set -u
 REMOTE_NAME="${1:-}"
 REMOTE_URL="${2:-}"
 LOG_DIR="$HOME/.config/my-calendar/git-hooks/logs"
-TRIGGER_SCRIPT="$HOME/Desktop/my-calendar/scripts/pr_local_trigger.sh"
+# The TRIGGER_SCRIPT path on the next line is rendered by scripts/install_git_hook.sh
+# at deploy time with the absolute path to pr_local_trigger.sh inside the
+# installer's checkout. The placeholder token must stay on its own assignment
+# line so the installer can also use it to detect un-rendered templates.
+TRIGGER_SCRIPT="__TRIGGER_SCRIPT__"
 mkdir -p "$LOG_DIR"
 
 # ── 1. Drain stdin into a temp file so we can both chain-call and background-process it ──

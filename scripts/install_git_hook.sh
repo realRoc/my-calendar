@@ -26,6 +26,7 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE_FILE="$REPO_ROOT/templates/git-hooks/pre-push"
+TRIGGER_SCRIPT="$REPO_ROOT/scripts/pr_local_trigger.sh"
 HOOK_DIR="$HOME/.config/my-calendar/git-hooks"
 HOOK_FILE="$HOOK_DIR/pre-push"
 
@@ -36,12 +37,35 @@ if [[ ! -f "$TEMPLATE_FILE" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$TRIGGER_SCRIPT" ]]; then
+    echo "✗ trigger script not found in repo: $TRIGGER_SCRIPT" >&2
+    echo "  The pre-push hook would deploy with a dangling TRIGGER_SCRIPT path." >&2
+    exit 1
+fi
+
 mkdir -p "$HOOK_DIR"
 
-# ── 1. Deploy the hook ────────────────────────────────────────────────────────
+# ── 1. Render the template ───────────────────────────────────────────────────
+# Substitute __TRIGGER_SCRIPT__ with the absolute path inside *this* checkout.
+# Previously the template hardcoded $HOME/Desktop/my-calendar, which silently
+# broke any clone in a different directory (the hook fired but the trigger
+# branch always missed and PR watcher never ran).
+RENDERED_TMP="$(mktemp -t my-calendar-prepush.XXXXXX)"
+trap 'rm -f "$RENDERED_TMP"' EXIT
+# Escape replacement for sed: backslashes, ampersands, and the delimiter (|).
+escaped_trigger=$(printf '%s' "$TRIGGER_SCRIPT" | sed -e 's/[\\&|]/\\&/g')
+sed -e "s|__TRIGGER_SCRIPT__|${escaped_trigger}|g" "$TEMPLATE_FILE" > "$RENDERED_TMP"
+
+# Sanity-check the substitution actually happened.
+if grep -q '__TRIGGER_SCRIPT__' "$RENDERED_TMP"; then
+    echo "✗ rendered hook still contains __TRIGGER_SCRIPT__ placeholder — sed substitution failed" >&2
+    exit 1
+fi
+
+# ── 2. Deploy the hook ────────────────────────────────────────────────────────
 deploy_needed=1
 if [[ -f "$HOOK_FILE" ]]; then
-    if cmp -s "$TEMPLATE_FILE" "$HOOK_FILE"; then
+    if cmp -s "$RENDERED_TMP" "$HOOK_FILE"; then
         # Content matches; still make sure the executable bit is present —
         # git silently ignores non-executable hooks, and a previous chmod
         # could have been undone (umask, rsync, manual edit).
@@ -55,12 +79,12 @@ if [[ -f "$HOOK_FILE" ]]; then
     elif [[ "$FORCE" -eq 1 ]]; then
         echo "→ --force: overwriting hook at $HOOK_FILE"
     else
-        echo "✗ deployed hook differs from template:" >&2
-        echo "      template: $TEMPLATE_FILE" >&2
-        echo "      deployed: $HOOK_FILE" >&2
+        echo "✗ deployed hook differs from rendered template:" >&2
+        echo "      template:  $TEMPLATE_FILE (rendered with TRIGGER_SCRIPT=$TRIGGER_SCRIPT)" >&2
+        echo "      deployed:  $HOOK_FILE" >&2
         echo >&2
-        echo "  ── diff (deployed vs template) ────────────────────────────────" >&2
-        diff -u "$HOOK_FILE" "$TEMPLATE_FILE" >&2 || true
+        echo "  ── diff (deployed vs rendered template) ───────────────────────" >&2
+        diff -u "$HOOK_FILE" "$RENDERED_TMP" >&2 || true
         echo "  ───────────────────────────────────────────────────────────────" >&2
         echo >&2
         echo "  Re-run with --force to overwrite, or update the template to" >&2
@@ -70,9 +94,9 @@ if [[ -f "$HOOK_FILE" ]]; then
 fi
 
 if [[ "$deploy_needed" -eq 1 ]]; then
-    cp "$TEMPLATE_FILE" "$HOOK_FILE"
+    cp "$RENDERED_TMP" "$HOOK_FILE"
     chmod +x "$HOOK_FILE"
-    echo "→ deployed: $HOOK_FILE"
+    echo "→ deployed: $HOOK_FILE  (TRIGGER_SCRIPT=$TRIGGER_SCRIPT)"
 fi
 
 # ── 2. Wire up core.hooksPath ─────────────────────────────────────────────────

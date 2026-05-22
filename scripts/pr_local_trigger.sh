@@ -20,7 +20,11 @@ set -u
 REMOTE_URL="${1:-}"
 STDIN_FILE="${2:-}"
 ORIGIN_CWD="${3:-}"
-ROOT="$HOME/Desktop/my-calendar"
+# Self-locate ROOT so the script works regardless of where the user cloned the
+# repo (installer hardcoded $HOME/Desktop/my-calendar previously, which silently
+# broke any non-Desktop install — pre-push hook ran, but trigger never fired).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON="$ROOT/.venv/bin/python"
 WATCHER="$ROOT/scripts/pr_watcher.py"
 LOG_DIR="$HOME/.config/my-calendar/git-hooks/logs"
