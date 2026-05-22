@@ -75,32 +75,10 @@ if [[ -z "$URL" ]]; then
   exit 2
 fi
 
-# Parse + validate URL in Python. Output is `key=shlex_quoted_value` lines,
-# safe to eval. Validates scheme/action and cross-checks pr URL belongs to
-# the same repo as the `repo` field (defends against repo=safe/x but
-# pr=evil/y/pull/1 trickery).
-eval "$(python3 - "$URL" <<'PYEOF'
-import re, sys, shlex, urllib.parse
-p = urllib.parse.urlparse(sys.argv[1])
-def err(m):
-    print(f"URL_ERROR={shlex.quote(m)}")
-    sys.exit(0)
-if (p.scheme or "").lower() != "mycalfix":
-    err(f"URL scheme 不是 mycalfix: {p.scheme!r}")
-if (p.netloc or "").lower() != "fix":
-    err(f"URL action 不是 fix: {p.netloc!r}")
-q = urllib.parse.parse_qs(p.query, keep_blank_values=False)
-def first(k):
-    v = q.get(k, [""])
-    return v[0] if v else ""
-repo, pr = first("repo"), first("pr")
-m = re.match(r"https?://[^/]+/([^/]+/[^/]+)/(?:pull|issues)/\d+", pr) if pr else None
-if pr and (not m or m.group(1) != repo):
-    err(f"pr URL 与 repo 不一致: pr={pr!r} repo={repo!r}")
-for k in ("repo", "branch", "comment", "pr", "origin_cwd"):
-    print(f"{k}={shlex.quote(first(k))}")
-PYEOF
-)"
+# Parse + validate URL via external module so unit tests can import it.
+# Validates scheme/action, cross-checks pr URL repo, and constrains comment to
+# a GitHub PR comment URL on the same repo + PR (rejects control chars).
+eval "$(python3 "$HERE/parse_fix_url.py" "$URL")"
 
 if [[ -n "${URL_ERROR:-}" ]]; then
   echo "$URL_ERROR" >> "$LOG_FILE"
@@ -148,6 +126,25 @@ if [[ ! -f "$PROMPT_FILE" ]]; then
   echo "$msg" >> "$LOG_FILE"
   show_alert "$msg"
   exit 5
+fi
+
+# Refuse to fetch/checkout on top of uncommitted work. The generated Terminal
+# command runs `git checkout <branch> && git pull --ff-only`, which would
+# carry the user's dirty tree onto the target branch before claude even gets
+# a chance to abort. Bail here instead.
+dirty=$(git -C "$origin_cwd" status --porcelain 2>/dev/null || echo __ERR__)
+if [[ "$dirty" == "__ERR__" ]]; then
+  msg="MyCalFix: 无法在 $origin_cwd 跑 git status，放弃。"
+  echo "$msg" >> "$LOG_FILE"
+  show_alert "$msg"
+  exit 6
+fi
+if [[ -n "$dirty" ]]; then
+  msg="MyCalFix: $origin_cwd 有未提交的改动，请先 commit/stash 后再点修复入口。"
+  echo "  dirty worktree, aborting" >> "$LOG_FILE"
+  echo "$dirty" | head -10 >> "$LOG_FILE"
+  show_alert "$msg"
+  exit 6
 fi
 
 rendered_prompt=$(

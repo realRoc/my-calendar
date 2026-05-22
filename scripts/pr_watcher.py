@@ -103,6 +103,9 @@ query($q: String!) {
           nameWithOwner
           defaultBranchRef { name }
         }
+        headRepository {
+          nameWithOwner
+        }
       }
     }
   }
@@ -163,6 +166,9 @@ class PRSnap:
     created_at: str = ""      # ISO-8601 UTC (e.g. "2026-05-20T03:56:40Z")
     head_branch: str = ""     # source branch (headRefName); needed by the
                               # "fix this PR" launcher to git checkout locally.
+    head_repo: str = ""       # headRepository.nameWithOwner; differs from .repo
+                              # on fork PRs. Used to suppress the fix URL when
+                              # the head branch isn't on the base repo's origin.
 
 
 def load_state() -> dict:
@@ -277,6 +283,7 @@ def fetch_open_prs() -> list[PRSnap]:
             continue
         repo = n.get("repository", {}) or {}
         default_ref = (repo.get("defaultBranchRef") or {}).get("name") or ""
+        head_repo = (n.get("headRepository") or {}).get("nameWithOwner") or ""
         out.append(PRSnap(
             url=n["url"],
             number=int(n["number"]),
@@ -288,6 +295,7 @@ def fetch_open_prs() -> list[PRSnap]:
             head_sha=n.get("headRefOid", ""),
             created_at=n.get("createdAt", "") or "",
             head_branch=n.get("headRefName", "") or "",
+            head_repo=head_repo,
         ))
     return out
 
@@ -511,6 +519,16 @@ def parse_verdict(comment_body: str | None) -> str:
     return "🤖"
 
 
+def _is_fork_pr(pr: PRSnap) -> bool:
+    """True iff the PR's head branch lives on a different repo than its base.
+
+    `head_repo == ""` (head fork deleted, or missing from GraphQL) is treated
+    as the safe pessimistic case — same as a fork — because the launcher would
+    blindly try `git fetch origin <branch>` on the base repo and fail.
+    """
+    return bool(pr.repo) and pr.head_repo != pr.repo
+
+
 def _build_fix_url(
     *,
     pr: PRSnap,
@@ -519,11 +537,14 @@ def _build_fix_url(
 ) -> str | None:
     """Compose a mycalfix://fix?... URL the MyCalFix.app handler can open.
 
-    Returns None when we lack the bare minimum (comment_url + head_branch); the
-    launcher needs both to do anything useful. origin_cwd is optional — the
-    .app falls back to a folder picker when missing.
+    Returns None when we lack the bare minimum (comment_url + head_branch), or
+    for fork PRs whose head branch isn't on the base repo's origin (the
+    launcher's `git fetch origin <branch>` would fail). origin_cwd is optional
+    — the .app falls back to a folder picker when missing.
     """
     if not comment_url or not pr.head_branch:
+        return None
+    if _is_fork_pr(pr):
         return None
     params = {
         "repo": pr.repo,
@@ -592,30 +613,39 @@ def build_event(
     # ── fix 入口（仅 ⚠️ / ❌；✅ 不需要修复） ──
     # URL goes on EKEvent.url (Calendar.app surfaces as a clickable link); the
     # paste-ready command is also dumped into notes as a degradation path for
-    # when MyCalFix.app isn't installed.
+    # when MyCalFix.app isn't installed. Fork PRs are explicitly skipped — the
+    # launcher's `git fetch origin <branch>` would fail on a head branch that
+    # lives in someone else's fork.
     fix_url: str | None = None
     fix_section: list[str] = []
     if verdict in ("⚠️", "❌"):
-        fix_url = _build_fix_url(pr=pr, comment_url=comment_url, origin_cwd=origin_cwd)
-        paste_cmd = _build_paste_ready_fix_command(
-            pr=pr, comment_url=comment_url, origin_cwd=origin_cwd,
-        )
+        fork = _is_fork_pr(pr)
         fix_section = [
             "",
             "─" * 40,
             "🛠 修复入口（MyCalFix）",
         ]
-        if fix_url:
-            fix_section.append(f"链接：{fix_url}")
+        if fork:
+            fix_section.append(
+                f"链接：（fork PR，head 在 {pr.head_repo or '未知 fork'}，"
+                f"暂不支持自动修复入口；请到对应 fork 本地手动 checkout）"
+            )
         else:
-            fix_section.append("链接：（缺 head_branch 或 comment_url，未能构造 mycalfix URL）")
-        fix_section.append("")
-        if not origin_cwd:
-            fix_section.append("⚠️  origin_cwd 未知（本次走的 launchd 兜底路径，没有 hook 喂数据）。")
-            fix_section.append("    .app 触发时会弹目录选择器；下次本地 push 同 PR 会自动落 origin_cwd。")
+            fix_url = _build_fix_url(pr=pr, comment_url=comment_url, origin_cwd=origin_cwd)
+            paste_cmd = _build_paste_ready_fix_command(
+                pr=pr, comment_url=comment_url, origin_cwd=origin_cwd,
+            )
+            if fix_url:
+                fix_section.append(f"链接：{fix_url}")
+            else:
+                fix_section.append("链接：（缺 head_branch 或 comment_url，未能构造 mycalfix URL）")
             fix_section.append("")
-        fix_section.append("paste-ready 命令（无 .app 时降级用）：")
-        fix_section.append(paste_cmd)
+            if not origin_cwd:
+                fix_section.append("⚠️  origin_cwd 未知（本次走的 launchd 兜底路径，没有 hook 喂数据）。")
+                fix_section.append("    .app 触发时会弹目录选择器；下次本地 push 同 PR 会自动落 origin_cwd。")
+                fix_section.append("")
+            fix_section.append("paste-ready 命令（无 .app 时降级用）：")
+            fix_section.append(paste_cmd)
 
     # ── metadata 折到最后 ──
     metadata: list[str] = [
@@ -810,23 +840,28 @@ def main() -> int:
         # Bypass GraphQL listing; fetch this single PR's metadata
         forced = subprocess.run(
             ["gh", "pr", "view", args.force,
-             "--json", "url,number,title,isDraft,baseRefName,headRefName,headRefOid,createdAt"],
+             "--json", "url,number,title,isDraft,baseRefName,headRefName,headRefOid,createdAt,headRepository,headRepositoryOwner"],
             capture_output=True, text=True, check=True,
         )
         data = json.loads(forced.stdout)
         # gh pr view doesn't give defaultBranchRef directly; treat base as if it were default for --force.
         # (The pre-push trigger script already verifies base==default before invoking --force.)
+        base_repo = args.force.replace("https://github.com/", "").rsplit("/pull/", 1)[0]
+        head_owner = (data.get("headRepositoryOwner") or {}).get("login") or ""
+        head_name = (data.get("headRepository") or {}).get("name") or ""
+        head_repo = f"{head_owner}/{head_name}" if head_owner and head_name else ""
         pr = PRSnap(
             url=data["url"],
             number=int(data["number"]),
             title=data.get("title", ""),
             is_draft=bool(data.get("isDraft", False)),
-            repo=args.force.replace("https://github.com/", "").rsplit("/pull/", 1)[0],
+            repo=base_repo,
             base=data.get("baseRefName", ""),
             default_branch=data.get("baseRefName", ""),
             head_sha=data.get("headRefOid", ""),
             created_at=data.get("createdAt", "") or "",
             head_branch=data.get("headRefName", "") or "",
+            head_repo=head_repo,
         )
 
         # Record origin_cwd as soon as the hook tells us — even when the

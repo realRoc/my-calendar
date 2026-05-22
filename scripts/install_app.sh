@@ -11,6 +11,7 @@ ROOT=$(cd "$HERE/.." && pwd)
 
 SRC_APPLESCRIPT="$ROOT/app/MyCalFix/main.applescript"
 LAUNCHER="$HERE/launch_fix.sh"
+URL_PARSER="$HERE/parse_fix_url.py"
 PROMPT="$HERE/fix_prompt.md"
 
 APP_DIR="$HOME/Applications"
@@ -28,6 +29,10 @@ fi
 if [[ ! -x "$LAUNCHER" ]]; then
   echo "✗ launcher not executable: $LAUNCHER" >&2
   echo "  fix with: chmod +x $LAUNCHER" >&2
+  exit 1
+fi
+if [[ ! -f "$URL_PARSER" ]]; then
+  echo "✗ url parser not found: $URL_PARSER" >&2
   exit 1
 fi
 if [[ ! -f "$PROMPT" ]]; then
@@ -51,9 +56,10 @@ osacompile -o "$APP_PATH" "$SRC_APPLESCRIPT"
 # matters because the repo may live under a TCC-protected folder (~/Desktop,
 # ~/Documents, ~/Downloads) — reading scripts/launch_fix.sh from there would
 # EPERM. Files inside the .app bundle are not TCC-gated for the .app itself.
-echo "  → installing launcher + prompt into $RESOURCES"
+echo "  → installing launcher + url parser + prompt into $RESOURCES"
 cp "$LAUNCHER" "$RESOURCES/launch_fix.sh"
 chmod +x "$RESOURCES/launch_fix.sh"
+cp "$URL_PARSER" "$RESOURCES/parse_fix_url.py"
 cp "$PROMPT" "$RESOURCES/fix_prompt.md"
 
 if [[ ! -f "$PLIST" ]]; then
@@ -98,10 +104,11 @@ echo "✅ installed $APP_PATH"
 echo "   bundle:    $BUNDLE_ID"
 echo "   scheme:    $URL_SCHEME://"
 echo "   launcher:  $RESOURCES/launch_fix.sh  (bundled)"
+echo "   parser:    $RESOURCES/parse_fix_url.py  (bundled)"
 echo "   prompt:    $RESOURCES/fix_prompt.md  (bundled)"
 echo
 echo "smoke test:"
-echo "  open 'mycalfix://fix?repo=realRoc%2Fmy-calendar&branch=main&comment=https%3A%2F%2Fexample.com&pr=https%3A%2F%2Fgithub.com%2FrealRoc%2Fmy-calendar%2Fpull%2F10&origin_cwd=$ROOT'"
+echo "  open 'mycalfix://fix?repo=realRoc%2Fmy-calendar&branch=main&comment=https%3A%2F%2Fgithub.com%2FrealRoc%2Fmy-calendar%2Fpull%2F10%23issuecomment-1&pr=https%3A%2F%2Fgithub.com%2FrealRoc%2Fmy-calendar%2Fpull%2F10&origin_cwd=$ROOT'"
 echo "  → should open Terminal, cd into $ROOT, attempt git fetch/checkout main, and start claude"
 echo
 echo "tail logs:  tail -f \$HOME/Library/Logs/MyCalFix/launch_fix.log"
