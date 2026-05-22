@@ -62,6 +62,23 @@ chmod +x "$RESOURCES/launch_fix.sh"
 cp "$URL_PARSER" "$RESOURCES/parse_fix_url.py"
 cp "$PROMPT" "$RESOURCES/fix_prompt.md"
 
+# Verify the bundled parser is actually runnable end-to-end. Catches a missing
+# python3 on $PATH or a syntactic regression in parse_fix_url.py at install
+# time, rather than at the moment the user clicks a calendar link and gets a
+# silent failure (alert path was added in launch_fix.sh as a runtime fallback).
+echo "  → smoke-testing bundled parser"
+SMOKE_URL='mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1'
+if ! smoke_out=$(python3 "$RESOURCES/parse_fix_url.py" "$SMOKE_URL" 2>&1); then
+  echo "✗ bundled parser failed to run: $smoke_out" >&2
+  echo "  (python3 may not be available, or parse_fix_url.py is broken)" >&2
+  exit 3
+fi
+if [[ "$smoke_out" == *URL_ERROR=* ]]; then
+  echo "✗ bundled parser rejected a known-good URL — regression?" >&2
+  echo "$smoke_out" >&2
+  exit 3
+fi
+
 if [[ ! -f "$PLIST" ]]; then
   echo "✗ compiled app missing Info.plist: $PLIST" >&2
   exit 2

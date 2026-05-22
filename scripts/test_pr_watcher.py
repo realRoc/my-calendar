@@ -428,6 +428,107 @@ class PasteReadyPlaceholderQuotingTests(unittest.TestCase):
         self.assertNotIn("<填入本地 repo 路径>", cmd)
 
 
+class PasteReadyFetchHandlesRemoteOnlyBranchTests(unittest.TestCase):
+    """Regression: paste-ready command must not break when the user has never
+    seen the PR branch locally (e.g. launchd-fallback path / cross-machine PR).
+
+    Plain `git fetch origin <branch>` only guarantees FETCH_HEAD; the
+    follow-up `git checkout <branch>` then fails with `pathspec '<branch>' did
+    not match any file(s) known to git` when neither the local branch nor a
+    remote-tracking ref exists. Fix: explicit `+refs/heads/<b>:refs/remotes/
+    origin/<b>` refspec + `git switch` (which auto-creates a tracking branch
+    from origin/<b> when missing locally)."""
+
+    def _pr(self) -> pr_watcher.PRSnap:
+        return pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/11",
+            number=11,
+            title="Phase 3",
+            is_draft=False,
+            repo="realRoc/my-calendar",
+            base="main",
+            default_branch="main",
+            head_sha="deadbeef",
+            head_branch="phase3-fix-launcher",
+            head_repo="realRoc/my-calendar",
+        )
+
+    def test_paste_cmd_uses_explicit_remote_tracking_refspec(self):
+        cmd = pr_watcher._build_paste_ready_fix_command(
+            pr=self._pr(),
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-1",
+            origin_cwd="/Users/me/repo",
+        )
+        # explicit refspec writes refs/remotes/origin/<branch>; shlex.quote may
+        # or may not wrap it depending on the branch name's chars — assert on
+        # the refspec substring rather than exact surrounding quoting.
+        self.assertIn(
+            "+refs/heads/phase3-fix-launcher:refs/remotes/origin/phase3-fix-launcher",
+            cmd,
+        )
+        self.assertIn("git fetch origin ", cmd)
+        # switch (not checkout) so a missing local branch is auto-created from origin/
+        self.assertIn("git switch phase3-fix-launcher", cmd)
+        self.assertNotIn("git checkout", cmd)
+
+    def test_paste_cmd_still_pulls_ff_only_after_switch(self):
+        # When the local branch already exists we still want to be up-to-date
+        # before claude opens; --ff-only guards against accidental merge.
+        cmd = pr_watcher._build_paste_ready_fix_command(
+            pr=self._pr(),
+            comment_url="https://github.com/realRoc/my-calendar/pull/11#issuecomment-1",
+            origin_cwd="/Users/me/repo",
+        )
+        self.assertIn("git pull --ff-only origin phase3-fix-launcher", cmd)
+
+
+class ValidateOriginCwdRegexTests(unittest.TestCase):
+    """Regression: the inline Python normalizer in launch_fix.sh used to
+    exclude `.` from the repo half of `owner/name`, so legitimate GitHub repos
+    like `owner/my.repo` validated as a mismatch and dropped the user into the
+    folder picker. Allow dots while still stripping the optional `.git`
+    suffix."""
+
+    SNIPPET = (
+        'import sys, re\n'
+        'm = re.search(r"[:/]([^/:]+/[^/:]+?)(?:\\.git)?/?$", sys.argv[1])\n'
+        'print(m.group(1) if m else "")\n'
+    )
+
+    def _normalize(self, url: str) -> str:
+        result = subprocess.run(
+            ["python3", "-c", self.SNIPPET, url],
+            capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    def test_dot_in_repo_name_accepted(self):
+        self.assertEqual(
+            self._normalize("git@github.com:owner/my.repo.git"),
+            "owner/my.repo",
+        )
+        self.assertEqual(
+            self._normalize("https://github.com/owner/my.repo"),
+            "owner/my.repo",
+        )
+
+    def test_plain_repo_still_normalizes(self):
+        self.assertEqual(
+            self._normalize("git@github.com:realRoc/my-calendar.git"),
+            "realRoc/my-calendar",
+        )
+        self.assertEqual(
+            self._normalize("https://github.com/realRoc/my-calendar.git"),
+            "realRoc/my-calendar",
+        )
+
+    def test_trailing_slash_stripped(self):
+        self.assertEqual(
+            self._normalize("https://github.com/owner/repo.git/"),
+            "owner/repo",
+        )
+
+
 class ParseFixUrlTests(unittest.TestCase):
     """parse_fix_url.parse_and_validate is the trust boundary for the
     mycalfix:// scheme. Anything that flunks must return URL_ERROR and not

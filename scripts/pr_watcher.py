@@ -572,7 +572,13 @@ def _build_paste_ready_fix_command(
     # Single-quote the placeholder so a copy-paste lands `cd: No such file or
     # directory: <…>` (clear error) instead of bash parsing `<…>` as a redirect.
     cwd = shlex.quote(origin_cwd) if origin_cwd else "'<填入本地 repo 路径>'"
-    branch = shlex.quote(pr.head_branch or "<branch>")
+    raw_branch = pr.head_branch or "<branch>"
+    branch = shlex.quote(raw_branch)
+    # Explicit refspec ensures `refs/remotes/origin/<branch>` is updated even
+    # when the local config wouldn't otherwise create it, so `git switch` can
+    # auto-track from the remote when the branch doesn't exist locally yet
+    # (the launchd-fallback / cross-machine PR case).
+    refspec = shlex.quote(f"+refs/heads/{raw_branch}:refs/remotes/origin/{raw_branch}")
     comment_ref = comment_url or pr.url
     prompt = (
         f"针对 {comment_ref} 这条 codex review 反馈做修复。"
@@ -581,7 +587,8 @@ def _build_paste_ready_fix_command(
     )
     return (
         f"cd {cwd} && "
-        f"git fetch origin {branch} && git checkout {branch} && git pull --ff-only origin {branch} && "
+        f"git fetch origin {refspec} && "
+        f"git switch {branch} && git pull --ff-only origin {branch} && "
         f"claude {shlex.quote(prompt)}"
     )
 

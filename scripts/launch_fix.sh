@@ -50,9 +50,12 @@ validate_origin_cwd() {
     return 1
   fi
   url=$(git -C "$dir" config --get remote.origin.url 2>/dev/null || true)
+  # Allow `.` in repo names (e.g. owner/my.repo) — GitHub repo names may
+  # contain dots. The lazy `+?` combined with the optional `.git` suffix and
+  # `/?$` anchor still strips `.git` cleanly from both SSH and HTTPS URLs.
   normalized=$(python3 -c '
 import sys, re
-m = re.search(r"[:/]([^/:]+/[^/:.]+?)(?:\.git)?/?$", sys.argv[1])
+m = re.search(r"[:/]([^/:]+/[^/:]+?)(?:\.git)?/?$", sys.argv[1])
 print(m.group(1) if m else "")
 ' "$url")
   if [[ "$normalized" != "$expected" ]]; then
@@ -78,7 +81,18 @@ fi
 # Parse + validate URL via external module so unit tests can import it.
 # Validates scheme/action, cross-checks pr URL repo, and constrains comment to
 # a GitHub PR comment URL on the same repo + PR (rejects control chars).
-eval "$(python3 "$HERE/parse_fix_url.py" "$URL")"
+#
+# Capture stdout + exit status separately. Bare `eval "$(python3 …)"` swallows
+# a missing python3 / parser crash silently — the subshell prints nothing,
+# `set -u` then trips on unbound `URL_ERROR`/`repo`/… below with a cryptic
+# message instead of going through `show_alert`. Surface the failure here.
+if ! parser_output=$(python3 "$HERE/parse_fix_url.py" "$URL" 2>>"$LOG_FILE"); then
+  msg="MyCalFix: URL 解析器执行失败 (python3 不可用或脚本异常)，查看 $LOG_FILE"
+  echo "$msg" >> "$LOG_FILE"
+  show_alert "$msg"
+  exit 2
+fi
+eval "$parser_output"
 
 if [[ -n "${URL_ERROR:-}" ]]; then
   echo "$URL_ERROR" >> "$LOG_FILE"
@@ -160,6 +174,11 @@ sys.stdout.write(text)
 )
 
 # shlex.quote handles backticks/$/quotes/newlines in rendered_prompt.
+# Fetch uses an explicit `+refs/heads/<b>:refs/remotes/origin/<b>` refspec so
+# `git switch <b>` works in both directions: local branch exists (just check it
+# out) and local branch missing (auto-create tracking from origin/<b>). Plain
+# `git fetch origin <b>` only writes FETCH_HEAD in some configs, and the
+# follow-up `git checkout <b>` then fails when the local branch isn't there.
 cmd=$(
   CWD="$origin_cwd" BRANCH="$branch" PROMPT="$rendered_prompt" \
   python3 -c '
@@ -167,11 +186,12 @@ import os, shlex
 cwd = os.environ["CWD"]
 branch = os.environ["BRANCH"]
 prompt = os.environ["PROMPT"]
+refspec = "+refs/heads/{0}:refs/remotes/origin/{0}".format(branch)
 parts = [
     "cd " + shlex.quote(cwd),
     "echo \x27[MyCalFix] fetching origin/\x27" + shlex.quote(branch),
-    "git fetch origin " + shlex.quote(branch),
-    "git checkout " + shlex.quote(branch),
+    "git fetch origin " + shlex.quote(refspec),
+    "git switch " + shlex.quote(branch),
     "git pull --ff-only origin " + shlex.quote(branch),
     "claude " + shlex.quote(prompt),
 ]
