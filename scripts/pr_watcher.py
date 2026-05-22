@@ -548,7 +548,9 @@ def _build_paste_ready_fix_command(
     machine without the launcher. <REPO_ROOT> is a placeholder when origin_cwd
     is unknown so the user notices they need to fill it in.
     """
-    cwd = shlex.quote(origin_cwd) if origin_cwd else "<填入本地 repo 路径>"
+    # Single-quote the placeholder so a copy-paste lands `cd: No such file or
+    # directory: <…>` (clear error) instead of bash parsing `<…>` as a redirect.
+    cwd = shlex.quote(origin_cwd) if origin_cwd else "'<填入本地 repo 路径>'"
     branch = shlex.quote(pr.head_branch or "<branch>")
     comment_ref = comment_url or pr.url
     prompt = (

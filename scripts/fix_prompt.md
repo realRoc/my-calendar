@@ -6,7 +6,20 @@
 
 ## 第一步：读完整反馈
 
-用 `gh api -H "Accept: application/vnd.github+json" "$(printf '%s' "{comment_url}" | sed -E 's#https://github.com/([^/]+)/([^/]+)/pull/[0-9]+#repos/\1/\2#')/issues/comments/$(printf '%s' "{comment_url}" | sed -E 's#.*issuecomment-([0-9]+).*#\1#')" --jq '.body'` 把这条评论的完整 body 抓下来读一遍。重点看：
+用下面这段命令把评论的完整 body 抓下来读一遍。注意：`{comment_url}` 一般形如
+`https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`，必须把 `owner/repo` 和
+`comment_id` 分两次解析，**不能**直接对整条 URL 做单次 sed 替换——`#issuecomment-...`
+fragment 会污染 API endpoint，导致 `gh api` 报 404。
+
+```bash
+url='{comment_url}'
+owner_repo=$(printf '%s' "$url" | sed -E 's|^https://github.com/([^/]+/[^/]+)/pull/[0-9]+.*$|\1|')
+comment_id=$(printf '%s' "$url" | sed -E 's|.*issuecomment-([0-9]+).*|\1|')
+gh api -H "Accept: application/vnd.github+json" \
+  "repos/$owner_repo/issues/comments/$comment_id" --jq '.body'
+```
+
+重点看：
 
 - `## Blocker / 必须修正` 一节：列出的每一条都必须处理
 - `## 后端成本与资源影响` 一节：通常是评估，不需要改代码；除非里头明确说"建议改 X"

@@ -350,5 +350,80 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
         self.assertIn("origin_cwd 未知", event.notes)
 
 
+class FixPromptCommentEndpointTests(unittest.TestCase):
+    """Regression: the gh api snippet in scripts/fix_prompt.md must produce a
+    valid endpoint when {comment_url} carries the #issuecomment-<id> fragment.
+
+    The previous one-shot `sed s#…/pull/<n>#repos/<o>/<r>#` only replaced the
+    prefix and left the fragment in the path, yielding
+    `repos/<o>/<r>#issuecomment-<id>/issues/comments/<id>` — not a valid
+    GitHub API path. The fix splits owner/repo + comment_id into two separate
+    extractions; this test pins that contract."""
+
+    FIXTURE_URL = "https://github.com/realRoc/my-calendar/pull/13#issuecomment-4516623335"
+
+    def test_owner_repo_extracted_stripping_fragment(self):
+        result = subprocess.run(
+            ["sed", "-E", r"s|^https://github.com/([^/]+/[^/]+)/pull/[0-9]+.*$|\1|"],
+            input=self.FIXTURE_URL, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "realRoc/my-calendar")
+
+    def test_comment_id_extracted(self):
+        result = subprocess.run(
+            ["sed", "-E", r"s|.*issuecomment-([0-9]+).*|\1|"],
+            input=self.FIXTURE_URL, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "4516623335")
+
+    def test_fix_prompt_does_not_regress_to_single_sed(self):
+        # Burn-in: the prompt must not regress to the buggy pattern. The old
+        # bug was the substitution `…/pull/[0-9]+#repos/…` (no fragment-eating
+        # group), which leaves the #issuecomment-<id> tail glued onto the
+        # replacement.
+        prompt = (HERE / "fix_prompt.md").read_text(encoding="utf-8")
+        self.assertNotIn("/pull/[0-9]+#repos/", prompt)
+
+
+class PasteReadyPlaceholderQuotingTests(unittest.TestCase):
+    """Regression: when origin_cwd is unknown, the paste-ready fallback in
+    _build_paste_ready_fix_command must single-quote the `<…>` placeholder.
+    Otherwise bash parses `cd <填入本地 repo 路径>` as input redirection from
+    a non-existent file, instead of a clear `cd: No such file or directory`."""
+
+    def _pr(self) -> pr_watcher.PRSnap:
+        return pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/11",
+            number=11,
+            title="Phase 3",
+            is_draft=False,
+            repo="realRoc/my-calendar",
+            base="main",
+            default_branch="main",
+            head_sha="deadbeef",
+            head_branch="phase3-fix-launcher",
+        )
+
+    def test_placeholder_is_single_quoted_when_origin_cwd_missing(self):
+        cmd = pr_watcher._build_paste_ready_fix_command(
+            pr=self._pr(),
+            comment_url="https://example.com/c/1",
+            origin_cwd=None,
+        )
+        self.assertIn("cd '<填入本地 repo 路径>'", cmd)
+        # Sanity: the unquoted form (which bash treats as a redirect) must NOT
+        # appear anywhere.
+        self.assertNotIn("cd <填入本地 repo 路径>", cmd)
+
+    def test_real_origin_cwd_is_shlex_quoted_not_placeholder(self):
+        cmd = pr_watcher._build_paste_ready_fix_command(
+            pr=self._pr(),
+            comment_url="https://example.com/c/1",
+            origin_cwd="/Users/me/Desktop/my calendar",
+        )
+        self.assertIn("/Users/me/Desktop/my calendar", cmd)
+        self.assertNotIn("<填入本地 repo 路径>", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()
