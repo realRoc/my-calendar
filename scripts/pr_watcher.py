@@ -174,6 +174,30 @@ def save_state(state: dict) -> None:
     )
 
 
+def sync_meta_origin_cwd(last_jsonl: str | None, origin_cwd: str) -> tuple[Path | None, bool]:
+    """Mirror origin_cwd into the prior run's .meta.json sidecar.
+
+    Returns (meta_path, changed). A missing last_jsonl or sidecar is a no-op.
+    """
+    if not last_jsonl:
+        return None, False
+
+    meta_path = Path(last_jsonl).with_suffix(".meta.json")
+    if not meta_path.exists():
+        return None, False
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if meta.get("origin_cwd") == origin_cwd:
+        return meta_path, False
+
+    meta["origin_cwd"] = origin_cwd
+    meta_path.write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return meta_path, True
+
+
 # ─── throttling ────────────────────────────────────────────────────────────────
 
 
@@ -704,10 +728,12 @@ def main() -> int:
         # rest of this run is a no-op (already-reviewed sha). Without this,
         # a sha that was first seen by the launchd tick and only later
         # re-pushed by the user would never get its origin_cwd backfilled.
+        new_origin_cwd: str | None = None
         if args.origin_cwd:
             cwd_p = Path(args.origin_cwd).expanduser().resolve()
             if cwd_p.is_dir():
-                state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = str(cwd_p)
+                new_origin_cwd = str(cwd_p)
+                state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = new_origin_cwd
             else:
                 print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
 
@@ -717,6 +743,18 @@ def main() -> int:
         prev = state.get("prs", {}).get(pr.url) or {}
         if prev.get("last_commented_sha") == pr.head_sha:
             print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
+            # Mirror the freshly-stamped origin_cwd into the prior run's
+            # .meta.json sidecar so dashboard / "fix this PR" consumers don't
+            # have to fall back to pr_state.json. Without this, a re-push from
+            # a relocated checkout updates pr_state.json but leaves the
+            # sidecar pointing at the stale path (or null).
+            if new_origin_cwd:
+                try:
+                    meta_path, changed = sync_meta_origin_cwd(prev.get("last_jsonl"), new_origin_cwd)
+                    if changed and meta_path is not None:
+                        print(f"      backfilled origin_cwd into {meta_path.name}")
+                except (OSError, json.JSONDecodeError) as e:
+                    print(f"      warn: failed to backfill origin_cwd in prior .meta.json: {e}")
             # Persist installed_at if this was the first-ever run; otherwise
             # the stamp gets recomputed on the next tick and the "new vs
             # pre-existing PR" cutoff drifts. Also persists any origin_cwd

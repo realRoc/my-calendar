@@ -42,7 +42,15 @@ mkdir -p "$HOOK_DIR"
 deploy_needed=1
 if [[ -f "$HOOK_FILE" ]]; then
     if cmp -s "$TEMPLATE_FILE" "$HOOK_FILE"; then
-        echo "✓ hook already up-to-date: $HOOK_FILE"
+        # Content matches; still make sure the executable bit is present —
+        # git silently ignores non-executable hooks, and a previous chmod
+        # could have been undone (umask, rsync, manual edit).
+        if [[ ! -x "$HOOK_FILE" ]]; then
+            chmod +x "$HOOK_FILE"
+            echo "✓ hook content matches template; restored executable bit: $HOOK_FILE"
+        else
+            echo "✓ hook already up-to-date: $HOOK_FILE"
+        fi
         deploy_needed=0
     elif [[ "$FORCE" -eq 1 ]]; then
         echo "→ --force: overwriting hook at $HOOK_FILE"
