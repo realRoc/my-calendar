@@ -44,9 +44,16 @@ APPLESCRIPT
 
 # 0 if $1 is a git worktree whose origin matches expected "owner/repo".
 validate_origin_cwd() {
-  local dir="$1" expected="$2" url normalized
-  if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
-    echo "  validate: $dir is not a git worktree" >> "$LOG_FILE"
+  local dir="$1" expected="$2" url normalized git_err
+  # Capture stderr separately: bundled launcher runs in the .app's TCC sandbox.
+  # If $dir is under ~/Desktop/~/Documents/~/Downloads and the .app lacks the
+  # corresponding NSXxxFolderUsageDescription, git fails with "Operation not
+  # permitted" and the user otherwise sees a misleading "not a git worktree".
+  if ! git_err=$(git -C "$dir" rev-parse --git-dir 2>&1 >/dev/null); then
+    echo "  validate: git -C $dir rev-parse failed: ${git_err:-<no stderr>}" >> "$LOG_FILE"
+    if [[ "$git_err" == *"Operation not permitted"* || "$git_err" == *"permission denied"* ]]; then
+      show_alert "MyCalFix: 读取 $dir 被 macOS 拒绝（TCC）。去 系统设置 → 隐私与安全性 → 文件与文件夹 → MyCalFix 勾选对应文件夹，然后再点一次链接。"
+    fi
     return 1
   fi
   url=$(git -C "$dir" config --get remote.origin.url 2>/dev/null || true)

@@ -105,6 +105,22 @@ else
   /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST"
 fi
 
+# TCC usage descriptions for Desktop/Documents/Downloads. Required for the
+# bundled launcher to run `git -C <origin_cwd>` when the user's repo lives
+# under one of these folders — without these keys macOS silently denies file
+# access and git fails with "Operation not permitted" (looks like "not a git
+# worktree" in the log). With these keys, the first click triggers a TCC
+# prompt; user grants once, future clicks are silent.
+#
+# Uses plutil rather than PlistBuddy: PlistBuddy's command tokenizer trips on
+# apostrophes/spaces inside the value string, plutil takes the value as a
+# single shell-quoted arg.
+TCC_MSG="MyCalFix needs to access this folder to read your local checkout of the PR repository."
+for KEY in NSDesktopFolderUsageDescription NSDocumentsFolderUsageDescription NSDownloadsFolderUsageDescription; do
+  # -replace creates the key if absent, overwrites if present.
+  plutil -replace "$KEY" -string "$TCC_MSG" "$PLIST"
+done
+
 # Strip quarantine xattr so first click doesn't trigger Gatekeeper warning.
 # (Self-built apps are unsigned; Gatekeeper will warn unless we remove the attr.)
 xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
