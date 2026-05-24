@@ -943,6 +943,40 @@ class ForkPRTests(unittest.TestCase):
         self.assertNotIn("paste-ready", event.notes)
 
 
+class CodexCapConfigTests(unittest.TestCase):
+    """Test that CODEX_CONCURRENCY_CAP can be overridden via the user config
+    file at ~/.config/my-calendar/config.json, and that bad config values
+    fall back to the default with a stderr warning instead of crashing."""
+
+    def _run(self, contents: str | None) -> int:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            if contents is not None:
+                cfg.write_text(contents, encoding="utf-8")
+            return pr_watcher._read_codex_cap(config_path=cfg, default=10)
+
+    def test_missing_file_uses_default(self):
+        self.assertEqual(self._run(contents=None), 10)
+
+    def test_valid_override(self):
+        self.assertEqual(self._run('{"codex_concurrency_cap": 4}'), 4)
+
+    def test_non_positive_falls_back(self):
+        self.assertEqual(self._run('{"codex_concurrency_cap": 0}'), 10)
+        self.assertEqual(self._run('{"codex_concurrency_cap": -3}'), 10)
+
+    def test_non_integer_falls_back(self):
+        self.assertEqual(self._run('{"codex_concurrency_cap": "abc"}'), 10)
+        self.assertEqual(self._run('{"codex_concurrency_cap": null}'), 10)
+
+    def test_malformed_json_falls_back(self):
+        self.assertEqual(self._run('{not valid json'), 10)
+
+    def test_missing_key_uses_default(self):
+        # File exists but doesn't set our key — leave the default alone.
+        self.assertEqual(self._run('{"other_setting": 42}'), 10)
+
+
 class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):
     """Regression test for the bug codex called out on PR #19: run_codex was
     writing the `.running` sidecar BEFORE calling acquire_codex_slot(). If

@@ -75,9 +75,46 @@ SCRATCH_BASE = Path("/tmp/codex-pr-runs")
 LOCK_DIR = HERE / "locks"                     # per-PR flock files + rerun markers + state lock
 STATE_LOCK_PATH = LOCK_DIR / "state.lock"     # brief flock around state read/merge/write
 FORCE_RERUN_ITER_CAP = 10                     # safety cap on the --force rerun-coalescing loop
-CODEX_CONCURRENCY_CAP = 10                    # max codex executions in flight across all PRs
 CODEX_SLOT_POLL_SEC = 2.0                     # how often to retry when all slots are full
 CODEX_SLOT_TIMEOUT_SEC = 30 * 60              # max time to wait for a slot before bailing
+
+# User-configurable: cap codex executions in flight across all PRs. Override
+# via ~/.config/my-calendar/config.json, e.g. {"codex_concurrency_cap": 4} to
+# match a smaller machine or tighter budget. Invalid values fall back to 10
+# with a stderr warning. Read once at module import — restart launchd agents
+# (or rerun manually) to pick up a config change.
+USER_CONFIG_PATH = Path.home() / ".config" / "my-calendar" / "config.json"
+DEFAULT_CODEX_CONCURRENCY_CAP = 10
+
+
+def _read_codex_cap(config_path: Path = USER_CONFIG_PATH, default: int = DEFAULT_CODEX_CONCURRENCY_CAP) -> int:
+    """Load codex_concurrency_cap from the user config file.
+
+    Returns `default` if the file is missing, unparseable, lacks the key, or
+    holds a non-positive / non-integer value. All failure modes emit a
+    one-line stderr warning so silent drift is loud."""
+    if not config_path.exists():
+        return default
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[pr-watcher] warn: cannot read {config_path}: {e}; using cap={default}", file=sys.stderr)
+        return default
+    if not isinstance(cfg, dict) or "codex_concurrency_cap" not in cfg:
+        return default
+    raw = cfg["codex_concurrency_cap"]
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        print(f"[pr-watcher] warn: codex_concurrency_cap={raw!r} in {config_path} is not an integer; using cap={default}", file=sys.stderr)
+        return default
+    if n < 1:
+        print(f"[pr-watcher] warn: codex_concurrency_cap={n} in {config_path} is not positive; using cap={default}", file=sys.stderr)
+        return default
+    return n
+
+
+CODEX_CONCURRENCY_CAP = _read_codex_cap()    # max codex executions in flight across all PRs
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
 NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
