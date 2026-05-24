@@ -72,8 +72,12 @@ CAL_STATE_PATH = HERE / "pr_calendar_state.json"   # EventKit event_id index (se
 PROMPT_PATH = HERE / "pr_prompt.md"
 LOG_DIR = HERE / "pr_logs"
 SCRATCH_BASE = Path("/tmp/codex-pr-runs")
-LOCK_PATH = HERE / "pr_watcher.lock"          # flock target — serialises hook + launchd runs
-FORCE_LOCK_WAIT_SEC = 30 * 60                 # --force willingly waits up to 30min for the lock
+LOCK_DIR = HERE / "locks"                     # per-PR flock files + rerun markers + state lock
+STATE_LOCK_PATH = LOCK_DIR / "state.lock"     # brief flock around state read/merge/write
+FORCE_RERUN_ITER_CAP = 10                     # safety cap on the --force rerun-coalescing loop
+CODEX_CONCURRENCY_CAP = 10                    # max codex executions in flight across all PRs
+CODEX_SLOT_POLL_SEC = 2.0                     # how often to retry when all slots are full
+CODEX_SLOT_TIMEOUT_SEC = 30 * 60              # max time to wait for a slot before bailing
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
 NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
@@ -116,38 +120,110 @@ query($q: String!) {
 # ─── lock ──────────────────────────────────────────────────────────────────────
 #
 # Two trigger channels (git pre-push hook + launchd 30-min tick) can fire on the
-# same PR within seconds. codex runs ~1–2 min, so without serialisation both
-# processes race past the state check, run codex on the same head_sha, and post
-# duplicate comments. flock() is held for the full run; kernel releases it on
-# exit (including SIGKILL by the watchdog timeout).
+# same PR within seconds. codex runs ~1–2 min, so without serialisation two
+# processes can race past the state check, run codex on the same head_sha, and
+# post duplicate comments.
 #
-# Behaviour:
-#   --force (hook-triggered, user just pushed)  → wait up to 30min for the lock
-#   anything else (launchd tick, --seed-only)   → try once, exit cleanly if held
+# Design: per-PR flock + rerun marker (coalescing).
+#   - Per-PR lock (locks/<safe_id>.lock) gates codex execution for that one PR.
+#     Different PRs run fully in parallel; within a PR, only one codex at a time.
+#   - Rerun marker (locks/<safe_id>.rerun) coalesces redundant --force runs.
+#     A --force that finds the lock held writes the marker and exits immediately
+#     instead of joining a queue. The leader unlinks the marker before each codex
+#     invocation and re-checks at loop end — if a new marker is present (someone
+#     signaled during the codex run), it loops once more against the freshly
+#     fetched head_sha. Net effect: N rapid pushes during one in-flight review →
+#     at most 1 additional codex run against the FINAL sha, not N.
+#   - State save (see save_state) uses a separate brief flock (locks/state.lock)
+#     and does a load-merge-write so concurrent writers for different PRs don't
+#     clobber each other's updates.
 
 
-def acquire_lock(*, blocking: bool, timeout_sec: int = FORCE_LOCK_WAIT_SEC) -> int | None:
-    """Return an open fd holding an exclusive flock on LOCK_PATH, or None if it
-    could not be acquired. Keep the returned fd alive for the rest of the
-    process — flock is released when the fd closes."""
-    fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o644)
-    if not blocking:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except BlockingIOError:
-            os.close(fd)
-            return None
+def _pr_safe_id(pr_url: str) -> str:
+    return pr_url.replace("https://github.com/", "").replace("/", "_")
+
+
+def _pr_lock_path(pr_url: str) -> Path:
+    return LOCK_DIR / f"{_pr_safe_id(pr_url)}.lock"
+
+
+def _pr_rerun_path(pr_url: str) -> Path:
+    return LOCK_DIR / f"{_pr_safe_id(pr_url)}.rerun"
+
+
+def acquire_pr_lock_nb(pr_url: str) -> int | None:
+    """Try once to acquire the per-PR flock. Return the fd if acquired
+    (caller must keep it open until done, then os.close), or None if it's
+    currently held by another process. Kernel releases the flock on fd close
+    or on process exit."""
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(_pr_lock_path(pr_url)), os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return None
+
+
+def acquire_pr_lock_or_signal(pr_url: str) -> int | None:
+    """--force entrypoint helper. Try to acquire the per-PR lock; if it's
+    held, write the rerun marker so the current leader re-reviews the latest
+    sha on completion, then retry once (handles the leader-just-released
+    race window). Returns the fd if we became the leader, or None if another
+    leader is in flight and will pick up our signal."""
+    fd = acquire_pr_lock_nb(pr_url)
+    if fd is not None:
+        return fd
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    _pr_rerun_path(pr_url).touch()
+    # Retry once: leader may have released between our first try and our touch.
+    return acquire_pr_lock_nb(pr_url)
+
+
+def release_lock_fd(fd: int) -> None:
+    """Release a flock fd defensively — never raises."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+
+
+def acquire_codex_slot(*, timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC) -> tuple[int, int] | None:
+    """Acquire one of CODEX_CONCURRENCY_CAP global codex slots.
+
+    Caps how many codex executions can run at once across ALL PRs. Without
+    this cap, per-PR parallelism plus rapid pushes could spawn unbounded
+    concurrent codex processes (CPU/network/$LLM cost).
+
+    Returns (fd, slot_number) on success (caller must release_lock_fd(fd) when
+    done), or None on timeout. Polls every CODEX_SLOT_POLL_SEC; waiting is
+    quiet after the first "all slots busy" notice."""
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + timeout_sec
+    announced_wait = False
     while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except BlockingIOError:
-            if time.time() >= deadline:
+        for n in range(1, CODEX_CONCURRENCY_CAP + 1):
+            fd = os.open(str(LOCK_DIR / f"codex-slot-{n}.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd, n
+            except BlockingIOError:
                 os.close(fd)
-                return None
-            time.sleep(3)
+        if not announced_wait:
+            print(
+                f"      all {CODEX_CONCURRENCY_CAP} codex slots busy, waiting up to "
+                f"{int(timeout_sec)}s...",
+                flush=True,
+            )
+            announced_wait = True
+        if time.time() >= deadline:
+            return None
+        time.sleep(CODEX_SLOT_POLL_SEC)
 
 
 # ─── state ─────────────────────────────────────────────────────────────────────
@@ -177,12 +253,54 @@ def load_state() -> dict:
     return {"_meta": {}, "prs": {}}
 
 
-def save_state(state: dict) -> None:
-    state.setdefault("_meta", {})["last_run"] = datetime.now().isoformat(timespec="seconds")
-    STATE_PATH.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
+def save_state(state: dict, *, touched_prs: set[str] | None = None) -> None:
+    """Persist `state` to disk under a brief flock.
+
+    When `touched_prs` is provided, do an atomic load-merge-write: only the
+    listed PR entries are pushed from in-memory `state` into the on-disk
+    state, preserving concurrent updates from other processes to OTHER PRs.
+    `_meta` keys present in-memory override on-disk (so `installed_at` etc.
+    can be stamped), and `_meta.last_run` is always refreshed.
+
+    When `touched_prs` is None, the in-memory state overwrites disk wholesale.
+    This is the legacy behavior — only safe when no other process is
+    concurrently writing state (e.g. single-shot --dry-run inspection or
+    tests). Production callsites should pass touched_prs."""
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(STATE_LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)  # blocking; held only for file I/O
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        if touched_prs is None:
+            state.setdefault("_meta", {})["last_run"] = now_iso
+            payload = state
+        else:
+            on_disk = load_state() if STATE_PATH.exists() else {"_meta": {}, "prs": {}}
+            on_disk.setdefault("prs", {})
+            on_disk.setdefault("_meta", {})
+            in_mem_prs = state.get("prs") or {}
+            for url in touched_prs:
+                if url in in_mem_prs:
+                    on_disk["prs"][url] = in_mem_prs[url]
+            for k, v in (state.get("_meta") or {}).items():
+                if k == "last_run":
+                    continue  # always overwritten below
+                on_disk["_meta"][k] = v
+            on_disk["_meta"]["last_run"] = now_iso
+            payload = on_disk
+        # Atomic write: load_state() doesn't take state.lock, so it can fire
+        # at any moment relative to this save. Write to a sibling tmp file
+        # then os.replace — POSIX-atomic. A reader either sees the prior
+        # complete state or the new complete state, never a half-flushed
+        # buffer that would raise JSONDecodeError mid-tick.
+        tmp_path = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, STATE_PATH)
+    finally:
+        release_lock_fd(lock_fd)
 
 
 def sync_meta_origin_cwd(last_jsonl: str | None, origin_cwd: str) -> tuple[Path | None, bool]:
@@ -393,6 +511,22 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     scratch = SCRATCH_BASE / f"{stamp}-{uuid.uuid4().hex[:8]}"
     scratch.mkdir(parents=True, exist_ok=True)
 
+    # Block (poll) for a global codex slot BEFORE writing the running sidecar.
+    # If acquire times out and raises RuntimeError, we must not leave behind
+    # an orphan sidecar (would pin a phantom "running" row in the dashboard
+    # since the cleanup `finally` below never gets entered). The per-PR lock
+    # is already held by the caller, so same-PR is serialised; this cap
+    # protects the box from unbounded codex fan-out across UNRELATED PRs
+    # (CPU/network/$LLM cost).
+    slot = acquire_codex_slot()
+    if slot is None:
+        raise RuntimeError(
+            f"codex concurrency cap ({CODEX_CONCURRENCY_CAP}) saturated for "
+            f">{CODEX_SLOT_TIMEOUT_SEC}s; aborting this run"
+        )
+    slot_fd, slot_n = slot
+    print(f"      codex slot {slot_n}/{CODEX_CONCURRENCY_CAP} acquired", flush=True)
+
     # Drop the .running sidecar BEFORE codex starts so the dashboard's
     # collect_running() can find it during the 1–2min codex run. Cleaned up
     # in the finally below. Reviewer dashboard refreshes every 5s, so a single
@@ -465,6 +599,9 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                     break
             proc.wait()
     finally:
+        # Release the global codex slot first so a waiter can acquire it
+        # without waiting for the .running sidecar cleanup.
+        release_lock_fd(slot_fd)
         # Whether codex exited cleanly, errored, or got killed by the watchdog,
         # the .running sidecar must go away — otherwise the dashboard's running
         # section would still show this PR after the run is over.
@@ -783,6 +920,117 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     return f"codex ran, calendar={cal_action}"
 
 
+def _gh_view_force_pr(pr_url: str) -> PRSnap:
+    """Fetch a single PR's metadata via gh pr view and build a PRSnap.
+    `default_branch` is filled with `base` because gh pr view doesn't return
+    defaultBranchRef directly; the pre-push hook already verified base==default
+    before invoking --force, so this is safe."""
+    forced = subprocess.run(
+        ["gh", "pr", "view", pr_url,
+         "--json", "url,number,title,isDraft,baseRefName,headRefName,headRefOid,createdAt,headRepository,headRepositoryOwner"],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(forced.stdout)
+    base_repo = pr_url.replace("https://github.com/", "").rsplit("/pull/", 1)[0]
+    head_owner = (data.get("headRepositoryOwner") or {}).get("login") or ""
+    head_name = (data.get("headRepository") or {}).get("name") or ""
+    head_repo = f"{head_owner}/{head_name}" if head_owner and head_name else ""
+    return PRSnap(
+        url=data["url"],
+        number=int(data["number"]),
+        title=data.get("title", ""),
+        is_draft=bool(data.get("isDraft", False)),
+        repo=base_repo,
+        base=data.get("baseRefName", ""),
+        default_branch=data.get("baseRefName", ""),
+        head_sha=data.get("headRefOid", ""),
+        created_at=data.get("createdAt", "") or "",
+        head_branch=data.get("headRefName", "") or "",
+        head_repo=head_repo,
+    )
+
+
+def _run_force(args, now: datetime) -> int:
+    """--force entrypoint: per-PR lock + rerun-coalescing loop.
+
+    Concurrency model:
+      - If the per-PR lock is held by another leader, write the rerun marker
+        and exit immediately — the leader will pick up the signal and
+        re-review the latest sha when its current codex run finishes.
+      - If we got the lock, loop: unlink marker → fetch fresh head_sha → if
+        not already-reviewed, run codex and save state → re-check marker; if
+        present (someone --force'd during our codex run), loop again. Caps at
+        FORCE_RERUN_ITER_CAP to defend against pathological signal stickiness.
+    """
+    pr_url = args.force
+    lock_fd = acquire_pr_lock_or_signal(pr_url)
+    if lock_fd is None:
+        print(f"  forced: {pr_url}  → another process is reviewing; queued rerun signal")
+        return 0
+
+    rerun_marker = _pr_rerun_path(pr_url)
+    try:
+        iteration = 0
+        while True:
+            iteration += 1
+            # Unlink BEFORE the gh fetch + codex run. Any --force that writes
+            # the marker AFTER this point will be observed at the loop tail
+            # and trigger another iteration against the freshly fetched sha.
+            rerun_marker.unlink(missing_ok=True)
+
+            pr = _gh_view_force_pr(pr_url)
+
+            # Reload state every iteration: concurrent --force runs on OTHER
+            # PRs may have updated _meta.last_run / installed_at, and our own
+            # previous iteration just wrote to disk.
+            state = load_state()
+            if "installed_at" not in state.get("_meta", {}):
+                state.setdefault("_meta", {})["installed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                print(f"[pr-watcher] first run: stamped installed_at = {state['_meta']['installed_at']}")
+
+            new_origin_cwd: str | None = None
+            if args.origin_cwd:
+                cwd_p = Path(args.origin_cwd).expanduser().resolve()
+                if cwd_p.is_dir():
+                    new_origin_cwd = str(cwd_p)
+                    state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = new_origin_cwd
+                else:
+                    print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
+
+            prev = state.get("prs", {}).get(pr.url) or {}
+            if prev.get("last_commented_sha") == pr.head_sha:
+                suffix = "" if iteration == 1 else f" (after {iteration - 1} rerun iter)"
+                print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping{suffix}")
+                # Mirror freshly-stamped origin_cwd into prior run's .meta.json
+                # sidecar so dashboard / "fix this PR" consumers don't have to
+                # fall back to pr_state.json for that field.
+                if new_origin_cwd:
+                    try:
+                        meta_path, changed = sync_meta_origin_cwd(prev.get("last_jsonl"), new_origin_cwd)
+                        if changed and meta_path is not None:
+                            print(f"      backfilled origin_cwd into {meta_path.name}")
+                    except (OSError, json.JSONDecodeError) as e:
+                        print(f"      warn: failed to backfill origin_cwd in prior .meta.json: {e}")
+                save_state(state, touched_prs={pr.url})
+            else:
+                action = process_pr(pr, state, dry_run=False)
+                save_state(state, touched_prs={pr.url})
+                print(f"  forced: {pr.url}  → {action}")
+
+            # Did a new --force write the marker while we were busy? If yes,
+            # loop once more — but cap iterations so a stuck marker (e.g.
+            # filesystem oddity, leftover from a crash) can't pin us forever.
+            if not rerun_marker.exists():
+                break
+            if iteration >= FORCE_RERUN_ITER_CAP:
+                print(f"  forced: {pr_url}  → rerun marker still set after {iteration} iterations; bailing to next tick")
+                break
+            print(f"  forced: {pr_url}  → rerun signal detected, looping (iter={iteration + 1})")
+    finally:
+        release_lock_fd(lock_fd)
+    return 0
+
+
 def main() -> int:
     redirect_stdio_to_log()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -816,21 +1064,17 @@ def main() -> int:
             print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  夜间节流：距上次运行不足 5min，跳过")
             return 0
 
-    # Serialise concurrent runs (hook + launchd tick can fire ~seconds apart).
-    # --dry-run doesn't mutate, so it skips the lock. --force is user-initiated
-    # via the pre-push hook and we want it to actually run, so it waits;
-    # everything else (the periodic tick, --seed-only) is best-effort and exits
-    # cleanly if another run is already in flight.
-    lock_fd: int | None = None
-    if not args.dry_run:
-        lock_fd = acquire_lock(blocking=bool(args.force))
-        if lock_fd is None:
-            mode = "force" if args.force else ("seed-only" if args.seed_only else "tick")
-            print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  another pr_watcher holds the lock ({mode}) — skipping")
-            return 0
-        # Reload state: a blocking --force run may have waited while another
-        # process updated head_sha / last_commented_sha.
-        state = load_state()
+    # Per-PR locks gate codex execution: different PRs run fully in parallel.
+    # --force uses acquire_pr_lock_or_signal so that redundant rapid-fire pushes
+    # coalesce into at most one additional codex run against the FINAL sha
+    # (rather than running once per queued task). The tick path takes per-PR
+    # locks inside its candidates loop and skips PRs that are currently being
+    # reviewed. --dry-run doesn't mutate and takes no lock at all.
+
+    print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  daytime={in_daytime(now)}  dry_run={args.dry_run}  seed_only={args.seed_only}")
+
+    if args.force:
+        return _run_force(args, now)
 
     # First-ever run stamps installed_at as the "new PR vs pre-existing PR" cutoff.
     # PRs created after this timestamp are treated as actionable on first sight;
@@ -840,78 +1084,6 @@ def main() -> int:
         print(f"[pr-watcher] first run: stamped installed_at = {state['_meta']['installed_at']}")
 
     installed_at_dt = _parse_iso_utc(state.get("_meta", {}).get("installed_at", ""))
-
-    print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  daytime={in_daytime(now)}  dry_run={args.dry_run}  seed_only={args.seed_only}")
-
-    if args.force:
-        # Bypass GraphQL listing; fetch this single PR's metadata
-        forced = subprocess.run(
-            ["gh", "pr", "view", args.force,
-             "--json", "url,number,title,isDraft,baseRefName,headRefName,headRefOid,createdAt,headRepository,headRepositoryOwner"],
-            capture_output=True, text=True, check=True,
-        )
-        data = json.loads(forced.stdout)
-        # gh pr view doesn't give defaultBranchRef directly; treat base as if it were default for --force.
-        # (The pre-push trigger script already verifies base==default before invoking --force.)
-        base_repo = args.force.replace("https://github.com/", "").rsplit("/pull/", 1)[0]
-        head_owner = (data.get("headRepositoryOwner") or {}).get("login") or ""
-        head_name = (data.get("headRepository") or {}).get("name") or ""
-        head_repo = f"{head_owner}/{head_name}" if head_owner and head_name else ""
-        pr = PRSnap(
-            url=data["url"],
-            number=int(data["number"]),
-            title=data.get("title", ""),
-            is_draft=bool(data.get("isDraft", False)),
-            repo=base_repo,
-            base=data.get("baseRefName", ""),
-            default_branch=data.get("baseRefName", ""),
-            head_sha=data.get("headRefOid", ""),
-            created_at=data.get("createdAt", "") or "",
-            head_branch=data.get("headRefName", "") or "",
-            head_repo=head_repo,
-        )
-
-        # Record origin_cwd as soon as the hook tells us — even when the
-        # rest of this run is a no-op (already-reviewed sha). Without this,
-        # a sha that was first seen by the launchd tick and only later
-        # re-pushed by the user would never get its origin_cwd backfilled.
-        new_origin_cwd: str | None = None
-        if args.origin_cwd:
-            cwd_p = Path(args.origin_cwd).expanduser().resolve()
-            if cwd_p.is_dir():
-                new_origin_cwd = str(cwd_p)
-                state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = new_origin_cwd
-            else:
-                print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
-
-        # Even with --force, suppress a duplicate review when the launchd tick we
-        # just waited on already covered this exact sha. To re-review the same
-        # sha intentionally, delete the PR's entry from pr_state.json first.
-        prev = state.get("prs", {}).get(pr.url) or {}
-        if prev.get("last_commented_sha") == pr.head_sha:
-            print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
-            # Mirror the freshly-stamped origin_cwd into the prior run's
-            # .meta.json sidecar so dashboard / "fix this PR" consumers don't
-            # have to fall back to pr_state.json. Without this, a re-push from
-            # a relocated checkout updates pr_state.json but leaves the
-            # sidecar pointing at the stale path (or null).
-            if new_origin_cwd:
-                try:
-                    meta_path, changed = sync_meta_origin_cwd(prev.get("last_jsonl"), new_origin_cwd)
-                    if changed and meta_path is not None:
-                        print(f"      backfilled origin_cwd into {meta_path.name}")
-                except (OSError, json.JSONDecodeError) as e:
-                    print(f"      warn: failed to backfill origin_cwd in prior .meta.json: {e}")
-            # Persist installed_at if this was the first-ever run; otherwise
-            # the stamp gets recomputed on the next tick and the "new vs
-            # pre-existing PR" cutoff drifts. Also persists any origin_cwd
-            # update we just made above.
-            save_state(state)
-            return 0
-        action = process_pr(pr, state, dry_run=False)
-        save_state(state)
-        print(f"  forced: {pr.url}  → {action}")
-        return 0
 
     prs = fetch_open_prs()
     print(f"  open PRs (any base): {len(prs)}")
@@ -928,56 +1100,97 @@ def main() -> int:
     print(f"  candidates (base==default): {len(candidates)}")
 
     for pr in candidates:
-        prev = state["prs"].get(pr.url)
-        # 首次见到此 PR：根据它是 install 之前就存在的旧 PR 还是之后新建的 PR 来决定
-        if prev is None:
-            pr_created_dt = _parse_iso_utc(pr.created_at)
-            is_post_install = (
-                not args.seed_only
-                and installed_at_dt is not None
-                and pr_created_dt is not None
-                and pr_created_dt > installed_at_dt
-            )
+        # Per-PR lock: skip PRs currently being reviewed by another process
+        # (typically a --force from the pre-push hook). The next tick will
+        # re-check this PR; head_sha-based dedup ensures we don't post a
+        # duplicate review for a sha the leader already covered.
+        pr_fd: int | None = None
+        if not args.dry_run:
+            pr_fd = acquire_pr_lock_nb(pr.url)
+            if pr_fd is None:
+                print(f"    busy (another process holds the lock)  {pr.url}")
+                continue
+            # Refresh in-memory state for this PR from disk: a concurrent
+            # --force on this PR may have just updated last_commented_sha,
+            # and our top-of-main load_state() snapshot would be stale.
+            fresh = load_state()
+            if pr.url in fresh.get("prs", {}):
+                state.setdefault("prs", {})[pr.url] = fresh["prs"][pr.url]
+            if "installed_at" in fresh.get("_meta", {}):
+                state.setdefault("_meta", {})["installed_at"] = fresh["_meta"]["installed_at"]
 
-            if not is_post_install:
-                # 装好工具之前就存在的旧 PR / 或显式 --seed-only：只 seed
-                reason = "seed-only" if args.seed_only else "pre-install"
-                print(f"    seed ({reason})  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
+        # Did this iteration mutate state["prs"][pr.url]? If so, save under the
+        # per-PR lock BEFORE releasing it (see finally block below). Without
+        # this, a --force that wakes up between release and the post-loop
+        # save_state would read stale state and re-run codex on the same sha.
+        pr_state_changed = False
+        try:
+            prev = state["prs"].get(pr.url)
+            # 首次见到此 PR：根据它是 install 之前就存在的旧 PR 还是之后新建的 PR 来决定
+            if prev is None:
+                pr_created_dt = _parse_iso_utc(pr.created_at)
+                is_post_install = (
+                    not args.seed_only
+                    and installed_at_dt is not None
+                    and pr_created_dt is not None
+                    and pr_created_dt > installed_at_dt
+                )
+
+                if not is_post_install:
+                    # 装好工具之前就存在的旧 PR / 或显式 --seed-only：只 seed
+                    reason = "seed-only" if args.seed_only else "pre-install"
+                    print(f"    seed ({reason})  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
+                    if not args.dry_run:
+                        state["prs"][pr.url] = {
+                            "repo": pr.repo,
+                            "number": pr.number,
+                            "last_seen_sha": pr.head_sha,
+                            "last_commented_sha": None,
+                            "seeded_at": now.isoformat(timespec="seconds"),
+                        }
+                        pr_state_changed = True
+                    continue
+
+                # 装好之后才创建的 PR → 即便 git pre-push hook 没抓到（网页 UI、异机 push、gh pr create…），也直接评论
+                print(f"    NEW PR (post-install)  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
+                action = process_pr(pr, state, dry_run=args.dry_run)
                 if not args.dry_run:
-                    state["prs"][pr.url] = {
-                        "repo": pr.repo,
-                        "number": pr.number,
-                        "last_seen_sha": pr.head_sha,
-                        "last_commented_sha": None,
-                        "seeded_at": now.isoformat(timespec="seconds"),
-                    }
+                    pr_state_changed = True
+                print(f"      → {action}")
                 continue
 
-            # 装好之后才创建的 PR → 即便 git pre-push hook 没抓到（网页 UI、异机 push、gh pr create…），也直接评论
-            print(f"    NEW PR (post-install)  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
+            if args.seed_only:
+                print(f"    seed-only (skip codex)  {pr.url}  sha={pr.head_sha[:8]}")
+                if not args.dry_run:
+                    state["prs"][pr.url]["last_seen_sha"] = pr.head_sha
+                    pr_state_changed = True
+                continue
+
+            # 已 seed 过：若 head_sha 自上次"评论或 seed"以来未变 → 跳过
+            baseline = prev.get("last_commented_sha") or prev.get("last_seen_sha")
+            if baseline == pr.head_sha:
+                print(f"    unchanged  {pr.url}  sha={pr.head_sha[:8]}")
+                continue
+
+            # 有新 commit → 触发 codex
+            print(f"    NEW COMMIT  {pr.url}  {baseline[:8] if baseline else 'NEW'} → {pr.head_sha[:8]}")
             action = process_pr(pr, state, dry_run=args.dry_run)
-            print(f"      → {action}")
-            continue
-
-        if args.seed_only:
-            print(f"    seed-only (skip codex)  {pr.url}  sha={pr.head_sha[:8]}")
             if not args.dry_run:
-                state["prs"][pr.url]["last_seen_sha"] = pr.head_sha
-            continue
-
-        # 已 seed 过：若 head_sha 自上次"评论或 seed"以来未变 → 跳过
-        baseline = prev.get("last_commented_sha") or prev.get("last_seen_sha")
-        if baseline == pr.head_sha:
-            print(f"    unchanged  {pr.url}  sha={pr.head_sha[:8]}")
-            continue
-
-        # 有新 commit → 触发 codex
-        print(f"    NEW COMMIT  {pr.url}  {baseline[:8] if baseline else 'NEW'} → {pr.head_sha[:8]}")
-        action = process_pr(pr, state, dry_run=args.dry_run)
-        print(f"      → {action}")
+                pr_state_changed = True
+            print(f"      → {action}")
+        finally:
+            if pr_fd is not None:
+                # Persist BEFORE releasing the lock so a concurrent --force
+                # for this PR cannot read the pre-codex sha.
+                if pr_state_changed:
+                    save_state(state, touched_prs={pr.url})
+                release_lock_fd(pr_fd)
 
     if not args.dry_run:
-        save_state(state)
+        # Flush _meta updates that happen outside the per-PR scope (e.g. a
+        # freshly stamped installed_at when the tick fires on a brand-new
+        # install). Per-PR entries were already saved inside the loop above.
+        save_state(state, touched_prs=set())
     print(f"[pr-watcher] done")
     return 0
 

@@ -83,8 +83,10 @@ class ForceOriginCwdTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
                     mock.patch.object(pr_watcher, "load_state", lambda: state), \
-                    mock.patch.object(pr_watcher, "save_state", lambda s: saved.append(s)), \
-                    mock.patch.object(pr_watcher, "acquire_lock", lambda blocking: 999), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(s)), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run):
                 rc = pr_watcher.main()
 
@@ -159,8 +161,10 @@ class ForceOriginCwdFreshRunTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
                     mock.patch.object(pr_watcher, "load_state", lambda: state), \
-                    mock.patch.object(pr_watcher, "save_state", lambda s: saved.append(s)), \
-                    mock.patch.object(pr_watcher, "acquire_lock", lambda blocking: 999), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(s)), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run), \
                     mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
                     mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: fake_codex_result), \
@@ -182,6 +186,219 @@ class ForceOriginCwdFreshRunTests(unittest.TestCase):
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             self.assertEqual(meta["origin_cwd"], expected_cwd)
             self.assertEqual(meta["head_sha"], head_sha)
+
+
+class ForceCoalesceTests(unittest.TestCase):
+    """Per-PR lock + rerun marker semantics.
+
+    Two important invariants:
+      A) A --force that can't get the per-PR lock writes the rerun marker and
+         exits immediately (no codex run, no state mutation).
+      B) A leader that finds the marker set after its codex run loops once
+         more against the freshly fetched head_sha, so a stack of N rapid
+         pushes during one in-flight review produces 1 extra codex run, not N.
+    """
+
+    def test_force_signals_and_exits_when_lock_held(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/10"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            # acquire_pr_lock_or_signal returns None to simulate "another leader
+            # is in flight"; the rerun marker should be written as a side effect.
+            # We fake this by patching acquire_pr_lock_or_signal directly and
+            # writing the marker ourselves to mimic real behavior.
+            marker_touches: list[str] = []
+
+            def fake_acquire(url):
+                # Mirror the real implementation's side effect.
+                marker = lock_dir / f"{pr_watcher._pr_safe_id(url)}.rerun"
+                marker.touch()
+                marker_touches.append(str(marker))
+                return None  # signal "another leader"
+
+            gh_calls: list = []
+
+            def fake_run(*args, **_kwargs):
+                gh_calls.append(args)
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+            codex_runs: list = []
+
+            argv = ["pr_watcher.py", "--force", pr_url]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", fake_acquire), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda *a, **kw: codex_runs.append(a) or None), \
+                    mock.patch.object(pr_watcher.subprocess, "run", fake_run):
+                rc = pr_watcher.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(codex_runs, [], "must not invoke codex when lock is held")
+            self.assertEqual(gh_calls, [], "must not call gh when lock is held")
+            self.assertEqual(len(marker_touches), 1, "rerun marker must be written")
+            self.assertTrue(Path(marker_touches[0]).exists())
+
+    def test_leader_loops_when_marker_set_then_breaks(self):
+        """Simulate: leader runs codex on iter 1, a --force concurrently writes
+        the marker, leader sees marker → loops → codex on iter 2, no further
+        marker writes → exit. Verify exactly 2 codex invocations."""
+        pr_url = "https://github.com/realRoc/my-calendar/pull/10"
+        first_sha = "aaaa1111"
+        second_sha = "bbbb2222"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            marker_path = lock_dir / f"{pr_watcher._pr_safe_id(pr_url)}.rerun"
+
+            # State will be re-loaded each iteration; mutate it from the codex
+            # mock to mirror what real process_pr would do (set last_commented_sha).
+            shared_state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {pr_url: {"last_commented_sha": None}},
+            }
+            # gh pr view returns first_sha on first call, second_sha on second
+            sha_seq = iter([first_sha, second_sha])
+
+            def fake_gh_run(*args, **_kwargs):
+                sha = next(sha_seq)
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=json.dumps({
+                        "url": pr_url, "number": 10, "title": "t",
+                        "isDraft": False, "baseRefName": "main",
+                        "headRefOid": sha, "createdAt": "2026-05-22T00:00:00Z",
+                    }),
+                    stderr="",
+                )
+
+            codex_shas: list[str] = []
+
+            def fake_process_pr(pr, state, dry_run):
+                codex_shas.append(pr.head_sha)
+                # Simulate "another --force arrives during codex" only on iter 1.
+                if len(codex_shas) == 1:
+                    marker_path.touch()
+                # Mirror real process_pr's state mutation.
+                state.setdefault("prs", {}).setdefault(pr.url, {})["last_commented_sha"] = pr.head_sha
+                return "codex ran (mocked)"
+
+            saved: list = []
+
+            argv = ["pr_watcher.py", "--force", pr_url]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: shared_state), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(touched_prs)), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process_pr), \
+                    mock.patch.object(pr_watcher.subprocess, "run", fake_gh_run):
+                rc = pr_watcher.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(codex_shas, [first_sha, second_sha],
+                             "leader should run codex on first sha, then loop once for the second")
+            self.assertFalse(marker_path.exists(), "marker should be unlinked by the leader's final iteration")
+            self.assertEqual(len(saved), 2, "save_state should be called per iteration")
+            self.assertEqual(saved, [{pr_url}, {pr_url}], "each save should be scoped to this PR")
+
+
+class TickSaveStateOrderTests(unittest.TestCase):
+    """Regression test for the race called out by codex on PR #19.
+
+    Old tick path released the per-PR flock first and saved state for ALL
+    touched PRs in a single trailing save_state. In the window between
+    release and trailing save, a --force on the same PR could grab the lock,
+    read stale state, and re-run codex on the same head_sha (duplicate
+    comment).
+
+    Fix: save_state(touched_prs={pr.url}) inside the candidates loop's
+    finally, BEFORE release_lock_fd. This test asserts the ordering via
+    spies."""
+
+    def test_tick_persists_per_pr_state_before_releasing_lock(self):
+        pr_url_a = "https://github.com/realRoc/my-calendar/pull/100"
+        pr_url_b = "https://github.com/realRoc/my-calendar/pull/101"
+
+        state = {
+            "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+            "prs": {
+                pr_url_a: {"last_seen_sha": "old_a", "last_commented_sha": "old_a"},
+                pr_url_b: {"last_seen_sha": "old_b", "last_commented_sha": "old_b"},
+            },
+        }
+
+        def fake_fetch_open_prs():
+            return [
+                pr_watcher.PRSnap(
+                    url=pr_url_a, number=100, title="t", is_draft=False,
+                    repo="realRoc/my-calendar", base="main", default_branch="main",
+                    head_sha="new_a", created_at="2026-05-25T00:00:00Z",
+                    head_branch="feat-a", head_repo="realRoc/my-calendar",
+                ),
+                pr_watcher.PRSnap(
+                    url=pr_url_b, number=101, title="t", is_draft=False,
+                    repo="realRoc/my-calendar", base="main", default_branch="main",
+                    head_sha="new_b", created_at="2026-05-25T00:00:00Z",
+                    head_branch="feat-b", head_repo="realRoc/my-calendar",
+                ),
+            ]
+
+        def fake_process_pr(pr, st, dry_run):
+            st.setdefault("prs", {}).setdefault(pr.url, {})["last_commented_sha"] = pr.head_sha
+            return "codex ran (mocked)"
+
+        events: list[tuple] = []
+
+        def fake_save_state(s, *, touched_prs=None):
+            events.append(("save", set(touched_prs) if touched_prs is not None else None))
+
+        def fake_release_lock_fd(fd):
+            events.append(("release", fd))
+
+        fd_iter = iter([1001, 1002])
+
+        def fake_acquire(url):
+            return next(fd_iter)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            argv = ["pr_watcher.py"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save_state), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", fake_acquire), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", fake_release_lock_fd), \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", fake_fetch_open_prs), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process_pr):
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+
+        # PR A: save must precede release; same for PR B.
+        save_a_idx = next((i for i, e in enumerate(events) if e == ("save", {pr_url_a})), -1)
+        release_a_idx = next((i for i, e in enumerate(events) if e == ("release", 1001)), -1)
+        save_b_idx = next((i for i, e in enumerate(events) if e == ("save", {pr_url_b})), -1)
+        release_b_idx = next((i for i, e in enumerate(events) if e == ("release", 1002)), -1)
+
+        self.assertGreaterEqual(save_a_idx, 0, f"PR A save missing from events: {events}")
+        self.assertGreaterEqual(release_a_idx, 0, f"PR A release missing: {events}")
+        self.assertLess(save_a_idx, release_a_idx,
+                        f"PR A save_state must come BEFORE release_lock_fd. Events: {events}")
+        self.assertGreaterEqual(save_b_idx, 0, f"PR B save missing: {events}")
+        self.assertGreaterEqual(release_b_idx, 0, f"PR B release missing: {events}")
+        self.assertLess(save_b_idx, release_b_idx,
+                        f"PR B save_state must come BEFORE release_lock_fd. Events: {events}")
 
 
 class OriginCwdWithoutForceTests(unittest.TestCase):
@@ -482,53 +699,6 @@ class PasteReadyFetchHandlesRemoteOnlyBranchTests(unittest.TestCase):
         self.assertIn("git pull --ff-only origin phase3-fix-launcher", cmd)
 
 
-class ValidateOriginCwdRegexTests(unittest.TestCase):
-    """Regression: the inline Python normalizer in launch_fix.sh used to
-    exclude `.` from the repo half of `owner/name`, so legitimate GitHub repos
-    like `owner/my.repo` validated as a mismatch and dropped the user into the
-    folder picker. Allow dots while still stripping the optional `.git`
-    suffix."""
-
-    SNIPPET = (
-        'import sys, re\n'
-        'm = re.search(r"[:/]([^/:]+/[^/:]+?)(?:\\.git)?/?$", sys.argv[1])\n'
-        'print(m.group(1) if m else "")\n'
-    )
-
-    def _normalize(self, url: str) -> str:
-        result = subprocess.run(
-            ["python3", "-c", self.SNIPPET, url],
-            capture_output=True, text=True, check=True,
-        )
-        return result.stdout.strip()
-
-    def test_dot_in_repo_name_accepted(self):
-        self.assertEqual(
-            self._normalize("git@github.com:owner/my.repo.git"),
-            "owner/my.repo",
-        )
-        self.assertEqual(
-            self._normalize("https://github.com/owner/my.repo"),
-            "owner/my.repo",
-        )
-
-    def test_plain_repo_still_normalizes(self):
-        self.assertEqual(
-            self._normalize("git@github.com:realRoc/my-calendar.git"),
-            "realRoc/my-calendar",
-        )
-        self.assertEqual(
-            self._normalize("https://github.com/realRoc/my-calendar.git"),
-            "realRoc/my-calendar",
-        )
-
-    def test_trailing_slash_stripped(self):
-        self.assertEqual(
-            self._normalize("https://github.com/owner/repo.git/"),
-            "owner/repo",
-        )
-
-
 class ParseFixUrlTests(unittest.TestCase):
     """parse_fix_url.parse_and_validate is the trust boundary for the
     mycalfix:// scheme. Anything that flunks must return URL_ERROR and not
@@ -771,6 +941,145 @@ class ForkPRTests(unittest.TestCase):
         self.assertIn("contributor/proj", event.notes)
         # paste-ready cmd would also fail; must NOT be present for fork PRs.
         self.assertNotIn("paste-ready", event.notes)
+
+
+class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):
+    """Regression test for the bug codex called out on PR #19: run_codex was
+    writing the `.running` sidecar BEFORE calling acquire_codex_slot(). If
+    all 10 slots stayed full for 30min, slot acquire returned None and the
+    RuntimeError fired BEFORE the `finally` that cleans up running_path
+    could run → orphan sidecar → dashboard shows phantom "running" forever.
+
+    Fix: slot acquire moved above the sidecar write. This test exercises
+    the slot-timeout path and asserts no .running file is left behind."""
+
+    def test_slot_acquire_failure_leaves_no_running_sidecar(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+
+            pr = pr_watcher.PRSnap(
+                url="https://github.com/realRoc/my-calendar/pull/19",
+                number=19, title="t", is_draft=False,
+                repo="realRoc/my-calendar", base="main", default_branch="main",
+                head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+                head_branch="feat", head_repo="realRoc/my-calendar",
+            )
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: None):
+                with self.assertRaises(RuntimeError) as ctx:
+                    pr_watcher.run_codex("prompt", pr)
+
+            self.assertIn("concurrency cap", str(ctx.exception))
+            orphans = list(log_dir.glob("*.running"))
+            self.assertEqual(
+                orphans, [],
+                f"slot timeout must not leave a .running sidecar (would pin "
+                f"a phantom row in the dashboard). Found: {orphans}",
+            )
+
+
+class OriginRemoteNormalizerTests(unittest.TestCase):
+    """The Terminal-side `.command` script normalizes
+    `git remote get-url origin` to `owner/repo` before comparing against
+    the URL's `repo` param. Trailing slashes, optional `.git`, and ssh/https
+    forms must all collapse correctly — otherwise a legitimate checkout
+    would be flagged as a repo mismatch and abort the fix session.
+
+    This test reproduces the exact sed pipeline emitted by launch_fix.sh."""
+
+    # Mirror the exact two-stage sed pipeline emitted by scripts/launch_fix.sh.
+    # If the launcher's pipeline changes, this string must change with it.
+    PIPELINE = r"sed -E 's|(\.git)?/*$||' | sed -E 's|^.*github\.com[:/]||'"
+
+    def _normalize(self, url: str) -> str:
+        # Feed url via stdin to avoid sh-c argv quoting headaches.
+        result = subprocess.run(
+            ["sh", "-c", self.PIPELINE],
+            input=url, capture_output=True, text=True, check=True,
+        )
+        return result.stdout
+
+    def test_ssh_form(self):
+        self.assertEqual(self._normalize("git@github.com:owner/repo.git"), "owner/repo")
+
+    def test_https_plain(self):
+        self.assertEqual(self._normalize("https://github.com/owner/repo"), "owner/repo")
+
+    def test_https_with_git_suffix(self):
+        self.assertEqual(self._normalize("https://github.com/owner/repo.git"), "owner/repo")
+
+    def test_https_trailing_slash(self):
+        # Regression: legitimate `git config remote.origin.url` outputs that
+        # include a trailing slash must not be flagged as mismatching.
+        self.assertEqual(self._normalize("https://github.com/owner/repo/"), "owner/repo")
+
+    def test_https_git_with_trailing_slash(self):
+        # The combination form codex called out in PR #19 review:
+        # `https://github.com/owner/repo.git/` used to normalize to
+        # `owner/repo.git/`, falsely triggering the repo-mismatch abort.
+        self.assertEqual(self._normalize("https://github.com/owner/repo.git/"), "owner/repo")
+
+    def test_dotted_repo_name(self):
+        self.assertEqual(self._normalize("https://github.com/owner/my.repo.git"), "owner/my.repo")
+
+
+class StateAtomicWriteTests(unittest.TestCase):
+    """Regression test for the atomic-write fix: save_state writes to a
+    sibling .tmp file then os.replace()s it onto STATE_PATH. A concurrent
+    load_state() must always see either the prior complete state or the
+    new complete state — never a half-flushed file that would raise
+    JSONDecodeError.
+
+    Without the atomic write, this test trips on a few percent of runs."""
+
+    def test_concurrent_load_during_save_never_raises_json_decode_error(self):
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state_path = tmp / "state.json"
+            state_path.write_text('{"_meta": {}, "prs": {}}', encoding="utf-8")
+            lock_dir = tmp / "locks"
+
+            errors: list[Exception] = []
+            stop = threading.Event()
+            iterations = 200
+
+            def reader():
+                with mock.patch.object(pr_watcher, "STATE_PATH", state_path):
+                    while not stop.is_set():
+                        try:
+                            pr_watcher.load_state()
+                        except json.JSONDecodeError as e:
+                            errors.append(e)
+                        except FileNotFoundError:
+                            # Tolerable: os.replace transiently swaps inodes;
+                            # the file always exists post-replace.
+                            pass
+
+            def writer():
+                with mock.patch.object(pr_watcher, "STATE_PATH", state_path), \
+                        mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                    for i in range(iterations):
+                        state = {"_meta": {}, "prs": {f"url{i}": {"sha": "x" * 200, "i": i}}}
+                        pr_watcher.save_state(state, touched_prs={f"url{i}"})
+
+            r = threading.Thread(target=reader, daemon=True)
+            w = threading.Thread(target=writer)
+            r.start()
+            w.start()
+            w.join()
+            stop.set()
+            r.join(timeout=5)
+            self.assertEqual(
+                errors, [],
+                f"load_state() raised JSONDecodeError {len(errors)} times during "
+                f"concurrent saves — atomic-write contract is broken",
+            )
 
 
 if __name__ == "__main__":

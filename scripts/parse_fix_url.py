@@ -110,7 +110,17 @@ def parse_and_validate(url: str) -> dict[str, str]:
         if pr_number is not None and c_m.group(2) != pr_number:
             return {"URL_ERROR": f"comment PR #{c_m.group(2)} 与 pr #{pr_number} 不一致"}
 
-    return {k: first(k) for k in ("repo", "branch", "comment", "pr", "origin_cwd")}
+    origin_cwd = first("origin_cwd")
+    if origin_cwd and _has_control_chars(origin_cwd):
+        return {"URL_ERROR": "origin_cwd 含控制字符（换行/制表符等），拒绝执行"}
+
+    return {
+        "repo": repo,
+        "branch": branch,
+        "comment": comment,
+        "pr": pr,
+        "origin_cwd": origin_cwd,
+    }
 
 
 def emit(result: dict[str, str]) -> None:
