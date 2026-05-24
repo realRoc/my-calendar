@@ -1158,5 +1158,82 @@ class StateAtomicWriteTests(unittest.TestCase):
             )
 
 
+class AICoAuthorMarkerContractTests(unittest.TestCase):
+    """Lock the AI co-author marker contract in the prompt templates.
+
+    The "human activity" dashboard (issue #17) reads PR comments and commits
+    and bucket-sorts them by whether AI generated them. The signal it relies
+    on lives entirely in these prompt templates:
+
+      - pr_prompt.md MUST instruct codex to start every PR comment with the
+        canonical blockquote + HTML metadata pair.
+      - fix_prompt.md MUST instruct claude to keep the
+        `Co-Authored-By: Claude` trailer on every fix commit.
+
+    If a future edit drops these strings (rephrasing, translation, scope
+    trim), the marker disappears silently — the dashboard would then
+    misclassify automated work as human work. These tests fail the build
+    instead so the regression is impossible to merge unnoticed.
+    """
+
+    PR_PROMPT_PATH = HERE / "pr_prompt.md"
+    FIX_PROMPT_PATH = HERE / "fix_prompt.md"
+
+    # Canonical marker strings. If these need to change, update BOTH the
+    # prompt file and this test — and update the downstream scanner (#17)
+    # to recognize the old form too if you want historical data parseable.
+    PR_BLOCKQUOTE_MARKER = "> 🤖 由 Codex 自动生成（pr_watcher 触发，无人工干预）· 本仓库所有者未介入此条评论的撰写"
+    PR_HTML_METADATA_MARKER = "<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->"
+    FIX_COAUTHOR_TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
+
+    def test_pr_prompt_requires_blockquote_marker_on_first_line(self):
+        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            self.PR_BLOCKQUOTE_MARKER, body,
+            "pr_prompt.md lost the canonical AI-coauthor blockquote marker — "
+            "PR comments would stop being machine-identifiable as AI-generated",
+        )
+
+    def test_pr_prompt_requires_html_metadata_marker(self):
+        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            self.PR_HTML_METADATA_MARKER, body,
+            "pr_prompt.md lost the HTML metadata marker — scanner parseability lost",
+        )
+
+    def test_pr_prompt_marker_appears_before_section_headers(self):
+        # The marker must instruct codex to put it FIRST. If it ended up
+        # mentioned only deep in the file after the section list, codex
+        # might position it at the bottom instead. Use position of "## Blocker"
+        # in the prompt's example as a structural anchor.
+        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
+        marker_pos = body.find(self.PR_BLOCKQUOTE_MARKER)
+        # `## Blocker` is referenced in the formatting rules below the marker
+        # block. Marker must appear before the rules that describe what comes
+        # after it.
+        first_blocker_ref = body.find("## Blocker")
+        self.assertGreater(marker_pos, 0)
+        self.assertLess(
+            marker_pos, first_blocker_ref,
+            "Marker must be described before the section rules it precedes",
+        )
+
+    def test_fix_prompt_requires_coauthor_trailer(self):
+        body = self.FIX_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            self.FIX_COAUTHOR_TRAILER, body,
+            "fix_prompt.md lost the Co-Authored-By: Claude trailer requirement — "
+            "MyCalFix fix commits would stop being machine-identifiable as AI-coauthored",
+        )
+
+    def test_fix_prompt_links_marker_to_pr_prompt(self):
+        # The fix prompt must explain that the trailer is part of a single
+        # convention shared with pr_prompt.md. Without that link, a future
+        # editor might drop one and leave the other, half-breaking the signal.
+        body = self.FIX_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("pr_prompt.md", body)
+        self.assertIn("AI 共著", body)
+
+
 if __name__ == "__main__":
     unittest.main()
