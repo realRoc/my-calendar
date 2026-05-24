@@ -338,6 +338,22 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 某个 repo 已有自己的 pre-push（CI 校验等）想保留：把它改名为 `.git/hooks/pre-push.local`，全局 hook 会自动 exec 它，失败也会让 push 失败（保持原语义）。
 
+### 配置
+
+`~/.config/my-calendar/config.json` 可选，目前支持：
+
+| key | 默认 | 说明 |
+|---|---|---|
+| `codex_concurrency_cap` | `10` | 全机器同时跑 codex 的最大数量。pr_watcher 用 `locks/codex-slot-{1..N}.lock` 实现 N 个 slot 的信号量；想给小机器/紧预算降并发就把这个数调小（如 `4`）。**调大也不会被拦**，但 codex 同时执行数、CPU/网络和 LLM 调用成本会随之线性上升——自行评估机器和预算能承受。**严格 JSON integer** 校验：`2.5` / `"4"` / `true` / 负数 / 0 都会落回默认 10 + 一行 stderr 警告，不会崩 |
+
+示例 `config.json`：
+
+```json
+{
+  "codex_concurrency_cap": 4
+}
+```
+
 ### 调试
 
 - `tail -f logs/pr-watcher.log` 实时看 launchd 兜底
@@ -375,12 +391,17 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
        ↓
   - python urllib.parse 解析 URL，校验 scheme=mycalfix / action=fix
   - 交叉校验 pr URL ∈ 同一 owner/repo（防止 repo=safe/x + pr=evil/y）
-  - **不**做 `git rev-parse` 校验 origin_cwd：launcher 跑在 .app TCC 沙箱里，
-    `git -C ~/Desktop/<repo>` 大概率 EPERM，校验会把所有路径都打去 picker；
-    URL 来源是本地 pre-push hook 写的 pr_state.json，攻击面≈0，直接信任
-    - URL 给了 origin_cwd → 直接用
+  - launcher（.app 进程）**不**对 origin_cwd 做任何 git 校验：跑在 .app TCC
+    沙箱里，`git -C ~/Desktop/<repo>` 大概率 EPERM，校验会把所有路径打去 picker
+    - URL 给了 origin_cwd → 透传给 Terminal-side 脚本
     - URL 没给 → osascript 文件夹选择器（picker），用户取消则 abort
-    - 路径错了 → 在 Terminal 里 `git -C <wrong> fetch` 会失败，用户能看到
+  - **真正的 origin 校验**移到 Terminal-side `.command` 脚本里（Terminal.app 有自己
+    的 TCC 权限，不受 .app 沙箱限制）：跑 `git -C <origin_cwd> remote get-url origin`，
+    归一化（剥 `.git` + 尾部斜杠 + `^.*github\.com[:/]` 前缀）后跟 URL 的 `repo`
+    比对，不一致就 `mycalfix_abort`，**在 fetch / worktree-add 之前**就停下来，
+    避免修复跑到错误仓库甚至 push 到错误远端
+  - `.command` 用 `set -euo pipefail` + 给 `git fetch` / `git worktree add` / `cd`
+    显式 `|| mycalfix_abort`，任一步失败立刻停,不会 fall through 到 `claude`
   - 渲染 scripts/fix_prompt.md → 替换 {pr_url}/{comment_url}/{branch}/{worktree_dir}/{origin_cwd}/{local_branch}
   - 把 Terminal 命令写到 `/tmp/mycalfix.XXXXXX.command`，用 `open -a Terminal <file>` 打开
     （**不**用 `osascript do script Terminal`：那走 AppleEvents/Automation TCC，未签名 .app

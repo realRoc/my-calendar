@@ -943,6 +943,82 @@ class ForkPRTests(unittest.TestCase):
         self.assertNotIn("paste-ready", event.notes)
 
 
+class CodexCapConfigTests(unittest.TestCase):
+    """Test CODEX_CONCURRENCY_CAP override via ~/.config/my-calendar/config.json.
+
+    Beyond return values, this also asserts the contract on stderr: silent
+    on missing-file / missing-key (clean installs aren't noisy), but loud
+    on malformed values so a typo can't silently change codex concurrency
+    or cost. Without these stderr asserts, warning behavior could drift."""
+
+    def _run(self, contents: str | None) -> tuple[int, str]:
+        import contextlib
+        import io as _io
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            if contents is not None:
+                cfg.write_text(contents, encoding="utf-8")
+            buf = _io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                result = pr_watcher._read_codex_cap(config_path=cfg, default=10)
+            return result, buf.getvalue()
+
+    def test_missing_file_uses_default_silently(self):
+        val, err = self._run(contents=None)
+        self.assertEqual(val, 10)
+        self.assertEqual(err, "", "missing config file should not warn")
+
+    def test_missing_key_uses_default_silently(self):
+        val, err = self._run('{"other_setting": 42}')
+        self.assertEqual(val, 10)
+        self.assertEqual(err, "", "missing key should not warn (clean default path)")
+
+    def test_valid_override(self):
+        val, err = self._run('{"codex_concurrency_cap": 4}')
+        self.assertEqual(val, 4)
+        self.assertEqual(err, "", "valid override should not warn")
+
+    def test_non_positive_falls_back_with_warning(self):
+        for body in ('{"codex_concurrency_cap": 0}', '{"codex_concurrency_cap": -3}'):
+            with self.subTest(body=body):
+                val, err = self._run(body)
+                self.assertEqual(val, 10)
+                self.assertIn("is not positive", err)
+
+    def test_float_truncation_rejected(self):
+        # int(2.5) would truncate to 2 — exactly the silent-coercion bug
+        # codex flagged. Must be rejected with a warning instead.
+        val, err = self._run('{"codex_concurrency_cap": 2.5}')
+        self.assertEqual(val, 10)
+        self.assertIn("not a JSON integer", err)
+        self.assertIn("float", err)
+
+    def test_string_digit_rejected(self):
+        # int("4") would coerce — also rejected.
+        val, err = self._run('{"codex_concurrency_cap": "4"}')
+        self.assertEqual(val, 10)
+        self.assertIn("not a JSON integer", err)
+        self.assertIn("str", err)
+
+    def test_bool_true_rejected(self):
+        # int(True) = 1; isinstance(True, int) = True. `type(x) is int` is
+        # what catches this — `True` must NOT silently set cap to 1.
+        val, err = self._run('{"codex_concurrency_cap": true}')
+        self.assertEqual(val, 10)
+        self.assertIn("not a JSON integer", err)
+        self.assertIn("bool", err)
+
+    def test_null_rejected(self):
+        val, err = self._run('{"codex_concurrency_cap": null}')
+        self.assertEqual(val, 10)
+        self.assertIn("not a JSON integer", err)
+
+    def test_malformed_json_falls_back_with_warning(self):
+        val, err = self._run('{not valid json')
+        self.assertEqual(val, 10)
+        self.assertIn("cannot read", err)
+
+
 class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):
     """Regression test for the bug codex called out on PR #19: run_codex was
     writing the `.running` sidecar BEFORE calling acquire_codex_slot(). If
