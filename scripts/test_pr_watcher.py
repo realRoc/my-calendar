@@ -311,6 +311,96 @@ class ForceCoalesceTests(unittest.TestCase):
             self.assertEqual(saved, [{pr_url}, {pr_url}], "each save should be scoped to this PR")
 
 
+class TickSaveStateOrderTests(unittest.TestCase):
+    """Regression test for the race called out by codex on PR #19.
+
+    Old tick path released the per-PR flock first and saved state for ALL
+    touched PRs in a single trailing save_state. In the window between
+    release and trailing save, a --force on the same PR could grab the lock,
+    read stale state, and re-run codex on the same head_sha (duplicate
+    comment).
+
+    Fix: save_state(touched_prs={pr.url}) inside the candidates loop's
+    finally, BEFORE release_lock_fd. This test asserts the ordering via
+    spies."""
+
+    def test_tick_persists_per_pr_state_before_releasing_lock(self):
+        pr_url_a = "https://github.com/realRoc/my-calendar/pull/100"
+        pr_url_b = "https://github.com/realRoc/my-calendar/pull/101"
+
+        state = {
+            "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+            "prs": {
+                pr_url_a: {"last_seen_sha": "old_a", "last_commented_sha": "old_a"},
+                pr_url_b: {"last_seen_sha": "old_b", "last_commented_sha": "old_b"},
+            },
+        }
+
+        def fake_fetch_open_prs():
+            return [
+                pr_watcher.PRSnap(
+                    url=pr_url_a, number=100, title="t", is_draft=False,
+                    repo="realRoc/my-calendar", base="main", default_branch="main",
+                    head_sha="new_a", created_at="2026-05-25T00:00:00Z",
+                    head_branch="feat-a", head_repo="realRoc/my-calendar",
+                ),
+                pr_watcher.PRSnap(
+                    url=pr_url_b, number=101, title="t", is_draft=False,
+                    repo="realRoc/my-calendar", base="main", default_branch="main",
+                    head_sha="new_b", created_at="2026-05-25T00:00:00Z",
+                    head_branch="feat-b", head_repo="realRoc/my-calendar",
+                ),
+            ]
+
+        def fake_process_pr(pr, st, dry_run):
+            st.setdefault("prs", {}).setdefault(pr.url, {})["last_commented_sha"] = pr.head_sha
+            return "codex ran (mocked)"
+
+        events: list[tuple] = []
+
+        def fake_save_state(s, *, touched_prs=None):
+            events.append(("save", set(touched_prs) if touched_prs is not None else None))
+
+        def fake_release_lock_fd(fd):
+            events.append(("release", fd))
+
+        fd_iter = iter([1001, 1002])
+
+        def fake_acquire(url):
+            return next(fd_iter)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            argv = ["pr_watcher.py"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save_state), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", fake_acquire), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", fake_release_lock_fd), \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", fake_fetch_open_prs), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process_pr):
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+
+        # PR A: save must precede release; same for PR B.
+        save_a_idx = next((i for i, e in enumerate(events) if e == ("save", {pr_url_a})), -1)
+        release_a_idx = next((i for i, e in enumerate(events) if e == ("release", 1001)), -1)
+        save_b_idx = next((i for i, e in enumerate(events) if e == ("save", {pr_url_b})), -1)
+        release_b_idx = next((i for i, e in enumerate(events) if e == ("release", 1002)), -1)
+
+        self.assertGreaterEqual(save_a_idx, 0, f"PR A save missing from events: {events}")
+        self.assertGreaterEqual(release_a_idx, 0, f"PR A release missing: {events}")
+        self.assertLess(save_a_idx, release_a_idx,
+                        f"PR A save_state must come BEFORE release_lock_fd. Events: {events}")
+        self.assertGreaterEqual(save_b_idx, 0, f"PR B save missing: {events}")
+        self.assertGreaterEqual(release_b_idx, 0, f"PR B release missing: {events}")
+        self.assertLess(save_b_idx, release_b_idx,
+                        f"PR B save_state must come BEFORE release_lock_fd. Events: {events}")
+
+
 class OriginCwdWithoutForceTests(unittest.TestCase):
     """Manual-debugging guard: passing --origin-cwd without --force used to
     silently drop the value. Verify we now emit a stderr warning so the user

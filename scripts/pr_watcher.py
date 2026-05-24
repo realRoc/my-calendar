@@ -75,6 +75,9 @@ SCRATCH_BASE = Path("/tmp/codex-pr-runs")
 LOCK_DIR = HERE / "locks"                     # per-PR flock files + rerun markers + state lock
 STATE_LOCK_PATH = LOCK_DIR / "state.lock"     # brief flock around state read/merge/write
 FORCE_RERUN_ITER_CAP = 10                     # safety cap on the --force rerun-coalescing loop
+CODEX_CONCURRENCY_CAP = 10                    # max codex executions in flight across all PRs
+CODEX_SLOT_POLL_SEC = 2.0                     # how often to retry when all slots are full
+CODEX_SLOT_TIMEOUT_SEC = 30 * 60              # max time to wait for a slot before bailing
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
 NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
@@ -188,6 +191,39 @@ def release_lock_fd(fd: int) -> None:
         os.close(fd)
     except Exception:
         pass
+
+
+def acquire_codex_slot(*, timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC) -> tuple[int, int] | None:
+    """Acquire one of CODEX_CONCURRENCY_CAP global codex slots.
+
+    Caps how many codex executions can run at once across ALL PRs. Without
+    this cap, per-PR parallelism plus rapid pushes could spawn unbounded
+    concurrent codex processes (CPU/network/$LLM cost).
+
+    Returns (fd, slot_number) on success (caller must release_lock_fd(fd) when
+    done), or None on timeout. Polls every CODEX_SLOT_POLL_SEC; waiting is
+    quiet after the first "all slots busy" notice."""
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout_sec
+    announced_wait = False
+    while True:
+        for n in range(1, CODEX_CONCURRENCY_CAP + 1):
+            fd = os.open(str(LOCK_DIR / f"codex-slot-{n}.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd, n
+            except BlockingIOError:
+                os.close(fd)
+        if not announced_wait:
+            print(
+                f"      all {CODEX_CONCURRENCY_CAP} codex slots busy, waiting up to "
+                f"{int(timeout_sec)}s...",
+                flush=True,
+            )
+            announced_wait = True
+        if time.time() >= deadline:
+            return None
+        time.sleep(CODEX_SLOT_POLL_SEC)
 
 
 # ─── state ─────────────────────────────────────────────────────────────────────
@@ -511,6 +547,18 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     # Make sure brew bins are reachable when run from launchd
     env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+    # Block (poll) for a global codex slot. The per-PR lock is already held by
+    # the caller, so same-PR is serialised; this cap protects the box from
+    # unbounded codex fan-out across UNRELATED PRs (CPU/network/$LLM cost).
+    slot = acquire_codex_slot()
+    if slot is None:
+        raise RuntimeError(
+            f"codex concurrency cap ({CODEX_CONCURRENCY_CAP}) saturated for "
+            f">{CODEX_SLOT_TIMEOUT_SEC}s; aborting this run"
+        )
+    slot_fd, slot_n = slot
+    print(f"      codex slot {slot_n}/{CODEX_CONCURRENCY_CAP} acquired", flush=True)
+
     thread_id: str | None = None
     try:
         with jsonl_path.open("w", encoding="utf-8") as f:
@@ -540,6 +588,9 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                     break
             proc.wait()
     finally:
+        # Release the global codex slot first so a waiter can acquire it
+        # without waiting for the .running sidecar cleanup.
+        release_lock_fd(slot_fd)
         # Whether codex exited cleanly, errored, or got killed by the watchdog,
         # the .running sidecar must go away — otherwise the dashboard's running
         # section would still show this PR after the run is over.
@@ -1037,7 +1088,6 @@ def main() -> int:
         candidates.append(pr)
     print(f"  candidates (base==default): {len(candidates)}")
 
-    touched: set[str] = set()
     for pr in candidates:
         # Per-PR lock: skip PRs currently being reviewed by another process
         # (typically a --force from the pre-push hook). The next tick will
@@ -1058,6 +1108,11 @@ def main() -> int:
             if "installed_at" in fresh.get("_meta", {}):
                 state.setdefault("_meta", {})["installed_at"] = fresh["_meta"]["installed_at"]
 
+        # Did this iteration mutate state["prs"][pr.url]? If so, save under the
+        # per-PR lock BEFORE releasing it (see finally block below). Without
+        # this, a --force that wakes up between release and the post-loop
+        # save_state would read stale state and re-run codex on the same sha.
+        pr_state_changed = False
         try:
             prev = state["prs"].get(pr.url)
             # 首次见到此 PR：根据它是 install 之前就存在的旧 PR 还是之后新建的 PR 来决定
@@ -1082,14 +1137,14 @@ def main() -> int:
                             "last_commented_sha": None,
                             "seeded_at": now.isoformat(timespec="seconds"),
                         }
-                        touched.add(pr.url)
+                        pr_state_changed = True
                     continue
 
                 # 装好之后才创建的 PR → 即便 git pre-push hook 没抓到（网页 UI、异机 push、gh pr create…），也直接评论
                 print(f"    NEW PR (post-install)  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
                 action = process_pr(pr, state, dry_run=args.dry_run)
                 if not args.dry_run:
-                    touched.add(pr.url)
+                    pr_state_changed = True
                 print(f"      → {action}")
                 continue
 
@@ -1097,7 +1152,7 @@ def main() -> int:
                 print(f"    seed-only (skip codex)  {pr.url}  sha={pr.head_sha[:8]}")
                 if not args.dry_run:
                     state["prs"][pr.url]["last_seen_sha"] = pr.head_sha
-                    touched.add(pr.url)
+                    pr_state_changed = True
                 continue
 
             # 已 seed 过：若 head_sha 自上次"评论或 seed"以来未变 → 跳过
@@ -1110,14 +1165,21 @@ def main() -> int:
             print(f"    NEW COMMIT  {pr.url}  {baseline[:8] if baseline else 'NEW'} → {pr.head_sha[:8]}")
             action = process_pr(pr, state, dry_run=args.dry_run)
             if not args.dry_run:
-                touched.add(pr.url)
+                pr_state_changed = True
             print(f"      → {action}")
         finally:
             if pr_fd is not None:
+                # Persist BEFORE releasing the lock so a concurrent --force
+                # for this PR cannot read the pre-codex sha.
+                if pr_state_changed:
+                    save_state(state, touched_prs={pr.url})
                 release_lock_fd(pr_fd)
 
     if not args.dry_run:
-        save_state(state, touched_prs=touched)
+        # Flush _meta updates that happen outside the per-PR scope (e.g. a
+        # freshly stamped installed_at when the tick fires on a brand-new
+        # install). Per-PR entries were already saved inside the loop above.
+        save_state(state, touched_prs=set())
     print(f"[pr-watcher] done")
     return 0
 

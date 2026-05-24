@@ -17,15 +17,15 @@
 #   .command file opened via `open -a Terminal` is a normal user-intent action,
 #   needs no AppleEvents permission, and works on first run.
 #
-# Why no `git rev-parse` validation of origin_cwd?
-#   The launcher runs inside the .app's TCC sandbox. Reading a repo under
-#   ~/Desktop/~/Documents/~/Downloads is gated by TCC, and once the user (or
-#   macOS) records a deny, `git -C <dir>` fails with EPERM regardless of the
-#   Info.plist usage-description keys. Validation would then bounce every URL
-#   to a folder picker even when the URL contained a perfectly valid path. We
-#   trust the URL's origin_cwd: it's written by the local pre-push hook into
-#   pr_state.json, so the attack surface is effectively zero. A wrong path is
-#   surfaced clearly inside Terminal when `git -C <wrong> fetch` errors out.
+# Where origin_cwd is validated:
+#   The launcher (.app process) does NOT pre-validate origin_cwd: it runs inside
+#   the .app's TCC sandbox where `git -C ~/Desktop/<repo>` returns EPERM, which
+#   would bounce every URL to a picker. Validation moved into the Terminal-side
+#   `.command` script, where Terminal.app's own TCC permissions apply: before
+#   any fetch/worktree, the script runs `git -C <origin_cwd> remote get-url
+#   origin` and compares (normalized) against the URL's `repo=owner/name`. A
+#   wrong repo aborts the script and leaves the error visible in the Terminal
+#   window — no silent execution against the wrong remote.
 #
 # Security:
 #   - parse_fix_url.py validates scheme/action and that the comment URL is on
@@ -159,39 +159,62 @@ sys.stdout.write(text)
 ' < "$PROMPT_FILE"
 )
 
-# shlex.quote handles backticks/$/quotes/newlines in rendered_prompt.
-# Flow:
-#   1. fetch origin/<branch> into the user's main repo (.git is shared)
-#   2. `git worktree add -b <local_branch> <worktree_dir> origin/<branch>`
-#      creates a fresh worktree at <worktree_dir> on a brand new local
-#      branch started from origin/<branch>. The user's main checkout in
-#      <origin_cwd> is untouched.
-#   3. cd into the worktree and launch claude.
+# Flow (emitted as multi-line bash so the remote-validation gate can use
+# control flow). shlex.quote handles backticks/$/quotes/newlines in every
+# interpolated value.
+#   1. Validate `git -C <origin_cwd> remote get-url origin` (normalized) ==
+#      "<repo>". If not, abort with a clear error and keep the window open.
+#   2. fetch origin/<branch> into the user's main repo (.git is shared).
+#   3. `git worktree add -b <local_branch> <worktree_dir> origin/<branch>`
+#      creates a fresh worktree on a brand-new local branch started from
+#      origin/<branch>. The user's main checkout in <origin_cwd> is untouched.
+#   4. cd into the worktree and launch claude.
 # claude is told (via fix_prompt.md) to push back with `git push origin
 # HEAD:<branch>` and to print a `git worktree remove` command for cleanup.
 cmd=$(
-  CWD="$origin_cwd" BRANCH="$branch" PROMPT="$rendered_prompt" \
+  CWD="$origin_cwd" REPO="$repo" BRANCH="$branch" PROMPT="$rendered_prompt" \
   WORKTREE_DIR="$worktree_dir" WORKTREE_ROOT="$worktree_root" LOCAL_BRANCH="$local_branch" \
   python3 -c '
 import os, shlex
-cwd = os.environ["CWD"]
-branch = os.environ["BRANCH"]
-prompt = os.environ["PROMPT"]
-worktree_dir = os.environ["WORKTREE_DIR"]
-worktree_root = os.environ["WORKTREE_ROOT"]
-local_branch = os.environ["LOCAL_BRANCH"]
-refspec = "+refs/heads/{0}:refs/remotes/origin/{0}".format(branch)
-parts = [
-    "mkdir -p " + shlex.quote(worktree_root),
-    "echo \x27[MyCalFix] fetching origin/\x27" + shlex.quote(branch),
-    "git -C " + shlex.quote(cwd) + " fetch origin " + shlex.quote(refspec),
-    "echo \x27[MyCalFix] creating worktree at \x27" + shlex.quote(worktree_dir),
-    "git -C " + shlex.quote(cwd) + " worktree add -b " + shlex.quote(local_branch)
-        + " " + shlex.quote(worktree_dir) + " " + shlex.quote("origin/" + branch),
-    "cd " + shlex.quote(worktree_dir),
-    "claude " + shlex.quote(prompt),
-]
-print(" && ".join(parts))
+cwd = shlex.quote(os.environ["CWD"])
+repo = shlex.quote(os.environ["REPO"])
+branch = shlex.quote(os.environ["BRANCH"])
+prompt = shlex.quote(os.environ["PROMPT"])
+worktree_dir = shlex.quote(os.environ["WORKTREE_DIR"])
+worktree_root = shlex.quote(os.environ["WORKTREE_ROOT"])
+local_branch = shlex.quote(os.environ["LOCAL_BRANCH"])
+refspec = shlex.quote("+refs/heads/{0}:refs/remotes/origin/{0}".format(os.environ["BRANCH"]))
+origin_ref = shlex.quote("origin/" + os.environ["BRANCH"])
+print(f"""set -o pipefail
+printf '[MyCalFix] validating origin remote on %s...\\n' {cwd}
+if ! actual_url=$(git -C {cwd} remote get-url origin 2>/dev/null); then
+  printf '[MyCalFix] error: git -C %s remote get-url origin failed.\\n' {cwd} >&2
+  printf 'Path is not a git repo, or has no "origin" remote configured.\\n' >&2
+  printf 'Refusing to fetch/worktree. Fix origin_cwd in the calendar event URL\\n' >&2
+  printf 'or pick a different folder.\\n' >&2
+  exec bash -l
+fi
+# Normalize: strip optional trailing .git, then drop everything up to and
+# including github.com[:/]. Handles git@github.com:OWNER/REPO and
+# https://github.com/OWNER/REPO; non-github remotes fall through unchanged and
+# trip the != check below.
+actual_repo=$(printf '%s' "$actual_url" | sed -E 's|\\.git$||' | sed -E 's|^.*github\\.com[:/]||')
+if [ "$actual_repo" != {repo} ]; then
+  printf '[MyCalFix] error: origin_cwd points at a different repo.\\n' >&2
+  printf '  origin_cwd: %s\\n' {cwd} >&2
+  printf '  actual origin: %s\\n' "$actual_url" >&2
+  printf '  expected repo: %s\\n' {repo} >&2
+  printf 'Refusing to fetch/worktree (would push to wrong remote).\\n' >&2
+  exec bash -l
+fi
+printf '[MyCalFix] origin matches %s — proceeding\\n' "$actual_repo"
+mkdir -p {worktree_root}
+printf '[MyCalFix] fetching origin/%s\\n' {branch}
+git -C {cwd} fetch origin {refspec}
+printf '[MyCalFix] creating worktree at %s\\n' {worktree_dir}
+git -C {cwd} worktree add -b {local_branch} {worktree_dir} {origin_ref}
+cd {worktree_dir}
+claude {prompt}""")
 '
 )
 
