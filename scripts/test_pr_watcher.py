@@ -9,6 +9,9 @@ or:
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1188,6 +1191,140 @@ class InstallAppBundleManifestTests(unittest.TestCase):
             f"InstallAppBundleManifestTests.BUNDLED_RUNTIME_HELPERS *and* "
             f"to scripts/install_app.sh.",
         )
+
+
+class LaunchFixCommandFileRenderTests(unittest.TestCase):
+    """Regression test for issue #25 / PR #19. The .command file body is
+    built by embedding a python source inside `python3 -c '<source>'`. PR #19
+    rewrote that python source from a parts[]+`\\x27` builder into an
+    f-string that contains many *literal* single quotes (printf '...', sed
+    -E 's|...'). Those literal quotes closed bash's outer single-quoted
+    string after the first `'` inside the python source, leaving the rest
+    (including `s|(\\.git)?/*$||`) as unquoted shell tokens. bash aborted
+    the command substitution with `syntax error near unexpected token ?/*$'`,
+    the .command file was never written, and Terminal never launched.
+
+    Crucially, `bash -n scripts/launch_fix.sh` did NOT catch it — bash's
+    static parser doesn't peer inside `$(...)` bodies. The regression was
+    invisible until the user clicked a real `mycalfix://` URL.
+
+    This test drives launch_fix.sh end-to-end with a valid URL, stubs `open`
+    so Terminal is never actually launched, captures the path of the
+    generated .command file, and asserts (a) launch_fix.sh exited 0,
+    (b) the .command file parses as bash, (c) marker strings from the
+    renderer's output are present (catches the failure mode where the
+    python source breaks but `cmd=` still ends up empty/partial).
+    """
+
+    LAUNCHER = HERE / "launch_fix.sh"
+
+    # URL chosen to satisfy parse_fix_url.py: matching pr+comment repos,
+    # non-empty branch, origin_cwd present so the picker doesn't fire.
+    SMOKE_URL = (
+        "mycalfix://fix?"
+        "repo=foo%2Fbar"
+        "&branch=feat%2Fdummy"
+        "&comment=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1%23issuecomment-1"
+        "&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1"
+        "&origin_cwd=%2Ftmp"
+    )
+
+    def _run_launcher_with_stubbed_open(self):
+        """Run launch_fix.sh with a fake `open` on PATH that records the
+        .command file path instead of launching Terminal. Returns
+        (returncode, stdout, stderr, captured_command_path_or_None)."""
+        tmphome = Path(tempfile.mkdtemp(prefix="mycalfix-smoke-home-"))
+        try:
+            stub_dir = tmphome / "bin"
+            stub_dir.mkdir()
+            captured = tmphome / "captured.txt"
+            stub = stub_dir / "open"
+            # `open -a Terminal <file>` — record the final arg (the .command
+            # path). `${!#}` indirectly indexes the last positional arg.
+            stub.write_text(
+                "#!/bin/bash\n"
+                f'printf "%s" "${{!#}}" > {shlex.quote(str(captured))}\n'
+                "exit 0\n"
+            )
+            stub.chmod(0o755)
+            env = os.environ.copy()
+            env["HOME"] = str(tmphome)
+            env["PATH"] = f"{stub_dir}{os.pathsep}{env.get('PATH', '')}"
+            result = subprocess.run(
+                ["bash", str(self.LAUNCHER), self.SMOKE_URL],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            captured_path = None
+            if captured.exists():
+                raw = captured.read_text(encoding="utf-8").strip()
+                if raw:
+                    captured_path = Path(raw)
+            return result, captured_path
+        finally:
+            shutil.rmtree(tmphome, ignore_errors=True)
+
+    def test_launcher_exits_zero_and_writes_command_file(self):
+        result, cmd_path = self._run_launcher_with_stubbed_open()
+        self.assertEqual(
+            result.returncode, 0,
+            f"launch_fix.sh exited {result.returncode} — likely a quoting "
+            f"regression inside the python heredoc (see issue #25). "
+            f"`bash -n` won't catch this; only end-to-end execution does.\n"
+            f"--- stderr ---\n{result.stderr}\n"
+            f"--- stdout ---\n{result.stdout}",
+        )
+        self.assertIsNotNone(
+            cmd_path,
+            "stub `open` was never invoked — launch_fix.sh aborted before "
+            "reaching `open -a Terminal`.\n"
+            f"--- stderr ---\n{result.stderr}",
+        )
+        self.assertTrue(
+            cmd_path.is_file(),
+            f"recorded .command path does not exist on disk: {cmd_path}",
+        )
+
+    def test_command_file_parses_as_bash(self):
+        result, cmd_path = self._run_launcher_with_stubbed_open()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNotNone(cmd_path)
+        check = subprocess.run(
+            ["bash", "-n", str(cmd_path)],
+            capture_output=True, text=True,
+        )
+        body = cmd_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            check.returncode, 0,
+            f"`bash -n` rejected the rendered .command file:\n"
+            f"--- bash -n stderr ---\n{check.stderr}\n"
+            f"--- .command body ---\n{body}",
+        )
+
+    def test_command_file_contains_renderer_output(self):
+        # Belt-and-suspenders: even if launch_fix.sh exits 0 and bash -n
+        # passes, the python heredoc might silently emit an empty/partial
+        # cmd (e.g. command substitution swallowed an error). Marker
+        # assertions catch that — these strings only appear if the python
+        # source ran to completion and printed the full Terminal recipe.
+        _, cmd_path = self._run_launcher_with_stubbed_open()
+        self.assertIsNotNone(cmd_path)
+        body = cmd_path.read_text(encoding="utf-8")
+        for marker in (
+            "mycalfix_abort",            # error helper function rendered
+            "actual_repo=",              # remote-validation gate present
+            "git worktree add",          # worktree-creation step present
+            "claude --dangerously-skip-permissions ",  # claude invocation w/ default flag
+        ):
+            self.assertIn(
+                marker, body,
+                f"marker {marker!r} missing from rendered .command body. "
+                f"The python heredoc silently produced an empty/partial "
+                f"string — likely an issue-#25-style quoting regression.\n"
+                f"--- body ---\n{body}",
+            )
 
 
 class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):

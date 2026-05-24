@@ -185,11 +185,23 @@ sys.stdout.write(text)
 #   4. cd into the worktree and launch claude.
 # claude is told (via fix_prompt.md) to push back with `git push origin
 # HEAD:<branch>` and to print a `git worktree remove` command for cleanup.
+# NOTE on quoting: we feed the python source via `python3 - <<'PYEOF'` heredoc,
+# NOT via `python3 -c '<source>'`. The python source below contains many literal
+# single quotes (e.g. `printf '%s' ...`, `sed -E 's|...'`). With `python3 -c`,
+# bash's outer single-quoted string would be closed by the first literal `'`
+# inside the python source, leaving the rest as unquoted shell tokens — exactly
+# the regression that broke this path in PR #19 (issue #25): `s|(\\.git)?/*$||`
+# would parse as glob/$var/path tokens and bash would abort with
+# `syntax error near unexpected token ?/*$'`. `bash -n` doesn't catch it
+# because it only static-parses; substitution bodies aren't expanded. The
+# `<<'PYEOF'` form keeps every byte of the python source literal — single
+# quotes inside have no special meaning to the shell. All data still flows in
+# via os.environ so the script needs no shell-side interpolation.
 cmd=$(
   CWD="$origin_cwd" REPO="$repo" BRANCH="$branch" PROMPT="$rendered_prompt" \
   WORKTREE_DIR="$worktree_dir" WORKTREE_ROOT="$worktree_root" LOCAL_BRANCH="$local_branch" \
   CLAUDE_FLAG="$CLAUDE_FLAG" \
-  python3 -c '
+  python3 - <<'PYEOF'
 import os, shlex
 cwd = shlex.quote(os.environ["CWD"])
 repo = shlex.quote(os.environ["REPO"])
@@ -244,7 +256,7 @@ printf '[MyCalFix] creating worktree at %s\\n' {worktree_dir}
 git -C {cwd} worktree add -b {local_branch} {worktree_dir} {origin_ref} || mycalfix_abort "git worktree add failed"
 cd {worktree_dir} || mycalfix_abort "cd to worktree failed"
 {claude_invocation}""")
-'
+PYEOF
 )
 
 # Write the command to a .command file and let `open -a Terminal` execute it
