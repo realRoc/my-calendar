@@ -344,7 +344,7 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 | key | 默认 | 说明 |
 |---|---|---|
-| `codex_concurrency_cap` | `10` | 全机器同时跑 codex 的最大数量。pr_watcher 用 `locks/codex-slot-{1..N}.lock` 实现 N 个 slot 的信号量；想给小机器/紧预算降并发就把这个数调小（如 `4`）。**无效值（非整数、≤0、JSON 损坏）会落回 10 + 一行 stderr 警告，不会崩**。改完要重启 launchd agent 或重跑 pr_watcher 让进程重新读 |
+| `codex_concurrency_cap` | `10` | 全机器同时跑 codex 的最大数量。pr_watcher 用 `locks/codex-slot-{1..N}.lock` 实现 N 个 slot 的信号量；想给小机器/紧预算降并发就把这个数调小（如 `4`）。**调大也不会被拦**，但 codex 同时执行数、CPU/网络和 LLM 调用成本会随之线性上升——自行评估机器和预算能承受。**严格 JSON integer** 校验：`2.5` / `"4"` / `true` / 负数 / 0 都会落回默认 10 + 一行 stderr 警告，不会崩 |
 
 示例 `config.json`：
 

@@ -90,9 +90,16 @@ DEFAULT_CODEX_CONCURRENCY_CAP = 10
 def _read_codex_cap(config_path: Path = USER_CONFIG_PATH, default: int = DEFAULT_CODEX_CONCURRENCY_CAP) -> int:
     """Load codex_concurrency_cap from the user config file.
 
-    Returns `default` if the file is missing, unparseable, lacks the key, or
-    holds a non-positive / non-integer value. All failure modes emit a
-    one-line stderr warning so silent drift is loud."""
+    Silently returns `default` when the file is missing or doesn't set the
+    key — clean installs shouldn't be noisy. When the file IS present but
+    unparseable / wrong type / non-positive, emits a one-line stderr warning
+    and falls back to `default` so a malformed config can't crash the
+    daemon.
+
+    "Integer" means strictly a JSON integer (Python `int` that is NOT a
+    `bool`). `2.5`, `"4"`, and `true` are all rejected — silently coercing
+    them would let a typo'd config change codex concurrency / cost without
+    the user noticing."""
     if not config_path.exists():
         return default
     try:
@@ -103,15 +110,23 @@ def _read_codex_cap(config_path: Path = USER_CONFIG_PATH, default: int = DEFAULT
     if not isinstance(cfg, dict) or "codex_concurrency_cap" not in cfg:
         return default
     raw = cfg["codex_concurrency_cap"]
-    try:
-        n = int(raw)
-    except (TypeError, ValueError):
-        print(f"[pr-watcher] warn: codex_concurrency_cap={raw!r} in {config_path} is not an integer; using cap={default}", file=sys.stderr)
+    # Strict: `type(raw) is int` excludes bool (subclass) and any non-int JSON
+    # scalar. int(raw) would silently truncate 2.5 → 2 and coerce "4" → 4.
+    if type(raw) is not int:
+        print(
+            f"[pr-watcher] warn: codex_concurrency_cap={raw!r} in {config_path} "
+            f"is not a JSON integer (got {type(raw).__name__}); using cap={default}",
+            file=sys.stderr,
+        )
         return default
-    if n < 1:
-        print(f"[pr-watcher] warn: codex_concurrency_cap={n} in {config_path} is not positive; using cap={default}", file=sys.stderr)
+    if raw < 1:
+        print(
+            f"[pr-watcher] warn: codex_concurrency_cap={raw} in {config_path} "
+            f"is not positive; using cap={default}",
+            file=sys.stderr,
+        )
         return default
-    return n
+    return raw
 
 
 CODEX_CONCURRENCY_CAP = _read_codex_cap()    # max codex executions in flight across all PRs
