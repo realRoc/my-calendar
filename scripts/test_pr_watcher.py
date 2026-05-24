@@ -1110,6 +1110,86 @@ class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "--dangerously-skip-permissions")
 
 
+class InstallAppBundleManifestTests(unittest.TestCase):
+    """Regression for PR #22 blocker: launch_fix.sh references runtime helpers
+    via `$HERE/<helper>` after .app install, but install_app.sh used to only
+    bundle launch_fix.sh + parse_fix_url.py + fix_prompt.md. mycalfix_config.py
+    was missing → `python3 .../mycalfix_config.py claude-flag` failed → the
+    fail-safe in launch_fix.sh fell through to `--dangerously-skip-permissions`
+    even when the user opted into interactive mode via config.json.
+
+    These tests are static: they read install_app.sh and assert that every
+    runtime helper that launch_fix.sh expects in its directory is also
+    copy-installed and smoke-tested by the installer. They don't actually run
+    `bash install_app.sh` (which would touch ~/Applications, lsregister, and
+    tccutil)."""
+
+    INSTALLER = HERE / "install_app.sh"
+    LAUNCHER = HERE / "launch_fix.sh"
+
+    # Helpers that launch_fix.sh resolves via `$HERE/<name>` (i.e. expects to
+    # find next to itself inside the .app bundle). Update this set whenever
+    # launch_fix.sh starts shelling out to a new sibling script.
+    BUNDLED_RUNTIME_HELPERS = (
+        "launch_fix.sh",
+        "parse_fix_url.py",
+        "mycalfix_config.py",
+        "fix_prompt.md",
+    )
+
+    def test_installer_copies_each_runtime_helper_into_resources(self):
+        installer = self.INSTALLER.read_text(encoding="utf-8")
+        for helper in self.BUNDLED_RUNTIME_HELPERS:
+            with self.subTest(helper=helper):
+                self.assertIn(
+                    f'"$RESOURCES/{helper}"',
+                    installer,
+                    f"install_app.sh must copy {helper} into the .app bundle "
+                    f"so launch_fix.sh can find it at runtime. Missing copy "
+                    f"reproduces PR #22 blocker (silent yolo-mode fallback).",
+                )
+
+    def test_installer_smoke_tests_bundled_config_helper(self):
+        # The fail-safe in launch_fix.sh swallows a missing/broken helper and
+        # defaults to yolo, which is exactly what made the original blocker
+        # invisible to the user. Make the installer reject that state at
+        # install-time so a regression can't ship silently again.
+        installer = self.INSTALLER.read_text(encoding="utf-8")
+        self.assertIn(
+            "mycalfix_config.py",
+            installer.split("smoke-testing bundled config helper", 1)[-1][:1500]
+            if "smoke-testing bundled config helper" in installer
+            else "",
+            "install_app.sh must smoke-test the bundled mycalfix_config.py "
+            "(invoke `claude-flag` and assert the default flag) so a copy "
+            "regression fails the install rather than silently downgrading "
+            "to yolo mode at runtime.",
+        )
+        self.assertIn("--dangerously-skip-permissions", installer)
+
+    def test_launcher_references_match_bundled_manifest(self):
+        # Belt-and-suspenders: any `"$HERE/<file>"` reference in launch_fix.sh
+        # must be in BUNDLED_RUNTIME_HELPERS (otherwise we have a runtime
+        # dependency the installer doesn't know about). This catches the
+        # reverse mistake — adding a new helper to launch_fix.sh without
+        # extending the bundle manifest.
+        import re
+        launcher = self.LAUNCHER.read_text(encoding="utf-8")
+        # Match $HERE/<filename> with extension. Allow letters, digits, _ - .
+        referenced = set(re.findall(r'\$HERE/([A-Za-z0-9_.\-]+\.[A-Za-z0-9]+)', launcher))
+        # launch_fix.sh itself is the launcher; it doesn't reference itself
+        # via $HERE, but the bundle still contains it. Drop from comparison.
+        expected = set(self.BUNDLED_RUNTIME_HELPERS) - {"launch_fix.sh"}
+        unknown = referenced - expected
+        self.assertFalse(
+            unknown,
+            f"launch_fix.sh references helpers that aren't in the bundle "
+            f"manifest: {sorted(unknown)}. Add them to "
+            f"InstallAppBundleManifestTests.BUNDLED_RUNTIME_HELPERS *and* "
+            f"to scripts/install_app.sh.",
+        )
+
+
 class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):
     """Regression test for the bug codex called out on PR #19: run_codex was
     writing the `.running` sidecar BEFORE calling acquire_codex_slot(). If

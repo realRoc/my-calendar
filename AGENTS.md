@@ -441,8 +441,8 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
 | `scripts/mycalfix_config.py` | MyCalFix 用户 config 读取器。`claude-flag` 子命令被 `launch_fix.sh` 调用，读 `~/.config/my-calendar/config.json` 决定要不要给 claude 加 `--dangerously-skip-permissions`。严格 JSON bool 校验，校验失败回 yolo 默认 |
 | `scripts/launch_fix.sh` | URL handler 本体（repo 里的"源"；install 时被复制进 .app）。所有 URL 都会落到 `~/Library/Logs/MyCalFix/launch_fix.log` 方便排错 |
 | `app/MyCalFix/main.applescript` | AppleScript 源（自包含；运行时用 `path to me` 找 `Contents/Resources/launch_fix.sh`） |
-| `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ 把 launcher/prompt 复制进 `Contents/Resources/` + `xattr -dr com.apple.quarantine` + `lsregister -f` + `tccutil reset All <bundle-id>`（清旧 TCC 决定） |
-| `~/Applications/MyCalFix.app` | 部署后的 .app；`com.wuyupeng.mycalfix` bundle id，注册 `mycalfix:` scheme；`Contents/Resources/` 内含 bundled `launch_fix.sh` + `fix_prompt.md` |
+| `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ 把 `launch_fix.sh` / `parse_fix_url.py` / `mycalfix_config.py` / `fix_prompt.md` 全复制进 `Contents/Resources/`（少一个就 abort）+ 安装时 smoke-test bundled parser + config helper（HOME 清空跑 `claude-flag` 必须输出 `--dangerously-skip-permissions`，否则视为 bundle 残缺 fail install）+ `xattr -dr com.apple.quarantine` + `lsregister -f` + `tccutil reset All <bundle-id>`（清旧 TCC 决定） |
+| `~/Applications/MyCalFix.app` | 部署后的 .app；`com.wuyupeng.mycalfix` bundle id，注册 `mycalfix:` scheme；`Contents/Resources/` 内含 bundled `launch_fix.sh` + `parse_fix_url.py` + `mycalfix_config.py` + `fix_prompt.md` |
 | `~/Library/Logs/MyCalFix/launch_fix.log` | 每次 URL 触发的解析参数 + Terminal 启动状况 |
 
 ### 手动入口
@@ -489,6 +489,7 @@ launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 com
 - `build_event`：verdict 是 ❌/⚠️ 时 URL 设置 + paste-ready 命令含 origin_cwd；verdict 是 ✅ 时 URL=None 且无修复入口区块；origin_cwd 缺失时 paste 命令带 `<填入本地 repo 路径>` 占位
 - `ParseFixUrlTests`：URL 解析器拒绝 wrong scheme / wrong action / non-github pr / repo mismatch / 控制字符等
 - `MyCalFixInteractiveClaudeConfigTests`：默认 yolo / 显式 true 切回交互 / 严格 bool 校验拒绝 `"true"` `1` `null` / malformed JSON 落回默认 / `python3 mycalfix_config.py claude-flag` CLI 子命令在干净 HOME 下输出 `--dangerously-skip-permissions`
+- `InstallAppBundleManifestTests`：PR #22 blocker 回归——静态读 `install_app.sh` 校验 `launch_fix.sh` 引用的每个 `$HERE/<helper>`（`parse_fix_url.py` / `mycalfix_config.py` / `fix_prompt.md`）都在 bundle 复制清单里；同时校验 installer 装完会 smoke-test bundled `mycalfix_config.py claude-flag`。漏打包 helper（或反过来给 launch_fix.sh 加新 helper 不更新 manifest）这条测试会挂
 
 `launch_fix.sh` 末段的 `.command` 文件生成 + `open -a Terminal` 没有自动测试（依赖 macOS LaunchServices），靠手动 smoke：`bash scripts/launch_fix.sh 'mycalfix://...'` 直接跑（无 .app 也可），看 `~/Library/Logs/MyCalFix/launch_fix.log` 末尾打印的 `.command` 文件路径是否被 Terminal 读到（文件在 Terminal 启动时被 `rm -f $0` 自删）。
 
@@ -502,7 +503,7 @@ launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 com
 - **用 `.command` 文件 + `open -a Terminal`，不用 `osascript do script Terminal`**：osascript do script 走 AppleEvents (Automation TCC)，未签名 osacompile 应用经常被静默拒绝 -1743 errAEEventNotPermitted，连授权对话框都不弹。`.command` 是 LaunchServices 文档打开，没有 TCC 门槛，第一次点链接就能用。.command 文件首行 `rm -f $0` 自删避免堆积
 - **`launch_fix.sh` 不做 `git rev-parse` 校验 origin_cwd**：launcher 跑在 .app 的 TCC 沙箱里，`git -C ~/Desktop/<repo>` 会 EPERM（即使 Info.plist 声明了 `NSDesktopFolderUsageDescription`，一旦 TCC 库记下 deny 就不再弹框，重装 .app 也不清）。校验会把每次点击都打去 picker，违背"URL 里给的路径应该被用上"的语义。URL 来源是本地 pre-push hook，攻击面≈0，直接信任。路径错了在 Terminal 里 `git -C <wrong> fetch` 失败，用户能看到
 - **install_app.sh 末尾 `tccutil reset All <bundle-id>`**：清掉旧 TCC 决定，避免老版本 .app 留下的 deny 状态污染新版。tccutil 没有记录可清时返回非零，无视即可
-- **launcher + prompt 都打包进 .app bundle（`Contents/Resources/`）**：早期版本是 `__LAUNCHER_PATH__` 占位 + 指向 repo 内绝对路径，但若 repo 在 `~/Desktop` / `~/Documents` / `~/Downloads` 这类 macOS TCC 受保护目录下，.app 跑 bundled launcher 会直接 `EPERM (126)`（Info.plist 里也没声明 `NSDesktopFolderUsageDescription`，弹不出权限对话框）。把脚本和 prompt 搬进 bundle 内部后，.app 读自己 bundle 里的资源不受 TCC 管，问题彻底消失。代价是改任意一个源文件都要 `bash scripts/install_app.sh` 重装一次（installer 重新复制）
+- **launcher + parser + config helper + prompt 都打包进 .app bundle（`Contents/Resources/`）**：早期版本是 `__LAUNCHER_PATH__` 占位 + 指向 repo 内绝对路径，但若 repo 在 `~/Desktop` / `~/Documents` / `~/Downloads` 这类 macOS TCC 受保护目录下，.app 跑 bundled launcher 会直接 `EPERM (126)`（Info.plist 里也没声明 `NSDesktopFolderUsageDescription`，弹不出权限对话框）。把脚本和 prompt 搬进 bundle 内部后，.app 读自己 bundle 里的资源不受 TCC 管，问题彻底消失。代价是改任意一个源文件都要 `bash scripts/install_app.sh` 重装一次（installer 重新复制）。**bundle 清单与 launch_fix.sh 的 `$HERE/...` 依赖必须保持一致**——任何 helper 漏打包都会让 launch_fix.sh 的 fail-safe 静默落回默认（`mycalfix_config.py` 漏打包 → `claude-flag` 失败 → 自动 yolo，把 `mycalfix_interactive_claude: true` 阀门绕掉）。`install_app.sh` 装完会跑 bundled parser + bundled config helper 的 smoke 测试（HOME 清空跑 `claude-flag` 必须输出 `--dangerously-skip-permissions`），`scripts/test_pr_watcher.py::InstallAppBundleManifestTests` 在 CI/单测层面静态校验 `launch_fix.sh` 引用的每个 `$HERE/<helper>` 都在 install_app.sh 复制清单里，避免下次漏打包
 - **log 写 `~/Library/Logs/MyCalFix/`，不写 repo `logs/`**：同一原因——bundled launcher 是 .app 的子进程，写 Desktop 下 `logs/` 也会 EPERM。`~/Library/Logs/` 是 Apple 文档化的应用日志位置，不受 TCC 管
 - **`LSUIElement=true`**：MyCalFix 是一次性 URL handler，不该出现在 Dock / 应用切换器里
 - **prompt 里硬约束 "diff >200 行 abort"**：safeguard，防止 claude 被 prompt injection 或误解 review 拐去做大重构
