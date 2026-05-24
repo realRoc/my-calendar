@@ -2,7 +2,15 @@
 
 **目标 PR**：{pr_url}
 **反馈评论**：{comment_url}
-**当前分支**：{branch}（已 fetch + checkout 到位）
+
+**运行环境**：你正在一个**临时 worktree** 里，主仓库的工作区不受影响。
+
+- worktree 路径：`{worktree_dir}` （你现在 `pwd` 应该就是这里）
+- 主仓库（共享 .git）：`{origin_cwd}`
+- 本地分支：`{local_branch}` （时间戳临时分支）
+- 远端目标分支：`{branch}` （原 PR 的 head 分支）
+
+`git status` 此刻是干净的——所有改动都从你这里开始。
 
 ## 第一步：读完整反馈
 
@@ -48,13 +56,15 @@ gh api -H "Accept: application/vnd.github+json" \
 - commit message 格式：`fix(review): <一句话总结这次修了什么 blocker>`
   - 例：`fix(review): chmod +x hook when cmp -s skips deploy`
 - 在 commit message body 里贴 `Reviewed-Comment: {comment_url}` 一行（方便回溯）
-- `git push`（**不要** `--force-with-lease` 也不要 `--force`；同分支 fast-forward）
+- push **必须**用：`git push origin HEAD:{branch}`
+  - 你本地分支叫 `{local_branch}`（带时间戳），跟远端 `{branch}` 不同名。直接 `git push` 会推到错的 remote ref。
+  - **不要** `--force-with-lease` / `--force`；同分支 fast-forward
 - push 之后 hook 会自动触发新一轮 codex review，那是验证回路
 
 ## 硬约束（违反任何一条就 abort，输出 "ABORTED: <原因>"，不要 commit）
 
 1. **diff 超过 200 行** → abort。让人工先看一眼。如果 review 反馈确实需要这么大改动，写一个 plan 文件 `PHASE3_FIX_PLAN.md` 让人决定
-2. **`git status` 在你开始前不干净** → abort（说明分支上有 stash 没处理的东西）
+2. **`git status` 在你开始前不干净** → abort（worktree 是 launcher 刚 `git worktree add` 出来的，理论上 100% 干净；如果不干净说明 worktree 创建有问题或被外力改过）
 3. **改了 review 没点名的文件**（除非是 import / 测试 fixture 这类附带）→ 在最终回复里逐文件解释为什么动了它；超过 3 个未点名文件 → abort
 4. **跑测试时项目本来就是红的**（不是你引入的）→ 不 abort，但在 commit message body 里标注"pre-existing test failure in <file>"
 5. **`gh pr view {pr_url} --json mergeable` 返回 `CONFLICTING`** → abort，让人工 rebase
@@ -67,3 +77,17 @@ gh api -H "Accept: application/vnd.github+json" \
 - 跑了哪些 lint/test，结果如何
 - push 的 commit SHA（短 hash）
 - 提醒一句：「等 codex 自动再 review 一轮（≤2min），看新评论」
+
+## 第六步：打印清理命令
+
+在最终汇报末尾**原样**打印下面这段（不要替换占位，已经渲染好了），让用户决定什么时候删 worktree：
+
+```
+# 本次 fix 用的临时 worktree（不会自动清理）：
+#   {worktree_dir}
+# 验证 PR 通过后可以删（不会动主仓库或远端）：
+#   git -C {origin_cwd} worktree remove {worktree_dir}
+#   git -C {origin_cwd} branch -D {local_branch}
+```
+
+如果你 ABORTED 了或没 push，也打印这段——worktree 还在磁盘上，用户可能想去里面看你做了一半的东西，或者直接清掉。

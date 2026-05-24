@@ -378,9 +378,16 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
   - 校验 origin_cwd：是 git worktree && remote.origin.url 归一化 == URL 里的 repo
     - URL 给的 origin_cwd 不过 → 静默回退到 osascript 文件夹选择器
     - picker 选完再校验一次；仍不匹配 → alert + abort
-  - 渲染 scripts/fix_prompt.md → 替换 {pr_url}/{comment_url}/{branch}
-  - osascript 起 Terminal：cd → git fetch origin <branch> → git checkout <branch>
-    → git pull --ff-only → claude '<rendered prompt>'
+  - 渲染 scripts/fix_prompt.md → 替换 {pr_url}/{comment_url}/{branch}/{worktree_dir}/{origin_cwd}/{local_branch}
+  - osascript 起 Terminal：
+    mkdir -p ~/.cache/my-calendar/worktrees/
+    → git -C <origin_cwd> fetch origin <branch>
+    → git -C <origin_cwd> worktree add -b mycalfix/<branch>-<ts>
+        ~/.cache/my-calendar/worktrees/<owner>__<repo>__<branch>__<ts>  origin/<branch>
+    → cd <worktree_dir> → claude '<rendered prompt>'
+  - 用临时 worktree（不在 origin_cwd 上 git switch），主 checkout 的 WIP 完全不受打扰；
+    claude 在 worktree 里改完用 `git push origin HEAD:<branch>` 推回原 PR 分支更新原 PR；
+    fix_prompt.md 末尾让 claude 打印 `git worktree remove <worktree_dir>` 让用户决定何时清理
        ↓
   claude 交互模式起来，第一条消息已经是 fix prompt，订阅生效（不是 -p 走 API key）
 ```
