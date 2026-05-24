@@ -335,7 +335,84 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       repoSelect.appendChild(opt);
     });
 
-    let currentView = 'repo';
+    // ─── persisted UI state (issue #12) ─────────────────────────────────
+    // location.reload() loses any in-DOM state, including the user's choices
+    // in the filter bar. We mirror that state into location.hash (a URL
+    // fragment, kept by the browser across reload()), and reapply it on
+    // load. This means: pick a range, edit the search box, expand a review;
+    // 5s reload comes and everything is exactly where it was. Hash is also
+    // shareable — paste the URL and the next viewer sees the same view.
+    //
+    // Schema (URLSearchParams in the hash, after a leading '#'):
+    //   range  : 'today' | 'week' | 'all'           (default 'today')
+    //   repo   : <repo slug>                         (default '')
+    //   q      : <search text>                       (default '')
+    //   tab    : 'repo' | 'pr' | 'timeline'          (default 'repo')
+    //   open   : <rid>,<rid>,...                     (default '', i.e. empty Set)
+    //
+    // Tolerant: missing keys → defaults; unknown 'range'/'tab' values
+    // silently fall back to defaults so a bookmarked URL from an older
+    // dashboard version won't crash; the 'open' list is comma-split with
+    // empty entries filtered out.
+
+    const state = {
+      range: 'today',
+      repo: '',
+      q: '',
+      tab: 'repo',
+      expanded: new Set(),
+    };
+
+    function readStateFromHash() {
+      const raw = location.hash.replace(/^#/, '');
+      if (!raw) return;
+      let params;
+      try {
+        params = new URLSearchParams(raw);
+      } catch (e) {
+        return;
+      }
+      const range = params.get('range');
+      if (range === 'today' || range === 'week' || range === 'all') {
+        state.range = range;
+      }
+      const repo = params.get('repo');
+      if (repo != null) state.repo = repo;
+      const q = params.get('q');
+      if (q != null) state.q = q;
+      const tab = params.get('tab');
+      if (tab === 'repo' || tab === 'pr' || tab === 'timeline') {
+        state.tab = tab;
+      }
+      const open = params.get('open');
+      if (open) {
+        open.split(',').filter(Boolean).forEach(rid => state.expanded.add(rid));
+      }
+    }
+
+    function writeStateToHash() {
+      const params = new URLSearchParams();
+      // Only emit non-defaults to keep the URL short and readable.
+      if (state.range !== 'today') params.set('range', state.range);
+      if (state.repo) params.set('repo', state.repo);
+      if (state.q) params.set('q', state.q);
+      if (state.tab !== 'repo') params.set('tab', state.tab);
+      if (state.expanded.size) {
+        params.set('open', [...state.expanded].join(','));
+      }
+      const next = params.toString();
+      const target = next ? '#' + next : '';
+      // history.replaceState: no new entry in browser history (so back-button
+      // semantics aren't polluted by typing in the search box), no scroll.
+      // location.hash = '' would add '#' to the URL; replaceState avoids that.
+      try {
+        history.replaceState(null, '', location.pathname + location.search + target);
+      } catch (e) {
+        // Some browsers throw on file:// + replaceState; fall back to direct
+        // assignment. We accept the minor cosmetic '#' in that case.
+        if (target) location.hash = target;
+      }
+    }
 
     function rangeCutoff(range) {
       if (range === 'today') {
@@ -354,15 +431,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     function getFiltered() {
-      const range = document.getElementById('range').value;
-      const repo = document.getElementById('repo-filter').value;
-      const q = document.getElementById('q').value.trim().toLowerCase();
+      // Source of truth is the `state` object; the DOM is just its view.
+      // Filter inputs sync DOM → state → hash before each render via
+      // syncStateAndPersist(), so reading from state here keeps render
+      // logic decoupled from the input elements.
       let out = reviews;
-      const cutoff = rangeCutoff(range);
+      const cutoff = rangeCutoff(state.range);
       if (cutoff) {
         out = out.filter(r => new Date(r.timestamp) >= cutoff);
       }
-      if (repo) out = out.filter(r => r.repo === repo);
+      if (state.repo) out = out.filter(r => r.repo === state.repo);
+      const q = state.q.trim().toLowerCase();
       if (q) {
         out = out.filter(r =>
           (r.pr_title || '').toLowerCase().includes(q) ||
@@ -404,6 +483,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       return '<span class="badge badge-err">exit=' + exit + '</span>';
     }
 
+    // Stable id per review so the open/closed state survives a reload. Prefer
+    // comment_url (unique per posted GitHub comment) and fall back to
+    // pr_url+sha+timestamp for old reviews without a sidecar. Used as a
+    // data-rid attribute on each .review div, looked up against
+    // state.expanded (Set of rids loaded from the URL hash).
+    function reviewId(r) {
+      if (r.comment_url) return r.comment_url;
+      return (r.pr_url || '') + '::' + (r.head_sha || '') + '::' + (r.timestamp || '');
+    }
+
     function reviewRow(r) {
       const sha = (r.head_sha || '').slice(0, 8);
       const ts = (r.timestamp || '').replace('T', ' ').slice(0, 19);
@@ -417,8 +506,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         links.push('<a href="' + escapeAttr(sPrUrl) + '" target="_blank" rel="noopener noreferrer">PR</a>');
       }
       if (r.thread_id) links.push('<code>codex resume ' + escapeHtml(r.thread_id) + '</code>');
+      const rid = reviewId(r);
+      const openCls = state.expanded.has(rid) ? ' open' : '';
       return (
-        '<div class="review" onclick="this.classList.toggle(\'open\')">' +
+        '<div class="review' + openCls + '" data-rid="' + escapeAttr(rid) + '">' +
           '<div class="review-meta">' +
             ts + (sha ? ' · ' + sha : '') + ' ' + exitBadge(r.codex_exit) + ' · ' + links.join(' · ') +
           '</div>' +
@@ -447,7 +538,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return;
       }
 
-      if (currentView === 'repo') {
+      if (state.tab === 'repo') {
         const byRepo = {};
         data.forEach(r => { (byRepo[r.repo] = byRepo[r.repo] || []).push(r); });
         root.innerHTML = Object.keys(byRepo).sort().map(repo => {
@@ -460,7 +551,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             '</div>'
           );
         }).join('');
-      } else if (currentView === 'pr') {
+      } else if (state.tab === 'pr') {
         const byPR = {};
         data.forEach(r => { (byPR[r.pr_url] = byPR[r.pr_url] || []).push(r); });
         const keys = Object.keys(byPR).sort((a, b) =>
@@ -537,23 +628,82 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       );
     }
 
+    // Pull DOM filter values into state, then persist to the URL hash.
+    // Called on every change event AND right after the initial DOM sync,
+    // so the hash is always up to date.
+    function syncStateAndPersist() {
+      state.range = document.getElementById('range').value;
+      state.repo = document.getElementById('repo-filter').value;
+      state.q = document.getElementById('q').value;
+      writeStateToHash();
+    }
+
+    // Push the state object back into the filter inputs and tabs. Called on
+    // load, after readStateFromHash(), so a reload's restored URL hash
+    // shows up in the UI. NOT called on every change — that direction is
+    // DOM → state (via syncStateAndPersist).
+    function applyStateToDom() {
+      document.getElementById('range').value = state.range;
+      document.getElementById('repo-filter').value = state.repo;
+      document.getElementById('q').value = state.q;
+      document.querySelectorAll('.tab').forEach(x => {
+        x.classList.toggle('active', x.dataset.view === state.tab);
+      });
+    }
+
     document.querySelectorAll('.tab').forEach(t => {
       t.addEventListener('click', () => {
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
-        currentView = t.dataset.view;
+        state.tab = t.dataset.view;
+        writeStateToHash();
         render();
       });
     });
-    document.getElementById('range').addEventListener('change', render);
-    document.getElementById('repo-filter').addEventListener('change', render);
-    document.getElementById('q').addEventListener('input', render);
+    document.getElementById('range').addEventListener('change', () => {
+      syncStateAndPersist();
+      render();
+    });
+    document.getElementById('repo-filter').addEventListener('change', () => {
+      syncStateAndPersist();
+      render();
+    });
+    document.getElementById('q').addEventListener('input', () => {
+      syncStateAndPersist();
+      render();
+    });
 
+    // Toggle review-card expansion via event delegation. Persists the open
+    // set into state.expanded → URL hash, so the same cards reopen on
+    // reload(). Inline onclick was removed for this reason; the delegated
+    // listener also lets us update state in one place.
+    // Skip clicks on links/code so external nav + the codex-resume
+    // <code> snippet stay clickable without flipping the card.
+    document.getElementById('content').addEventListener('click', (ev) => {
+      if (ev.target.closest('a') || ev.target.closest('code')) return;
+      const row = ev.target.closest('.review');
+      if (!row) return;
+      const rid = row.dataset.rid;
+      if (!rid) return;
+      if (row.classList.toggle('open')) {
+        state.expanded.add(rid);
+      } else {
+        state.expanded.delete(rid);
+      }
+      writeStateToHash();
+    });
+
+    // ─── boot ───────────────────────────────────────────────────────────
+    readStateFromHash();
+    applyStateToDom();
     renderRunning();
     render();
 
-    // 静态 HTML：reload 只在 dashboard.py 被重新跑过之后才会看到新数据。
-    // pr_watcher 写完 sidecar 会自动重生成，所以 review 一落盘 ≤5s 就可见。
+    // Static HTML refresh: dashboard.py regenerates the file every time
+    // pr_watcher writes a sidecar (≤5s lag), so reloading the file is how
+    // the page picks up new reviews. The URL hash is preserved across
+    // reload() automatically, so all filter state + expanded-card state
+    // survives this. Fixes issue #12 (filter reset on every refresh).
     setInterval(() => location.reload(), 5000);
   </script>
 </body>
