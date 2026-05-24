@@ -281,5 +281,93 @@ class RenderHtmlXssTests(unittest.TestCase):
         self.assertIn("JSON.parse", html)
 
 
+class FilterStatePersistenceTests(unittest.TestCase):
+    """Issue #12 regression cover: the dashboard reloads itself every 5s via
+    `setInterval(() => location.reload(), 5000)`. Before this PR the
+    in-DOM filter state (date range / repo / search / tab / expanded
+    review cards) was lost on every reload, so the board was unusable for
+    leaving open long-term.
+
+    Fix: mirror filter state into `location.hash` via URLSearchParams,
+    read it back on load. URL hash survives reload(), so the next render
+    starts from the same state. Also makes the view shareable by URL.
+
+    These tests are structural — they assert the plumbing strings exist
+    in the rendered HTML. Real behaviour testing would need a JS runtime
+    (jsdom/playwright); since the repo has no JS test infra, this is the
+    available guardrail. If someone refactors and accidentally drops the
+    persistence logic, these tests fail and force the conversation."""
+
+    def _render(self):
+        return dashboard.render_html([{
+            "timestamp": "2026-05-24T12:00:00",
+            "repo": "x/y",
+            "pr_number": 1,
+            "pr_url": "https://github.com/x/y/pull/1",
+            "pr_title": "test",
+            "head_sha": "deadbeef",
+            "comment_url": "https://github.com/x/y/issues/1#issuecomment-1",
+            "comment_body": "hi",
+            "codex_exit": 0,
+        }], [])
+
+    def test_hash_state_helpers_are_present(self):
+        html = self._render()
+        # The two persistence directions.
+        self.assertIn("readStateFromHash", html, "state restore on load missing")
+        self.assertIn("writeStateToHash", html, "state persist on change missing")
+        # URL-hash mechanism specifically (not localStorage, which would not
+        # be shareable and would not work cross-browser-profile).
+        self.assertIn("URLSearchParams", html)
+        self.assertIn("location.hash", html)
+        # replaceState avoids polluting browser history with one entry per
+        # keystroke in the search box.
+        self.assertIn("history.replaceState", html)
+
+    def test_state_object_holds_canonical_fields(self):
+        html = self._render()
+        # The state object must own all five filter dimensions that issue
+        # #12 calls out: date range, repo, search, tab, expanded items.
+        # Asserts the keys are wired up — a refactor that drops one would
+        # silently stop persisting that dimension.
+        for key in ("range", "repo", "q", "tab", "expanded"):
+            self.assertIn(f"state.{key}", html, f"state.{key} missing — {key} would not persist")
+
+    def test_expanded_set_persists_via_rid(self):
+        html = self._render()
+        # Review cards need a stable id (data-rid) for the expanded Set to
+        # match the same cards after reload. Without data-rid the open/closed
+        # state can't be reapplied.
+        self.assertIn("data-rid=", html)
+        self.assertIn("reviewId(", html, "stable rid function missing")
+        # Inline onclick toggler was replaced by delegated handler so the
+        # toggle can update state.expanded. Inline form would skip the Set.
+        self.assertNotIn("onclick=\"this.classList.toggle", html)
+
+    def test_reload_interval_preserved(self):
+        # The 5s reload itself must stay — the URL-hash fix is meant to be
+        # invisible to the user, NOT a swap to incremental data fetching.
+        # If a future change disables the reload, dashboard staleness comes
+        # back and users won't see new pr_watcher reviews until refresh.
+        html = self._render()
+        self.assertIn("location.reload()", html)
+        self.assertIn("setInterval", html)
+
+    def test_tolerates_unknown_hash_values(self):
+        # The hash schema is forward-compatible: unknown range/tab values
+        # must fall back to defaults so an old bookmark from a future
+        # dashboard version (or a typo in a hand-edited URL) doesn't crash
+        # the page. Assert the validation enumerations are present.
+        html = self._render()
+        # range whitelist
+        self.assertIn("range === 'today'", html)
+        self.assertIn("range === 'week'", html)
+        self.assertIn("range === 'all'", html)
+        # tab whitelist
+        self.assertIn("tab === 'repo'", html)
+        self.assertIn("tab === 'pr'", html)
+        self.assertIn("tab === 'timeline'", html)
+
+
 if __name__ == "__main__":
     unittest.main()
