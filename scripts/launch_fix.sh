@@ -1,5 +1,8 @@
 #!/bin/bash
-# MyCalFix URL handler: parse mycalfix://fix?... → open Terminal → fetch+checkout → claude
+# MyCalFix URL handler: parse mycalfix://fix?... → open Terminal → create
+# disposable worktree under ~/.cache/my-calendar/worktrees/ → launch claude.
+# Worktree-based to avoid touching the user's main checkout (no dirty-tree
+# abort, no branch switch). claude pushes back via `git push origin HEAD:<b>`.
 #
 # Triggered by ~/Applications/MyCalFix.app via `on open location`. Also
 # runnable manually:
@@ -149,57 +152,63 @@ if [[ ! -f "$PROMPT_FILE" ]]; then
   exit 5
 fi
 
-# Refuse to fetch/checkout on top of uncommitted work. The generated Terminal
-# command runs `git checkout <branch> && git pull --ff-only`, which would
-# carry the user's dirty tree onto the target branch before claude even gets
-# a chance to abort. Bail here instead.
-dirty=$(git -C "$origin_cwd" status --porcelain 2>/dev/null || echo __ERR__)
-if [[ "$dirty" == "__ERR__" ]]; then
-  msg="MyCalFix: 无法在 $origin_cwd 跑 git status，放弃。"
-  echo "$msg" >> "$LOG_FILE"
-  show_alert "$msg"
-  exit 6
-fi
-if [[ -n "$dirty" ]]; then
-  msg="MyCalFix: $origin_cwd 有未提交的改动，请先 commit/stash 后再点修复入口。"
-  echo "  dirty worktree, aborting" >> "$LOG_FILE"
-  echo "$dirty" | head -10 >> "$LOG_FILE"
-  show_alert "$msg"
-  exit 6
-fi
+# Compute worktree path + temporary local branch name now (in this process)
+# so we can render them into the prompt before passing it to claude. claude
+# needs the literal path/branch to print the cleanup command at the end and
+# to push correctly. Worktree dir lives under ~/.cache (not Desktop/Documents/
+# Downloads — those are TCC-protected and would block git inside Terminal in
+# certain installs).
+ts=$(date +%Y%m%d-%H%M%S)
+safe_repo=${repo//\//__}
+worktree_root="$HOME/.cache/my-calendar/worktrees"
+worktree_dir="$worktree_root/${safe_repo}__${branch}__${ts}"
+# Unique local branch name avoids `git worktree add` collision when the user
+# already has $branch checked out in origin_cwd. claude pushes via
+# `git push origin HEAD:<branch>` so the remote branch name is preserved.
+local_branch="mycalfix/${branch}-${ts}"
 
 rendered_prompt=$(
   COMMENT_URL="$comment" PR_URL="$pr" BRANCH="$branch" \
+  WORKTREE_DIR="$worktree_dir" ORIGIN_CWD="$origin_cwd" LOCAL_BRANCH="$local_branch" \
   python3 -c '
 import os, sys
 text = sys.stdin.read()
-text = text.replace("{comment_url}", os.environ["COMMENT_URL"])
-text = text.replace("{pr_url}", os.environ["PR_URL"])
-text = text.replace("{branch}", os.environ["BRANCH"])
+for key in ("COMMENT_URL", "PR_URL", "BRANCH", "WORKTREE_DIR", "ORIGIN_CWD", "LOCAL_BRANCH"):
+    text = text.replace("{" + key.lower() + "}", os.environ[key])
 sys.stdout.write(text)
 ' < "$PROMPT_FILE"
 )
 
 # shlex.quote handles backticks/$/quotes/newlines in rendered_prompt.
-# Fetch uses an explicit `+refs/heads/<b>:refs/remotes/origin/<b>` refspec so
-# `git switch <b>` works in both directions: local branch exists (just check it
-# out) and local branch missing (auto-create tracking from origin/<b>). Plain
-# `git fetch origin <b>` only writes FETCH_HEAD in some configs, and the
-# follow-up `git checkout <b>` then fails when the local branch isn't there.
+# Flow:
+#   1. fetch origin/<branch> into the user's main repo (.git is shared)
+#   2. `git worktree add -b <local_branch> <worktree_dir> origin/<branch>`
+#      creates a fresh worktree at <worktree_dir> on a brand new local
+#      branch started from origin/<branch>. The user's main checkout in
+#      <origin_cwd> is untouched.
+#   3. cd into the worktree and launch claude.
+# claude is told (via fix_prompt.md) to push back with `git push origin
+# HEAD:<branch>` and to print a `git worktree remove` command for cleanup.
 cmd=$(
   CWD="$origin_cwd" BRANCH="$branch" PROMPT="$rendered_prompt" \
+  WORKTREE_DIR="$worktree_dir" WORKTREE_ROOT="$worktree_root" LOCAL_BRANCH="$local_branch" \
   python3 -c '
 import os, shlex
 cwd = os.environ["CWD"]
 branch = os.environ["BRANCH"]
 prompt = os.environ["PROMPT"]
+worktree_dir = os.environ["WORKTREE_DIR"]
+worktree_root = os.environ["WORKTREE_ROOT"]
+local_branch = os.environ["LOCAL_BRANCH"]
 refspec = "+refs/heads/{0}:refs/remotes/origin/{0}".format(branch)
 parts = [
-    "cd " + shlex.quote(cwd),
+    "mkdir -p " + shlex.quote(worktree_root),
     "echo \x27[MyCalFix] fetching origin/\x27" + shlex.quote(branch),
-    "git fetch origin " + shlex.quote(refspec),
-    "git switch " + shlex.quote(branch),
-    "git pull --ff-only origin " + shlex.quote(branch),
+    "git -C " + shlex.quote(cwd) + " fetch origin " + shlex.quote(refspec),
+    "echo \x27[MyCalFix] creating worktree at \x27" + shlex.quote(worktree_dir),
+    "git -C " + shlex.quote(cwd) + " worktree add -b " + shlex.quote(local_branch)
+        + " " + shlex.quote(worktree_dir) + " " + shlex.quote("origin/" + branch),
+    "cd " + shlex.quote(worktree_dir),
     "claude " + shlex.quote(prompt),
 ]
 print(" && ".join(parts))
