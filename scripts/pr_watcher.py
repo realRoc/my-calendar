@@ -288,10 +288,17 @@ def save_state(state: dict, *, touched_prs: set[str] | None = None) -> None:
                 on_disk["_meta"][k] = v
             on_disk["_meta"]["last_run"] = now_iso
             payload = on_disk
-        STATE_PATH.write_text(
+        # Atomic write: load_state() doesn't take state.lock, so it can fire
+        # at any moment relative to this save. Write to a sibling tmp file
+        # then os.replace — POSIX-atomic. A reader either sees the prior
+        # complete state or the new complete state, never a half-flushed
+        # buffer that would raise JSONDecodeError mid-tick.
+        tmp_path = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+        tmp_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True),
             encoding="utf-8",
         )
+        os.replace(tmp_path, STATE_PATH)
     finally:
         release_lock_fd(lock_fd)
 

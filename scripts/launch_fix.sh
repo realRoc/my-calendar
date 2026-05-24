@@ -185,20 +185,26 @@ worktree_root = shlex.quote(os.environ["WORKTREE_ROOT"])
 local_branch = shlex.quote(os.environ["LOCAL_BRANCH"])
 refspec = shlex.quote("+refs/heads/{0}:refs/remotes/origin/{0}".format(os.environ["BRANCH"]))
 origin_ref = shlex.quote("origin/" + os.environ["BRANCH"])
-print(f"""set -o pipefail
+print(f"""set -euo pipefail
+# Helper: print error + keep the Terminal window open so the user can read it.
+# Without this, `set -e` would silently exit and Terminal might close the tab.
+mycalfix_abort() {{
+  printf '[MyCalFix] error: %s\\n' "$1" >&2
+  exec bash -l
+}}
 printf '[MyCalFix] validating origin remote on %s...\\n' {cwd}
 if ! actual_url=$(git -C {cwd} remote get-url origin 2>/dev/null); then
-  printf '[MyCalFix] error: git -C %s remote get-url origin failed.\\n' {cwd} >&2
   printf 'Path is not a git repo, or has no "origin" remote configured.\\n' >&2
   printf 'Refusing to fetch/worktree. Fix origin_cwd in the calendar event URL\\n' >&2
   printf 'or pick a different folder.\\n' >&2
-  exec bash -l
+  mycalfix_abort "git -C $(printf '%s' {cwd}) remote get-url origin failed"
 fi
-# Normalize: strip optional trailing .git, then drop everything up to and
-# including github.com[:/]. Handles git@github.com:OWNER/REPO and
-# https://github.com/OWNER/REPO; non-github remotes fall through unchanged and
-# trip the != check below.
-actual_repo=$(printf '%s' "$actual_url" | sed -E 's|\\.git$||' | sed -E 's|^.*github\\.com[:/]||')
+# Normalize: strip optional trailing .git and/or trailing slashes, then drop
+# everything up to and including github.com[:/]. Handles
+# git@github.com:OWNER/REPO, https://github.com/OWNER/REPO,
+# https://github.com/OWNER/REPO.git/, https://github.com/OWNER/REPO/.
+# Non-github remotes fall through unchanged and trip the != check below.
+actual_repo=$(printf '%s' "$actual_url" | sed -E 's|(\\.git)?/*$||' | sed -E 's|^.*github\\.com[:/]||')
 if [ "$actual_repo" != {repo} ]; then
   printf '[MyCalFix] error: origin_cwd points at a different repo.\\n' >&2
   printf '  origin_cwd: %s\\n' {cwd} >&2
@@ -210,10 +216,10 @@ fi
 printf '[MyCalFix] origin matches %s — proceeding\\n' "$actual_repo"
 mkdir -p {worktree_root}
 printf '[MyCalFix] fetching origin/%s\\n' {branch}
-git -C {cwd} fetch origin {refspec}
+git -C {cwd} fetch origin {refspec} || mycalfix_abort "git fetch origin failed"
 printf '[MyCalFix] creating worktree at %s\\n' {worktree_dir}
-git -C {cwd} worktree add -b {local_branch} {worktree_dir} {origin_ref}
-cd {worktree_dir}
+git -C {cwd} worktree add -b {local_branch} {worktree_dir} {origin_ref} || mycalfix_abort "git worktree add failed"
+cd {worktree_dir} || mycalfix_abort "cd to worktree failed"
 claude {prompt}""")
 '
 )

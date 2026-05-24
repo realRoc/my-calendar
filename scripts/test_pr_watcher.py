@@ -943,5 +943,104 @@ class ForkPRTests(unittest.TestCase):
         self.assertNotIn("paste-ready", event.notes)
 
 
+class OriginRemoteNormalizerTests(unittest.TestCase):
+    """The Terminal-side `.command` script normalizes
+    `git remote get-url origin` to `owner/repo` before comparing against
+    the URL's `repo` param. Trailing slashes, optional `.git`, and ssh/https
+    forms must all collapse correctly — otherwise a legitimate checkout
+    would be flagged as a repo mismatch and abort the fix session.
+
+    This test reproduces the exact sed pipeline emitted by launch_fix.sh."""
+
+    # Mirror the exact two-stage sed pipeline emitted by scripts/launch_fix.sh.
+    # If the launcher's pipeline changes, this string must change with it.
+    PIPELINE = r"sed -E 's|(\.git)?/*$||' | sed -E 's|^.*github\.com[:/]||'"
+
+    def _normalize(self, url: str) -> str:
+        # Feed url via stdin to avoid sh-c argv quoting headaches.
+        result = subprocess.run(
+            ["sh", "-c", self.PIPELINE],
+            input=url, capture_output=True, text=True, check=True,
+        )
+        return result.stdout
+
+    def test_ssh_form(self):
+        self.assertEqual(self._normalize("git@github.com:owner/repo.git"), "owner/repo")
+
+    def test_https_plain(self):
+        self.assertEqual(self._normalize("https://github.com/owner/repo"), "owner/repo")
+
+    def test_https_with_git_suffix(self):
+        self.assertEqual(self._normalize("https://github.com/owner/repo.git"), "owner/repo")
+
+    def test_https_trailing_slash(self):
+        # Regression: legitimate `git config remote.origin.url` outputs that
+        # include a trailing slash must not be flagged as mismatching.
+        self.assertEqual(self._normalize("https://github.com/owner/repo/"), "owner/repo")
+
+    def test_https_git_with_trailing_slash(self):
+        # The combination form codex called out in PR #19 review:
+        # `https://github.com/owner/repo.git/` used to normalize to
+        # `owner/repo.git/`, falsely triggering the repo-mismatch abort.
+        self.assertEqual(self._normalize("https://github.com/owner/repo.git/"), "owner/repo")
+
+    def test_dotted_repo_name(self):
+        self.assertEqual(self._normalize("https://github.com/owner/my.repo.git"), "owner/my.repo")
+
+
+class StateAtomicWriteTests(unittest.TestCase):
+    """Regression test for the atomic-write fix: save_state writes to a
+    sibling .tmp file then os.replace()s it onto STATE_PATH. A concurrent
+    load_state() must always see either the prior complete state or the
+    new complete state — never a half-flushed file that would raise
+    JSONDecodeError.
+
+    Without the atomic write, this test trips on a few percent of runs."""
+
+    def test_concurrent_load_during_save_never_raises_json_decode_error(self):
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state_path = tmp / "state.json"
+            state_path.write_text('{"_meta": {}, "prs": {}}', encoding="utf-8")
+            lock_dir = tmp / "locks"
+
+            errors: list[Exception] = []
+            stop = threading.Event()
+            iterations = 200
+
+            def reader():
+                with mock.patch.object(pr_watcher, "STATE_PATH", state_path):
+                    while not stop.is_set():
+                        try:
+                            pr_watcher.load_state()
+                        except json.JSONDecodeError as e:
+                            errors.append(e)
+                        except FileNotFoundError:
+                            # Tolerable: os.replace transiently swaps inodes;
+                            # the file always exists post-replace.
+                            pass
+
+            def writer():
+                with mock.patch.object(pr_watcher, "STATE_PATH", state_path), \
+                        mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                    for i in range(iterations):
+                        state = {"_meta": {}, "prs": {f"url{i}": {"sha": "x" * 200, "i": i}}}
+                        pr_watcher.save_state(state, touched_prs={f"url{i}"})
+
+            r = threading.Thread(target=reader, daemon=True)
+            w = threading.Thread(target=writer)
+            r.start()
+            w.start()
+            w.join()
+            stop.set()
+            r.join(timeout=5)
+            self.assertEqual(
+                errors, [],
+                f"load_state() raised JSONDecodeError {len(errors)} times during "
+                f"concurrent saves — atomic-write contract is broken",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
