@@ -132,6 +132,14 @@ if [[ -x "$LSREGISTER" ]]; then
   echo "  → lsregister: $APP_PATH"
 fi
 
+# Reset TCC decisions for this bundle id. macOS persists "deny" verdicts per
+# bundle id; rebuilding the .app does NOT clear them. Without this, a user who
+# accidentally dismissed an old TCC prompt would have every future click
+# silently denied. tccutil exits non-zero when there are no records to clear,
+# which is fine — that's exactly the state we're trying to reach.
+echo "  → tccutil reset for $BUNDLE_ID"
+tccutil reset All "$BUNDLE_ID" >/dev/null 2>&1 || true
+
 echo
 echo "✅ installed $APP_PATH"
 echo "   bundle:    $BUNDLE_ID"

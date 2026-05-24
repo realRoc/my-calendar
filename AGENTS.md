@@ -375,11 +375,18 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
        ↓
   - python urllib.parse 解析 URL，校验 scheme=mycalfix / action=fix
   - 交叉校验 pr URL ∈ 同一 owner/repo（防止 repo=safe/x + pr=evil/y）
-  - 校验 origin_cwd：是 git worktree && remote.origin.url 归一化 == URL 里的 repo
-    - URL 给的 origin_cwd 不过 → 静默回退到 osascript 文件夹选择器
-    - picker 选完再校验一次；仍不匹配 → alert + abort
+  - **不**做 `git rev-parse` 校验 origin_cwd：launcher 跑在 .app TCC 沙箱里，
+    `git -C ~/Desktop/<repo>` 大概率 EPERM，校验会把所有路径都打去 picker；
+    URL 来源是本地 pre-push hook 写的 pr_state.json，攻击面≈0，直接信任
+    - URL 给了 origin_cwd → 直接用
+    - URL 没给 → osascript 文件夹选择器（picker），用户取消则 abort
+    - 路径错了 → 在 Terminal 里 `git -C <wrong> fetch` 会失败，用户能看到
   - 渲染 scripts/fix_prompt.md → 替换 {pr_url}/{comment_url}/{branch}/{worktree_dir}/{origin_cwd}/{local_branch}
-  - osascript 起 Terminal：
+  - 把 Terminal 命令写到 `/tmp/mycalfix.XXXXXX.command`，用 `open -a Terminal <file>` 打开
+    （**不**用 `osascript do script Terminal`：那走 AppleEvents/Automation TCC，未签名 .app
+    经常被静默拒绝 -1743 errAEEventNotPermitted，连授权对话框都不弹；.command 文件是
+    LaunchServices document-open，没有 TCC 门槛）
+    .command 文件首行 `rm -f $0` 自删；末尾 `exec bash -l` 保持窗口
     mkdir -p ~/.cache/my-calendar/worktrees/
     → git -C <origin_cwd> fetch origin <branch>
     → git -C <origin_cwd> worktree add -b mycalfix/<branch>-<ts>
@@ -410,7 +417,7 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
 | `scripts/fix_prompt.md` | 修复 prompt 模板（含 `{pr_url}` / `{comment_url}` / `{branch}` 占位）。硬约束包括：diff >200 行 abort、只改 review 点名的地方、跑项目自检、commit + push 同分支不要 --force |
 | `scripts/launch_fix.sh` | URL handler 本体（repo 里的"源"；install 时被复制进 .app）。所有 URL 都会落到 `~/Library/Logs/MyCalFix/launch_fix.log` 方便排错 |
 | `app/MyCalFix/main.applescript` | AppleScript 源（自包含；运行时用 `path to me` 找 `Contents/Resources/launch_fix.sh`） |
-| `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ 把 launcher/prompt 复制进 `Contents/Resources/` + `xattr -dr com.apple.quarantine` + `lsregister -f` |
+| `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ 把 launcher/prompt 复制进 `Contents/Resources/` + `xattr -dr com.apple.quarantine` + `lsregister -f` + `tccutil reset All <bundle-id>`（清旧 TCC 决定） |
 | `~/Applications/MyCalFix.app` | 部署后的 .app；`com.wuyupeng.mycalfix` bundle id，注册 `mycalfix:` scheme；`Contents/Resources/` 内含 bundled `launch_fix.sh` + `fix_prompt.md` |
 | `~/Library/Logs/MyCalFix/launch_fix.log` | 每次 URL 触发的解析参数 + Terminal 启动状况 |
 
@@ -442,12 +449,13 @@ launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 com
 
 ### 调试
 
-- `tail -f ~/Library/Logs/MyCalFix/launch_fix.log` 看每次 URL 被怎么解析的
+- `tail -f ~/Library/Logs/MyCalFix/launch_fix.log` 看每次 URL 被怎么解析的，最末尾会看到 `launching via .command: /tmp/mycalfix.xxxx.command`
 - 改了 `launch_fix.sh` / `fix_prompt.md` / `main.applescript` **都**必须 `bash scripts/install_app.sh` 重装——三个文件都被复制进 bundle，repo 里的源只是模板
 - 若看到 EPERM "Operation not permitted (126)"：bundled launcher 路径有问题或 .app 没装好；先 `ls ~/Applications/MyCalFix.app/Contents/Resources/` 确认 `launch_fix.sh` + `fix_prompt.md` 都在
 - Gatekeeper 第一次警告：installer 已经做了 `xattr -dr com.apple.quarantine`，理论上不会再弹；如果还弹，**右键 → 打开**，之后永久放行
-- `claude` 命令找不到：launcher 在 Terminal 里跑，PATH 是用户 shell 的 PATH（不是 launchd 那个被剥光的）。如果你的 `claude` 装在 `~/bin` 或自定义 npm prefix，确认它在 shell PATH 里
-- Terminal 弹了但 git fetch/checkout 失败：检查 `origin_cwd` 是不是对的 repo、分支名是否真的存在、远端是否能访问
+- `claude` 命令找不到：.command 文件里的 `exec bash -l` 起的是 login shell，PATH 用 shell rc 加载的。如果你的 `claude` 装在 `~/bin` 或自定义 npm prefix，确认它在 `.zshrc` / `.bash_profile` 里被加进 PATH
+- Terminal 弹了但 git fetch/checkout 失败：检查 `origin_cwd` 是不是对的 repo、分支名是否真的存在、远端是否能访问。**注意**：launcher 不再做 `git rev-parse` 预校验（见上面"on URL → launch_fix"小节），路径错误现在只能从 Terminal 输出里发现
+- Terminal **没弹**（点了链接没反应）：看日志最后一行是不是 `Terminal launched OK`。如果是但窗口没出现，可能 Terminal.app 被禁用或非默认 .command 处理器；用 `duti -d com.apple.Terminal command` 或在 Finder 右键 → 显示简介 → 打开方式重置 .command 绑定
 
 ### 单元测试覆盖
 
@@ -455,15 +463,19 @@ launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 com
 
 - `_build_fix_url`：有 origin_cwd / 无 origin_cwd / 缺 head_branch / 缺 comment_url 四种情形
 - `build_event`：verdict 是 ❌/⚠️ 时 URL 设置 + paste-ready 命令含 origin_cwd；verdict 是 ✅ 时 URL=None 且无修复入口区块；origin_cwd 缺失时 paste 命令带 `<填入本地 repo 路径>` 占位
+- `ParseFixUrlTests`：URL 解析器拒绝 wrong scheme / wrong action / non-github pr / repo mismatch / 控制字符等
 
-`launch_fix.sh` URL 解析 + AppleScript 组装目前**没有自动测试**（依赖 macOS osascript），靠手动 smoke：用一个 stub osascript 跑一次，看 `/tmp/launch_fix_smoke.log` 和 `~/Library/Logs/MyCalFix/launch_fix.log`。`.app → bundled launcher` 这一跳的快速 smoke 见下面"调试"——`open` 一个故意缺字段的 URL，看 log 是否多出新一段。
+`launch_fix.sh` 末段的 `.command` 文件生成 + `open -a Terminal` 没有自动测试（依赖 macOS LaunchServices），靠手动 smoke：`bash scripts/launch_fix.sh 'mycalfix://...'` 直接跑（无 .app 也可），看 `~/Library/Logs/MyCalFix/launch_fix.log` 末尾打印的 `.command` 文件路径是否被 Terminal 读到（文件在 Terminal 启动时被 `rm -f $0` 自删）。
 
 ### 设计取舍
 
 - **走 .app + URL scheme，不走 Shortcuts**：URL 稳定可版本化、可塞进 repo、不依赖 Shortcuts.app；缺点是要 osacompile 编译，installer 略复杂
 - **走 `claude "<prompt>"` 交互模式，不走 `claude -p`**：`-p` 在某些环境会吃 `ANTHROPIC_API_KEY` 而不是订阅；交互式确认走订阅
 - **不自动跑修复**：只写日历、塞 URL，由人决定要不要点。修复也是普通的 claude 会话，受用户监督
-- **默认 Terminal 不侦测 iTerm2**：减少配置面；用户用 iTerm2 想接管，改 launch_fix.sh 末尾的 osascript 即可（记得改完重装 .app）
+- **默认 Terminal 不侦测 iTerm2**：减少配置面；用户用 iTerm2 想接管，改 launch_fix.sh 末尾的 `open -a Terminal` 为 `open -a iTerm` 即可（记得改完重装 .app）
+- **用 `.command` 文件 + `open -a Terminal`，不用 `osascript do script Terminal`**：osascript do script 走 AppleEvents (Automation TCC)，未签名 osacompile 应用经常被静默拒绝 -1743 errAEEventNotPermitted，连授权对话框都不弹。`.command` 是 LaunchServices 文档打开，没有 TCC 门槛，第一次点链接就能用。.command 文件首行 `rm -f $0` 自删避免堆积
+- **`launch_fix.sh` 不做 `git rev-parse` 校验 origin_cwd**：launcher 跑在 .app 的 TCC 沙箱里，`git -C ~/Desktop/<repo>` 会 EPERM（即使 Info.plist 声明了 `NSDesktopFolderUsageDescription`，一旦 TCC 库记下 deny 就不再弹框，重装 .app 也不清）。校验会把每次点击都打去 picker，违背"URL 里给的路径应该被用上"的语义。URL 来源是本地 pre-push hook，攻击面≈0，直接信任。路径错了在 Terminal 里 `git -C <wrong> fetch` 失败，用户能看到
+- **install_app.sh 末尾 `tccutil reset All <bundle-id>`**：清掉旧 TCC 决定，避免老版本 .app 留下的 deny 状态污染新版。tccutil 没有记录可清时返回非零，无视即可
 - **launcher + prompt 都打包进 .app bundle（`Contents/Resources/`）**：早期版本是 `__LAUNCHER_PATH__` 占位 + 指向 repo 内绝对路径，但若 repo 在 `~/Desktop` / `~/Documents` / `~/Downloads` 这类 macOS TCC 受保护目录下，.app 跑 bundled launcher 会直接 `EPERM (126)`（Info.plist 里也没声明 `NSDesktopFolderUsageDescription`，弹不出权限对话框）。把脚本和 prompt 搬进 bundle 内部后，.app 读自己 bundle 里的资源不受 TCC 管，问题彻底消失。代价是改任意一个源文件都要 `bash scripts/install_app.sh` 重装一次（installer 重新复制）
 - **log 写 `~/Library/Logs/MyCalFix/`，不写 repo `logs/`**：同一原因——bundled launcher 是 .app 的子进程，写 Desktop 下 `logs/` 也会 EPERM。`~/Library/Logs/` 是 Apple 文档化的应用日志位置，不受 TCC 管
 - **`LSUIElement=true`**：MyCalFix 是一次性 URL handler，不该出现在 Dock / 应用切换器里

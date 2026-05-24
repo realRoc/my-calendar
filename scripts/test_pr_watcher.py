@@ -482,53 +482,6 @@ class PasteReadyFetchHandlesRemoteOnlyBranchTests(unittest.TestCase):
         self.assertIn("git pull --ff-only origin phase3-fix-launcher", cmd)
 
 
-class ValidateOriginCwdRegexTests(unittest.TestCase):
-    """Regression: the inline Python normalizer in launch_fix.sh used to
-    exclude `.` from the repo half of `owner/name`, so legitimate GitHub repos
-    like `owner/my.repo` validated as a mismatch and dropped the user into the
-    folder picker. Allow dots while still stripping the optional `.git`
-    suffix."""
-
-    SNIPPET = (
-        'import sys, re\n'
-        'm = re.search(r"[:/]([^/:]+/[^/:]+?)(?:\\.git)?/?$", sys.argv[1])\n'
-        'print(m.group(1) if m else "")\n'
-    )
-
-    def _normalize(self, url: str) -> str:
-        result = subprocess.run(
-            ["python3", "-c", self.SNIPPET, url],
-            capture_output=True, text=True, check=True,
-        )
-        return result.stdout.strip()
-
-    def test_dot_in_repo_name_accepted(self):
-        self.assertEqual(
-            self._normalize("git@github.com:owner/my.repo.git"),
-            "owner/my.repo",
-        )
-        self.assertEqual(
-            self._normalize("https://github.com/owner/my.repo"),
-            "owner/my.repo",
-        )
-
-    def test_plain_repo_still_normalizes(self):
-        self.assertEqual(
-            self._normalize("git@github.com:realRoc/my-calendar.git"),
-            "realRoc/my-calendar",
-        )
-        self.assertEqual(
-            self._normalize("https://github.com/realRoc/my-calendar.git"),
-            "realRoc/my-calendar",
-        )
-
-    def test_trailing_slash_stripped(self):
-        self.assertEqual(
-            self._normalize("https://github.com/owner/repo.git/"),
-            "owner/repo",
-        )
-
-
 class ParseFixUrlTests(unittest.TestCase):
     """parse_fix_url.parse_and_validate is the trust boundary for the
     mycalfix:// scheme. Anything that flunks must return URL_ERROR and not
