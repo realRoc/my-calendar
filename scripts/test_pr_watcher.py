@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import pr_watcher  # noqa: E402
+import mycalfix_config  # noqa: E402
 
 
 class ForceOriginCwdTests(unittest.TestCase):
@@ -1017,6 +1018,96 @@ class CodexCapConfigTests(unittest.TestCase):
         val, err = self._run('{not valid json')
         self.assertEqual(val, 10)
         self.assertIn("cannot read", err)
+
+
+class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
+    """Test mycalfix_interactive_claude knob in ~/.config/my-calendar/config.json.
+
+    Default (False) → claude_flag() returns '--dangerously-skip-permissions'.
+    Explicit True   → returns '' (interactive mode).
+
+    Strict bool check matters: a stray `"true"` string or `1` must NOT silently
+    flip the flag, since flipping = "claude runs without per-tool approval".
+    """
+
+    def _run(self, contents: str | None) -> tuple[bool, str, str]:
+        import contextlib
+        import io as _io
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            if contents is not None:
+                cfg.write_text(contents, encoding="utf-8")
+            buf = _io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                interactive = mycalfix_config.read_interactive_claude(config_path=cfg)
+                flag = mycalfix_config.claude_flag(config_path=cfg)
+            return interactive, flag, buf.getvalue()
+
+    def test_missing_file_default_yolo_silent(self):
+        interactive, flag, err = self._run(contents=None)
+        self.assertFalse(interactive)
+        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertEqual(err, "", "missing config file should not warn")
+
+    def test_missing_key_default_yolo_silent(self):
+        interactive, flag, err = self._run('{"codex_concurrency_cap": 4}')
+        self.assertFalse(interactive)
+        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertEqual(err, "", "missing key should not warn")
+
+    def test_explicit_true_interactive(self):
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": true}')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "", "interactive mode emits empty flag")
+        self.assertEqual(err, "", "valid override should not warn")
+
+    def test_explicit_false_yolo(self):
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": false}')
+        self.assertFalse(interactive)
+        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertEqual(err, "")
+
+    def test_string_true_rejected(self):
+        # "true" must NOT silently enable interactive — only JSON bool true does.
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": "true"}')
+        self.assertFalse(interactive)
+        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertIn("not a JSON boolean", err)
+        self.assertIn("str", err)
+
+    def test_int_one_rejected(self):
+        # Mirrors codex_cap's strict-bool check. int(1) == True but type isn't bool.
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": 1}')
+        self.assertFalse(interactive)
+        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertIn("not a JSON boolean", err)
+        self.assertIn("int", err)
+
+    def test_null_rejected(self):
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": null}')
+        self.assertFalse(interactive)
+        self.assertIn("not a JSON boolean", err)
+
+    def test_malformed_json_falls_back_silently_to_default(self):
+        # Same contract as codex_cap: warn on stderr, return default (yolo).
+        interactive, flag, err = self._run('{not valid json')
+        self.assertFalse(interactive)
+        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertIn("cannot read", err)
+
+    def test_cli_subcommand_emits_flag(self):
+        # launch_fix.sh shells out via `python3 mycalfix_config.py claude-flag`.
+        # The CLI is the public contract; lock it.
+        result = subprocess.run(
+            [sys.executable, str(HERE / "mycalfix_config.py"), "claude-flag"],
+            capture_output=True,
+            text=True,
+            check=False,
+            # Use a tmp HOME so the user's real config doesn't taint the test.
+            env={**{"PATH": "/usr/bin:/bin"}, "HOME": tempfile.mkdtemp()},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "--dangerously-skip-permissions")
 
 
 class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):

@@ -345,12 +345,14 @@ git -C <repo-path> config core.hooksPath .git/hooks
 | key | 默认 | 说明 |
 |---|---|---|
 | `codex_concurrency_cap` | `10` | 全机器同时跑 codex 的最大数量。pr_watcher 用 `locks/codex-slot-{1..N}.lock` 实现 N 个 slot 的信号量；想给小机器/紧预算降并发就把这个数调小（如 `4`）。**调大也不会被拦**，但 codex 同时执行数、CPU/网络和 LLM 调用成本会随之线性上升——自行评估机器和预算能承受。**严格 JSON integer** 校验：`2.5` / `"4"` / `true` / 负数 / 0 都会落回默认 10 + 一行 stderr 警告，不会崩 |
+| `mycalfix_interactive_claude` | `false` | MyCalFix 起 claude 修复会话时的模式开关。**默认 false** → 用 `claude --dangerously-skip-permissions <prompt>`，会话在 disposable worktree 里跑、不再为每个 tool call 弹 Approve/Deny（与 pr_watcher 调 codex 时的 yolo 模式对齐）。设 `true` 回退到交互模式，每个工具调用都需要手动确认——给"拿不准的 PR"留的安全阀门。**严格 JSON boolean** 校验：`"true"` / `1` / `null` 等非 bool 值会落回默认 false + 一行 stderr 警告 |
 
 示例 `config.json`：
 
 ```json
 {
-  "codex_concurrency_cap": 4
+  "codex_concurrency_cap": 4,
+  "mycalfix_interactive_claude": true
 }
 ```
 
@@ -436,6 +438,7 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
 | 路径 | 作用 |
 |---|---|
 | `scripts/fix_prompt.md` | 修复 prompt 模板（含 `{pr_url}` / `{comment_url}` / `{branch}` 占位）。硬约束包括：diff >200 行 abort、只改 review 点名的地方、跑项目自检、commit + push 同分支不要 --force |
+| `scripts/mycalfix_config.py` | MyCalFix 用户 config 读取器。`claude-flag` 子命令被 `launch_fix.sh` 调用，读 `~/.config/my-calendar/config.json` 决定要不要给 claude 加 `--dangerously-skip-permissions`。严格 JSON bool 校验，校验失败回 yolo 默认 |
 | `scripts/launch_fix.sh` | URL handler 本体（repo 里的"源"；install 时被复制进 .app）。所有 URL 都会落到 `~/Library/Logs/MyCalFix/launch_fix.log` 方便排错 |
 | `app/MyCalFix/main.applescript` | AppleScript 源（自包含；运行时用 `path to me` 找 `Contents/Resources/launch_fix.sh`） |
 | `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ 把 launcher/prompt 复制进 `Contents/Resources/` + `xattr -dr com.apple.quarantine` + `lsregister -f` + `tccutil reset All <bundle-id>`（清旧 TCC 决定） |
@@ -485,6 +488,7 @@ launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 com
 - `_build_fix_url`：有 origin_cwd / 无 origin_cwd / 缺 head_branch / 缺 comment_url 四种情形
 - `build_event`：verdict 是 ❌/⚠️ 时 URL 设置 + paste-ready 命令含 origin_cwd；verdict 是 ✅ 时 URL=None 且无修复入口区块；origin_cwd 缺失时 paste 命令带 `<填入本地 repo 路径>` 占位
 - `ParseFixUrlTests`：URL 解析器拒绝 wrong scheme / wrong action / non-github pr / repo mismatch / 控制字符等
+- `MyCalFixInteractiveClaudeConfigTests`：默认 yolo / 显式 true 切回交互 / 严格 bool 校验拒绝 `"true"` `1` `null` / malformed JSON 落回默认 / `python3 mycalfix_config.py claude-flag` CLI 子命令在干净 HOME 下输出 `--dangerously-skip-permissions`
 
 `launch_fix.sh` 末段的 `.command` 文件生成 + `open -a Terminal` 没有自动测试（依赖 macOS LaunchServices），靠手动 smoke：`bash scripts/launch_fix.sh 'mycalfix://...'` 直接跑（无 .app 也可），看 `~/Library/Logs/MyCalFix/launch_fix.log` 末尾打印的 `.command` 文件路径是否被 Terminal 读到（文件在 Terminal 启动时被 `rm -f $0` 自删）。
 
@@ -492,6 +496,7 @@ launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 com
 
 - **走 .app + URL scheme，不走 Shortcuts**：URL 稳定可版本化、可塞进 repo、不依赖 Shortcuts.app；缺点是要 osacompile 编译，installer 略复杂
 - **走 `claude "<prompt>"` 交互模式，不走 `claude -p`**：`-p` 在某些环境会吃 `ANTHROPIC_API_KEY` 而不是订阅；交互式确认走订阅
+- **默认加 `--dangerously-skip-permissions`，与 pr_watcher 的 codex yolo 模式对齐**：fix 会话每次都要为每一个工具调用点 Approve/Deny 既打断节奏也不真的提供新信息——用户已经点了 `mycalfix://` 链接就是 informed consent。安全前提：(a) worktree 一次性隔离在 `~/.cache/my-calendar/worktrees/`，改坏一删就回去；(b) `.command` 在 fetch/worktree-add 之前已经校验 `git remote get-url origin` 与 URL 的 repo 一致，push 推不到错的 remote；(c) `fix_prompt.md` 硬约束 diff >200 行 abort、只改 review 点名处、不 --force push。**剩余风险**：PR diff / review 评论里若含 prompt injection 把 claude 诱导去改 dotfile 或读敏感文件，prompt 硬约束是唯一防线——这是 yolo 模式的固有 trade-off。**回退阀门**：`mycalfix_interactive_claude: true` 写进 `~/.config/my-calendar/config.json`
 - **不自动跑修复**：只写日历、塞 URL，由人决定要不要点。修复也是普通的 claude 会话，受用户监督
 - **默认 Terminal 不侦测 iTerm2**：减少配置面；用户用 iTerm2 想接管，改 launch_fix.sh 末尾的 `open -a Terminal` 为 `open -a iTerm` 即可（记得改完重装 .app）
 - **用 `.command` 文件 + `open -a Terminal`，不用 `osascript do script Terminal`**：osascript do script 走 AppleEvents (Automation TCC)，未签名 osacompile 应用经常被静默拒绝 -1743 errAEEventNotPermitted，连授权对话框都不弹。`.command` 是 LaunchServices 文档打开，没有 TCC 门槛，第一次点链接就能用。.command 文件首行 `rm -f $0` 自删避免堆积

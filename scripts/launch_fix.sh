@@ -41,7 +41,21 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 LOG_DIR="$HOME/Library/Logs/MyCalFix"
 LOG_FILE="$LOG_DIR/launch_fix.log"
 PROMPT_FILE="$HERE/fix_prompt.md"
+MYCALFIX_CONFIG="$HERE/mycalfix_config.py"
 mkdir -p "$LOG_DIR"
+
+# Read claude CLI flag from ~/.config/my-calendar/config.json. Default value
+# is `--dangerously-skip-permissions` (yolo mode in the disposable worktree);
+# set `mycalfix_interactive_claude: true` to fall back to per-tool approval.
+# Fail-safe to the yolo default if the helper is missing/broken so a partial
+# install doesn't downgrade UX silently.
+if ! CLAUDE_FLAG=$(python3 "$MYCALFIX_CONFIG" claude-flag 2>>"$LOG_FILE"); then
+  CLAUDE_FLAG="--dangerously-skip-permissions"
+  echo "  warn: mycalfix_config.py failed; defaulting CLAUDE_FLAG=$CLAUDE_FLAG" >> "$LOG_FILE"
+fi
+# Trim trailing newline from the python output.
+CLAUDE_FLAG="${CLAUDE_FLAG%$'\n'}"
+echo "  CLAUDE_FLAG: ${CLAUDE_FLAG:-<interactive (empty)>}" >> "$LOG_FILE"
 
 # osascript helpers for the .app's own UI. These display dialogs owned by
 # osascript itself — no AppleEvent sent to other apps, so no Automation TCC
@@ -174,6 +188,7 @@ sys.stdout.write(text)
 cmd=$(
   CWD="$origin_cwd" REPO="$repo" BRANCH="$branch" PROMPT="$rendered_prompt" \
   WORKTREE_DIR="$worktree_dir" WORKTREE_ROOT="$worktree_root" LOCAL_BRANCH="$local_branch" \
+  CLAUDE_FLAG="$CLAUDE_FLAG" \
   python3 -c '
 import os, shlex
 cwd = shlex.quote(os.environ["CWD"])
@@ -185,6 +200,14 @@ worktree_root = shlex.quote(os.environ["WORKTREE_ROOT"])
 local_branch = shlex.quote(os.environ["LOCAL_BRANCH"])
 refspec = shlex.quote("+refs/heads/{0}:refs/remotes/origin/{0}".format(os.environ["BRANCH"]))
 origin_ref = shlex.quote("origin/" + os.environ["BRANCH"])
+# CLAUDE_FLAG is one of two fixed literals: "--dangerously-skip-permissions"
+# or "" (interactive mode). Splice unquoted so the empty string yields no
+# argument (NOT `claude '' <prompt>`, which would feed claude an empty prompt
+# arg). The two possible values have no shell metacharacters.
+claude_flag = os.environ["CLAUDE_FLAG"]
+claude_invocation = (
+    "claude " + claude_flag + " " + prompt if claude_flag else "claude " + prompt
+)
 print(f"""set -euo pipefail
 # Helper: print error + keep the Terminal window open so the user can read it.
 # Without this, `set -e` would silently exit and Terminal might close the tab.
@@ -220,7 +243,7 @@ git -C {cwd} fetch origin {refspec} || mycalfix_abort "git fetch origin failed"
 printf '[MyCalFix] creating worktree at %s\\n' {worktree_dir}
 git -C {cwd} worktree add -b {local_branch} {worktree_dir} {origin_ref} || mycalfix_abort "git worktree add failed"
 cd {worktree_dir} || mycalfix_abort "cd to worktree failed"
-claude {prompt}""")
+{claude_invocation}""")
 '
 )
 
