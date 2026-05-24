@@ -13,7 +13,9 @@ scripts/pr_calendar_state.json
 # PR-watcher codex runs (raw JSONL transcripts may contain private diffs)
 scripts/pr_logs/
 
-# Runtime flock target (pr_watcher serialises hook + launchd ticks)
+# Runtime flock targets (per-PR locks, rerun coalescing markers, state lock)
+scripts/locks/
+# Legacy global flock — kept here so old checkouts don't accidentally commit it
 scripts/pr_watcher.lock
 
 # Auto-generated

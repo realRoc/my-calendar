@@ -83,8 +83,10 @@ class ForceOriginCwdTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
                     mock.patch.object(pr_watcher, "load_state", lambda: state), \
-                    mock.patch.object(pr_watcher, "save_state", lambda s: saved.append(s)), \
-                    mock.patch.object(pr_watcher, "acquire_lock", lambda blocking: 999), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(s)), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run):
                 rc = pr_watcher.main()
 
@@ -159,8 +161,10 @@ class ForceOriginCwdFreshRunTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
                     mock.patch.object(pr_watcher, "load_state", lambda: state), \
-                    mock.patch.object(pr_watcher, "save_state", lambda s: saved.append(s)), \
-                    mock.patch.object(pr_watcher, "acquire_lock", lambda blocking: 999), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(s)), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run), \
                     mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
                     mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: fake_codex_result), \
@@ -182,6 +186,129 @@ class ForceOriginCwdFreshRunTests(unittest.TestCase):
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             self.assertEqual(meta["origin_cwd"], expected_cwd)
             self.assertEqual(meta["head_sha"], head_sha)
+
+
+class ForceCoalesceTests(unittest.TestCase):
+    """Per-PR lock + rerun marker semantics.
+
+    Two important invariants:
+      A) A --force that can't get the per-PR lock writes the rerun marker and
+         exits immediately (no codex run, no state mutation).
+      B) A leader that finds the marker set after its codex run loops once
+         more against the freshly fetched head_sha, so a stack of N rapid
+         pushes during one in-flight review produces 1 extra codex run, not N.
+    """
+
+    def test_force_signals_and_exits_when_lock_held(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/10"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            # acquire_pr_lock_or_signal returns None to simulate "another leader
+            # is in flight"; the rerun marker should be written as a side effect.
+            # We fake this by patching acquire_pr_lock_or_signal directly and
+            # writing the marker ourselves to mimic real behavior.
+            marker_touches: list[str] = []
+
+            def fake_acquire(url):
+                # Mirror the real implementation's side effect.
+                marker = lock_dir / f"{pr_watcher._pr_safe_id(url)}.rerun"
+                marker.touch()
+                marker_touches.append(str(marker))
+                return None  # signal "another leader"
+
+            gh_calls: list = []
+
+            def fake_run(*args, **_kwargs):
+                gh_calls.append(args)
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+            codex_runs: list = []
+
+            argv = ["pr_watcher.py", "--force", pr_url]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", fake_acquire), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda *a, **kw: codex_runs.append(a) or None), \
+                    mock.patch.object(pr_watcher.subprocess, "run", fake_run):
+                rc = pr_watcher.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(codex_runs, [], "must not invoke codex when lock is held")
+            self.assertEqual(gh_calls, [], "must not call gh when lock is held")
+            self.assertEqual(len(marker_touches), 1, "rerun marker must be written")
+            self.assertTrue(Path(marker_touches[0]).exists())
+
+    def test_leader_loops_when_marker_set_then_breaks(self):
+        """Simulate: leader runs codex on iter 1, a --force concurrently writes
+        the marker, leader sees marker → loops → codex on iter 2, no further
+        marker writes → exit. Verify exactly 2 codex invocations."""
+        pr_url = "https://github.com/realRoc/my-calendar/pull/10"
+        first_sha = "aaaa1111"
+        second_sha = "bbbb2222"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            marker_path = lock_dir / f"{pr_watcher._pr_safe_id(pr_url)}.rerun"
+
+            # State will be re-loaded each iteration; mutate it from the codex
+            # mock to mirror what real process_pr would do (set last_commented_sha).
+            shared_state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {pr_url: {"last_commented_sha": None}},
+            }
+            # gh pr view returns first_sha on first call, second_sha on second
+            sha_seq = iter([first_sha, second_sha])
+
+            def fake_gh_run(*args, **_kwargs):
+                sha = next(sha_seq)
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=json.dumps({
+                        "url": pr_url, "number": 10, "title": "t",
+                        "isDraft": False, "baseRefName": "main",
+                        "headRefOid": sha, "createdAt": "2026-05-22T00:00:00Z",
+                    }),
+                    stderr="",
+                )
+
+            codex_shas: list[str] = []
+
+            def fake_process_pr(pr, state, dry_run):
+                codex_shas.append(pr.head_sha)
+                # Simulate "another --force arrives during codex" only on iter 1.
+                if len(codex_shas) == 1:
+                    marker_path.touch()
+                # Mirror real process_pr's state mutation.
+                state.setdefault("prs", {}).setdefault(pr.url, {})["last_commented_sha"] = pr.head_sha
+                return "codex ran (mocked)"
+
+            saved: list = []
+
+            argv = ["pr_watcher.py", "--force", pr_url]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: shared_state), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(touched_prs)), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process_pr), \
+                    mock.patch.object(pr_watcher.subprocess, "run", fake_gh_run):
+                rc = pr_watcher.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(codex_shas, [first_sha, second_sha],
+                             "leader should run codex on first sha, then loop once for the second")
+            self.assertFalse(marker_path.exists(), "marker should be unlinked by the leader's final iteration")
+            self.assertEqual(len(saved), 2, "save_state should be called per iteration")
+            self.assertEqual(saved, [{pr_url}, {pr_url}], "each save should be scoped to this PR")
 
 
 class OriginCwdWithoutForceTests(unittest.TestCase):
