@@ -943,6 +943,46 @@ class ForkPRTests(unittest.TestCase):
         self.assertNotIn("paste-ready", event.notes)
 
 
+class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):
+    """Regression test for the bug codex called out on PR #19: run_codex was
+    writing the `.running` sidecar BEFORE calling acquire_codex_slot(). If
+    all 10 slots stayed full for 30min, slot acquire returned None and the
+    RuntimeError fired BEFORE the `finally` that cleans up running_path
+    could run → orphan sidecar → dashboard shows phantom "running" forever.
+
+    Fix: slot acquire moved above the sidecar write. This test exercises
+    the slot-timeout path and asserts no .running file is left behind."""
+
+    def test_slot_acquire_failure_leaves_no_running_sidecar(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+
+            pr = pr_watcher.PRSnap(
+                url="https://github.com/realRoc/my-calendar/pull/19",
+                number=19, title="t", is_draft=False,
+                repo="realRoc/my-calendar", base="main", default_branch="main",
+                head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+                head_branch="feat", head_repo="realRoc/my-calendar",
+            )
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: None):
+                with self.assertRaises(RuntimeError) as ctx:
+                    pr_watcher.run_codex("prompt", pr)
+
+            self.assertIn("concurrency cap", str(ctx.exception))
+            orphans = list(log_dir.glob("*.running"))
+            self.assertEqual(
+                orphans, [],
+                f"slot timeout must not leave a .running sidecar (would pin "
+                f"a phantom row in the dashboard). Found: {orphans}",
+            )
+
+
 class OriginRemoteNormalizerTests(unittest.TestCase):
     """The Terminal-side `.command` script normalizes
     `git remote get-url origin` to `owner/repo` before comparing against

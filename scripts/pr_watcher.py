@@ -511,6 +511,22 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     scratch = SCRATCH_BASE / f"{stamp}-{uuid.uuid4().hex[:8]}"
     scratch.mkdir(parents=True, exist_ok=True)
 
+    # Block (poll) for a global codex slot BEFORE writing the running sidecar.
+    # If acquire times out and raises RuntimeError, we must not leave behind
+    # an orphan sidecar (would pin a phantom "running" row in the dashboard
+    # since the cleanup `finally` below never gets entered). The per-PR lock
+    # is already held by the caller, so same-PR is serialised; this cap
+    # protects the box from unbounded codex fan-out across UNRELATED PRs
+    # (CPU/network/$LLM cost).
+    slot = acquire_codex_slot()
+    if slot is None:
+        raise RuntimeError(
+            f"codex concurrency cap ({CODEX_CONCURRENCY_CAP}) saturated for "
+            f">{CODEX_SLOT_TIMEOUT_SEC}s; aborting this run"
+        )
+    slot_fd, slot_n = slot
+    print(f"      codex slot {slot_n}/{CODEX_CONCURRENCY_CAP} acquired", flush=True)
+
     # Drop the .running sidecar BEFORE codex starts so the dashboard's
     # collect_running() can find it during the 1–2min codex run. Cleaned up
     # in the finally below. Reviewer dashboard refreshes every 5s, so a single
@@ -553,18 +569,6 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     env = os.environ.copy()
     # Make sure brew bins are reachable when run from launchd
     env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-    # Block (poll) for a global codex slot. The per-PR lock is already held by
-    # the caller, so same-PR is serialised; this cap protects the box from
-    # unbounded codex fan-out across UNRELATED PRs (CPU/network/$LLM cost).
-    slot = acquire_codex_slot()
-    if slot is None:
-        raise RuntimeError(
-            f"codex concurrency cap ({CODEX_CONCURRENCY_CAP}) saturated for "
-            f">{CODEX_SLOT_TIMEOUT_SEC}s; aborting this run"
-        )
-    slot_fd, slot_n = slot
-    print(f"      codex slot {slot_n}/{CODEX_CONCURRENCY_CAP} acquired", flush=True)
 
     thread_id: str | None = None
     try:
