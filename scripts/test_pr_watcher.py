@@ -541,11 +541,10 @@ class RunCodexPreExistingMarkerTests(unittest.TestCase):
     Fixed behaviour: stale-marker cleanup is the caller's responsibility,
     done immediately after lock acquisition (clear_stale_cancel_marker).
     run_codex no longer touches the marker on entry; any marker present when
-    run_codex starts MUST be observed by the watcher and trigger cancellation.
+    run_codex starts MUST short-circuit before Codex is spawned.
     """
 
-    def test_pre_existing_marker_kills_codex_and_sets_cancelled(self):
-        import time as _time
+    def test_pre_existing_marker_short_circuits_before_codex_start(self):
         pr = pr_watcher.PRSnap(
             url="https://github.com/realRoc/my-calendar/pull/26",
             number=26, title="t", is_draft=False,
@@ -562,16 +561,6 @@ class RunCodexPreExistingMarkerTests(unittest.TestCase):
             lock_dir = tmp / "locks"
             lock_dir.mkdir()
 
-            # Long-sleeping fake codex: if the marker is wrongly cleared,
-            # this test will take ~30s and the assertions below will fail.
-            fake_codex = tmp / "fake_codex"
-            fake_codex.write_text(
-                "#!/bin/bash\n"
-                'echo \'{"type":"thread.started","thread_id":"t-3"}\'\n'
-                "sleep 30\n"
-            )
-            fake_codex.chmod(0o755)
-
             slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
 
             # Pre-place the cancel marker — simulating --force B having
@@ -579,34 +568,28 @@ class RunCodexPreExistingMarkerTests(unittest.TestCase):
             # and A's entry into run_codex.
             cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
             cancel_marker.touch()
+            popen_calls = []
 
             with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
                     mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
                     mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
                     mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
-                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
-                orig_popen = pr_watcher.subprocess.Popen
-
-                def patched_popen(cmd, *args, **kwargs):
-                    if cmd and cmd[0] == "codex":
-                        cmd = [str(fake_codex)] + cmd[1:]
-                    return orig_popen(cmd, *args, **kwargs)
-
-                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
-                    t0 = _time.time()
-                    result = pr_watcher.run_codex("prompt-text", pr)
-                    elapsed = _time.time() - t0
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher.subprocess, "Popen",
+                                      lambda *a, **k: popen_calls.append(a) or (_ for _ in ()).throw(AssertionError("no codex"))):
+                result = pr_watcher.run_codex("prompt-text", pr)
 
             self.assertTrue(
                 result.cancelled,
                 "marker present at run_codex entry MUST be honoured as a cancel "
-                "signal, not silently deleted on entry. Old buggy code would "
-                "delete it and run codex to completion (cancelled=False).",
+                "signal before launching Codex. Old buggy code would start "
+                "Codex and rely on the watcher to kill it.",
             )
-            self.assertLess(
-                elapsed, 10,
-                f"watcher should kill the fake codex quickly after observing "
-                f"the pre-existing marker (elapsed={elapsed:.1f}s; fake sleeps 30s)",
+            self.assertEqual(popen_calls, [], "pre-start cancel must not spawn Codex")
+            self.assertFalse(cancel_marker.exists(), "marker must be consumed")
+            self.assertIn(
+                "cancelled_before_codex_start",
+                result.jsonl_path.read_text(encoding="utf-8"),
             )
 
 
@@ -856,6 +839,99 @@ class CancelMarkerAfterProcExitTests(unittest.TestCase):
                 "jsonl should record the cancellation marker reason even "
                 "when the marker landed post-exit.",
             )
+
+    def test_marker_consumed_by_watcher_after_post_wait_check_sets_cancelled(self):
+        """The marker can arrive after the main thread's post-wait check but
+        before stop_cancel_watcher is set. If the watcher consumes it in that
+        window, run_codex must re-read cancel_observed after join."""
+        import time as _time
+
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-consumed"}\'\n'
+                "exit 0\n"
+            )
+            fake_codex.chmod(0o755)
+
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+            real_event = pr_watcher.threading.Event
+            created_events = []
+
+            class HookedEvent:
+                def __init__(self, idx):
+                    self.idx = idx
+                    self._event = real_event()
+                    self.is_set_calls = 0
+
+                def set(self):
+                    self._event.set()
+
+                def wait(self, timeout=None):
+                    return self._event.wait(timeout)
+
+                def is_set(self):
+                    actual = self._event.is_set()
+                    self.is_set_calls += 1
+                    # cancel_observed is the second Event created by run_codex.
+                    # Its second is_set() call is the main thread's final
+                    # pre-finally decision. Drop the marker there, let the
+                    # watcher consume it, then return the old False value.
+                    if self.idx == 1 and self.is_set_calls == 2 and not actual:
+                        cancel_marker.touch()
+                        deadline = _time.time() + 2.0
+                        while cancel_marker.exists() and _time.time() < deadline:
+                            _time.sleep(0.005)
+                        return False
+                    return actual
+
+            def event_factory():
+                ev = HookedEvent(len(created_events))
+                created_events.append(ev)
+                return ev
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "CANCEL_POLL_SEC", 0.01), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher.threading, "Event", event_factory):
+                orig_popen = pr_watcher.subprocess.Popen
+
+                def patched_popen(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "codex":
+                        cmd = [str(fake_codex)] + cmd[1:]
+                    return orig_popen(cmd, *args, **kwargs)
+
+                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                    result = pr_watcher.run_codex("prompt-text", pr)
+
+            self.assertTrue(
+                result.cancelled,
+                "watcher-consumed marker after the main post-wait check must "
+                "still make run_codex return cancelled=True.",
+            )
+            self.assertFalse(cancel_marker.exists(), "watcher should consume the marker")
+            jsonl = result.jsonl_path.read_text(encoding="utf-8")
+            self.assertIn("cancelled_new_commit", jsonl)
 
 
 class ClearStaleCancelMarkerTests(unittest.TestCase):

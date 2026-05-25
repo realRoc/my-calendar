@@ -722,6 +722,35 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     slot_fd, slot_n = slot
     print(f"      codex slot {slot_n}/{CODEX_CONCURRENCY_CAP} acquired", flush=True)
 
+    # If a same-PR --force wrote the cancel marker while we were acquiring a
+    # global slot, honour it before spawning Codex. Otherwise a free slot can
+    # briefly start a stale Codex run just for the watcher to kill it.
+    try:
+        marker_exists = cancel_marker.exists()
+    except OSError:
+        marker_exists = False
+    if marker_exists:
+        try:
+            cancel_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            jsonl_path.write_text(
+                '{"type":"_killed_by_watcher","reason":"cancelled_before_codex_start"}\n',
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        release_lock_fd(slot_fd)
+        return CodexResult(
+            thread_id=None,
+            last_message="",
+            exit_code=-1,
+            jsonl_path=jsonl_path,
+            scratch_dir=scratch,
+            cancelled=True,
+        )
+
     # Drop the .running sidecar BEFORE codex starts so the dashboard's
     # collect_running() can find it during the 1–2min codex run. Cleaned up
     # in the finally below. Reviewer dashboard refreshes every 5s, so a single
@@ -770,6 +799,7 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     proc: subprocess.Popen | None = None
     stop_cancel_watcher = threading.Event()
     cancel_observed = threading.Event()
+    cancel_reason_written = False
 
     def _kill_proc_group(p: subprocess.Popen) -> None:
         """SIGKILL the codex process group. codex tends to spawn helpers
@@ -789,6 +819,31 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 p.kill()
             except Exception:
                 pass
+
+    def _consume_cancel_marker() -> bool:
+        try:
+            marker_exists = cancel_marker.exists()
+        except OSError:
+            marker_exists = False
+        if not marker_exists:
+            return False
+        cancel_observed.set()
+        try:
+            cancel_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return True
+
+    def _append_cancel_reason() -> None:
+        nonlocal cancel_reason_written
+        if cancel_reason_written:
+            return
+        try:
+            with jsonl_path.open("a", encoding="utf-8") as f:
+                f.write('{"type":"_killed_by_watcher","reason":"cancelled_new_commit"}\n')
+            cancel_reason_written = True
+        except OSError:
+            pass
 
     def _cancel_watcher() -> None:
         """Poll the cancel marker; any marker observed during the codex run
@@ -811,16 +866,7 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
         (the main thread already finished post-codex housekeeping).
         """
         while True:
-            try:
-                marker_exists = cancel_marker.exists()
-            except OSError:
-                marker_exists = False
-            if marker_exists:
-                cancel_observed.set()
-                try:
-                    cancel_marker.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if _consume_cancel_marker():
                 if proc is not None and proc.poll() is None:
                     _kill_proc_group(proc)
                 return
@@ -869,18 +915,11 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
             # and we'd commit stale calendar/state. Do one synchronous
             # marker check here so a late marker still flips cancelled=True.
             if not cancel_observed.is_set():
-                try:
-                    if cancel_marker.exists():
-                        cancel_observed.set()
-                        try:
-                            cancel_marker.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                except OSError:
-                    pass
+                _consume_cancel_marker()
             if cancel_observed.is_set():
                 cancelled = True
                 f.write('{"type":"_killed_by_watcher","reason":"cancelled_new_commit"}\n')
+                cancel_reason_written = True
     finally:
         # Stop the watcher thread BEFORE releasing the slot so a brand-new
         # codex (acquired by another --force right after) can't be confused
@@ -899,6 +938,14 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 watcher_thread.join(timeout=2)
             except RuntimeError:
                 pass
+        # Final cancellation decision must happen after the watcher has stopped.
+        # Otherwise the watcher can observe and unlink a marker after the main
+        # thread's post-wait check, leaving process_pr with neither
+        # result.cancelled nor a marker to consume.
+        _consume_cancel_marker()
+        if cancel_observed.is_set():
+            cancelled = True
+            _append_cancel_reason()
         # Release the global codex slot so a waiter can acquire it without
         # waiting for the .running sidecar cleanup.
         release_lock_fd(slot_fd)
