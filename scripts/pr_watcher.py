@@ -219,6 +219,27 @@ def _pr_cancel_path(pr_url: str) -> Path:
     return LOCK_DIR / f"{_pr_safe_id(pr_url)}.cancel"
 
 
+def clear_stale_cancel_marker(pr_url: str) -> None:
+    """Drop any leftover cancel marker for this PR. MUST be called only by
+    the holder of the per-PR lock, and ONLY at lock-acquisition time.
+
+    Why the restriction matters: the marker is the contract between a new
+    --force and the current leader's watcher. A new --force that fails to
+    grab the lock writes the marker via signal_cancel_and_wait_for_lock();
+    the current leader's watcher must observe it and kill its codex run.
+    If anyone other than "the holder, at acquisition time" clears the marker
+    — e.g. clearing it again later, in run_codex(), after a new --force has
+    already written its cancel signal — that cancel signal is silently lost,
+    the stale review runs to completion, and the new --force ends up running
+    a duplicate review on the fresh sha. See regression test
+    test_run_codex_does_not_clear_concurrent_cancel_marker.
+    """
+    try:
+        _pr_cancel_path(pr_url).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def acquire_pr_lock_nb(pr_url: str) -> int | None:
     """Try once to acquire the per-PR flock. Return the fd if acquired
     (caller must keep it open until done, then os.close), or None if it's
@@ -591,13 +612,13 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     scratch = SCRATCH_BASE / f"{stamp}-{uuid.uuid4().hex[:8]}"
     scratch.mkdir(parents=True, exist_ok=True)
 
-    # Clear any stale cancel marker from a previous aborted run so the
-    # watcher thread below doesn't kill our brand-new codex on its first poll.
+    # NOTE: do NOT clear the cancel marker here. Stale-marker cleanup is the
+    # responsibility of the caller, immediately after they acquire the per-PR
+    # lock (see clear_stale_cancel_marker). Clearing the marker on run_codex
+    # entry would race against a new --force that wrote the marker between
+    # lock acquisition and our arrival here — we'd silently drop its cancel
+    # signal and run the stale review to completion.
     cancel_marker = _pr_cancel_path(pr.url)
-    try:
-        cancel_marker.unlink(missing_ok=True)
-    except OSError:
-        pass
 
     # Block (poll) for a global codex slot BEFORE writing the running sidecar.
     # If acquire times out and raises RuntimeError, we must not leave behind
@@ -716,6 +737,7 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 return
 
     watcher_thread = threading.Thread(target=_cancel_watcher, daemon=True)
+    watcher_started = False
 
     try:
         with jsonl_path.open("w", encoding="utf-8") as f:
@@ -732,6 +754,7 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 start_new_session=True,
             )
             watcher_thread.start()
+            watcher_started = True
             start = time.time()
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -756,8 +779,20 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
         # Stop the watcher thread BEFORE releasing the slot so a brand-new
         # codex (acquired by another --force right after) can't be confused
         # by our still-running watcher reacting to a fresh marker for itself.
+        #
+        # Only join if the thread was actually started — Popen() above can
+        # raise (codex not in PATH, permission denied, fd exhaustion, etc.)
+        # before watcher_thread.start() runs. join()'ing an unstarted thread
+        # raises RuntimeError, which would mask the original error AND skip
+        # the slot release + sidecar cleanup below. The double-guard
+        # (watcher_started flag + try/except RuntimeError) keeps cleanup
+        # running even if the threading API changes underfoot.
         stop_cancel_watcher.set()
-        watcher_thread.join(timeout=2)
+        if watcher_started:
+            try:
+                watcher_thread.join(timeout=2)
+            except RuntimeError:
+                pass
         # Release the global codex slot so a waiter can acquire it without
         # waiting for the .running sidecar cleanup.
         release_lock_fd(slot_fd)
@@ -1171,16 +1206,17 @@ def _run_force(args, now: datetime) -> int:
             return 1
         cancelled_prior = True
 
-    # Defensive: if we got the lock immediately (no leader to cancel) there
-    # might still be a stale marker from a crash/abort. Clear it so the
-    # codex we're about to launch doesn't kill itself on its first watcher
-    # poll. (If cancelled_prior is True, the watcher in run_codex already
-    # cleared it — this is the no-leader path.)
-    if not cancelled_prior:
-        try:
-            _pr_cancel_path(pr_url).unlink(missing_ok=True)
-        except OSError:
-            pass
+    # We now own the per-PR lock. Drop any leftover cancel marker BEFORE
+    # entering process_pr / run_codex. This covers two cases:
+    #   - "no leader" path: leftover marker from a previous crash/abort.
+    #   - "cancelled prior" path: the old leader's watcher usually unlinks
+    #     the marker after killing codex, but if the old leader short-circuited
+    #     before run_codex (e.g. already_reviewed) the marker would persist.
+    # From here on, any marker that appears is a fresh cancel signal aimed at
+    # this run, and run_codex's watcher must react to it — NOT delete it as
+    # stale. See clear_stale_cancel_marker docstring for the race we're
+    # avoiding.
+    clear_stale_cancel_marker(pr_url)
 
     try:
         pr = _gh_view_force_pr(pr_url)
@@ -1317,6 +1353,11 @@ def main() -> int:
             if pr_fd is None:
                 print(f"    busy (another process holds the lock)  {pr.url}")
                 continue
+            # We own the per-PR lock now. Drop any leftover cancel marker
+            # before doing any work; from here on, any marker that appears
+            # is a fresh cancel signal aimed at this run (see
+            # clear_stale_cancel_marker docstring).
+            clear_stale_cancel_marker(pr.url)
             # Refresh in-memory state for this PR from disk: a concurrent
             # --force on this PR may have just updated last_commented_sha,
             # and our top-of-main load_state() snapshot would be stale.

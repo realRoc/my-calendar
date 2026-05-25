@@ -520,6 +520,230 @@ class RunCodexCancelObserveTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
 
 
+class RunCodexPreExistingMarkerTests(unittest.TestCase):
+    """Regression for PR #27 review (issue #26 follow-up).
+
+    Race the fix addresses:
+      1. Leader A grabs the per-PR lock (in --force entrypoint or tick path).
+      2. BEFORE A enters run_codex, --force B arrives, fails to grab the lock,
+         and writes the cancel marker via signal_cancel_and_wait_for_lock().
+      3. A finally enters run_codex.
+
+    Old (buggy) behaviour: run_codex unconditionally `unlink`ed the marker
+    on entry as "stale cleanup". B's freshly-written cancel signal was silently
+    deleted; A's watcher never saw it; A ran codex to completion against the
+    stale sha; B then ran a duplicate review against the fresh sha — defeating
+    cancel + restart.
+
+    Fixed behaviour: stale-marker cleanup is the caller's responsibility,
+    done immediately after lock acquisition (clear_stale_cancel_marker).
+    run_codex no longer touches the marker on entry; any marker present when
+    run_codex starts MUST be observed by the watcher and trigger cancellation.
+    """
+
+    def test_pre_existing_marker_kills_codex_and_sets_cancelled(self):
+        import time as _time
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/26",
+            number=26, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            # Long-sleeping fake codex: if the marker is wrongly cleared,
+            # this test will take ~30s and the assertions below will fail.
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-3"}\'\n'
+                "sleep 30\n"
+            )
+            fake_codex.chmod(0o755)
+
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+
+            # Pre-place the cancel marker — simulating --force B having
+            # written it during the window between A's lock acquisition
+            # and A's entry into run_codex.
+            cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+            cancel_marker.touch()
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                orig_popen = pr_watcher.subprocess.Popen
+
+                def patched_popen(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "codex":
+                        cmd = [str(fake_codex)] + cmd[1:]
+                    return orig_popen(cmd, *args, **kwargs)
+
+                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                    t0 = _time.time()
+                    result = pr_watcher.run_codex("prompt-text", pr)
+                    elapsed = _time.time() - t0
+
+            self.assertTrue(
+                result.cancelled,
+                "marker present at run_codex entry MUST be honoured as a cancel "
+                "signal, not silently deleted on entry. Old buggy code would "
+                "delete it and run codex to completion (cancelled=False).",
+            )
+            self.assertLess(
+                elapsed, 10,
+                f"watcher should kill the fake codex quickly after observing "
+                f"the pre-existing marker (elapsed={elapsed:.1f}s; fake sleeps 30s)",
+            )
+
+
+class RunCodexPopenFailureCleanupTests(unittest.TestCase):
+    """Regression for PR #27 review (issue #26 follow-up).
+
+    If subprocess.Popen() raises BEFORE watcher_thread.start() runs
+    (codex not in PATH, permission denied, fd exhaustion, etc.), the
+    `finally` in run_codex used to call watcher_thread.join() on an
+    unstarted thread, which raises RuntimeError. That RuntimeError would
+    mask the original error AND skip the slot release + .running sidecar
+    cleanup below the join.
+
+    The fix tracks `watcher_started` and only joins when the thread was
+    actually started — and even then defends with try/except RuntimeError
+    so cleanup always runs.
+    """
+
+    def test_popen_failure_surfaces_original_error_and_cleans_up(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            slot_lock_path = tmp / "slot.lock"
+            slot_fd = os.open(str(slot_lock_path), os.O_CREAT | os.O_WRONLY, 0o644)
+            released = []
+
+            real_release = pr_watcher.release_lock_fd
+
+            def tracking_release(fd):
+                released.append(fd)
+                real_release(fd)
+
+            class CodexNotFound(FileNotFoundError):
+                pass
+
+            def exploding_popen(*args, **kwargs):
+                raise CodexNotFound("codex: command not found")
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", tracking_release), \
+                    mock.patch.object(pr_watcher.subprocess, "Popen", exploding_popen):
+                with self.assertRaises(CodexNotFound):
+                    pr_watcher.run_codex("prompt-text", pr)
+
+            # Slot must have been released even though Popen blew up before
+            # watcher_thread.start() — old code would raise RuntimeError on
+            # the join() of an unstarted thread, skipping this release.
+            self.assertIn(
+                slot_fd, released,
+                "Popen failure must not skip release_lock_fd(slot_fd) — "
+                "otherwise the global codex slot is leaked permanently.",
+            )
+
+            # No orphan .running sidecar either: the cleanup `finally` block
+            # below the join must still run.
+            orphans = list(log_dir.glob("*.running"))
+            self.assertEqual(
+                orphans, [],
+                f"Popen failure must not leave behind a .running sidecar "
+                f"(would pin a phantom dashboard row). Found: {orphans}",
+            )
+
+
+class ClearStaleCancelMarkerTests(unittest.TestCase):
+    """The cancel-marker contract: the marker is meaningful only while a
+    leader holds the per-PR lock. The holder MUST drop any leftover marker
+    at acquisition time and MUST NOT touch it again as "stale" later.
+
+    This test pins the contract structurally so a future refactor can't
+    silently re-introduce the run_codex-entry clear that PR #27 fixed.
+    """
+
+    def test_clear_stale_cancel_marker_is_a_no_op_when_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                # Must not raise even though no marker exists.
+                pr_watcher.clear_stale_cancel_marker(
+                    "https://github.com/x/y/pull/1"
+                )
+
+    def test_clear_stale_cancel_marker_removes_existing(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                url = "https://github.com/x/y/pull/1"
+                marker = pr_watcher._pr_cancel_path(url)
+                marker.touch()
+                self.assertTrue(marker.exists())
+                pr_watcher.clear_stale_cancel_marker(url)
+                self.assertFalse(marker.exists())
+
+    def test_run_codex_does_not_clear_cancel_marker_on_entry(self):
+        """Static guard: the buggy line was `cancel_marker.unlink(...)` at the
+        top of run_codex. Search the source to make sure no future edit
+        re-introduces an unconditional unlink/clear of the cancel marker
+        between SCRATCH_BASE.mkdir and acquire_codex_slot().
+        """
+        src = (HERE / "pr_watcher.py").read_text(encoding="utf-8")
+        # Locate run_codex body up to the slot-acquire line.
+        run_codex_start = src.index("def run_codex(")
+        slot_acquire_idx = src.index("acquire_codex_slot(", run_codex_start)
+        prelude = src[run_codex_start:slot_acquire_idx]
+        # Common ways to clear/remove the marker; any of these inside
+        # run_codex's prelude would re-introduce the race.
+        forbidden_patterns = [
+            "cancel_marker.unlink",
+            "_pr_cancel_path(pr.url).unlink",
+            "clear_stale_cancel_marker(pr.url)",
+            "clear_stale_cancel_marker(pr_url)",
+        ]
+        for pat in forbidden_patterns:
+            self.assertNotIn(
+                pat, prelude,
+                f"run_codex must NOT clear the cancel marker on entry "
+                f"(found `{pat}`). Stale cleanup belongs at the caller's "
+                f"lock-acquisition point — see clear_stale_cancel_marker "
+                f"docstring and PR #27 fix for the race this prevents.",
+            )
+
+
 class ProcessPrCancelShortCircuitTests(unittest.TestCase):
     """When run_codex returns cancelled=True, process_pr must:
       - NOT call upsert_events (no calendar event for the stale review)
