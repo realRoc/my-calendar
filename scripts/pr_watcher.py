@@ -32,6 +32,16 @@ Single-pass flow:
        e. Write a calendar event into the "PR 监控" calendar.
        f. Persist {head_sha, thread_id, comment_url, timestamp} into state.
 
+  Cancel + restart on new commit (issue #26):
+       A --force that arrives for a PR already being reviewed writes a cancel
+       marker, the leader's watcher thread sees it and kills the in-flight
+       codex, process_pr short-circuits (no calendar event, no .meta sidecar,
+       no state mutation), the leader releases the lock, and the waiting
+       --force acquires it and runs against the freshly fetched head_sha.
+       Both the cancel and the restart fire a banner notification. Net effect:
+       the user's last calendar entry / PR comment is always against the most
+       recent push, with no queued-up stale reviews.
+
 Usage:
   python pr_watcher.py                          # one polling tick (the launchd entrypoint)
   python pr_watcher.py --dry-run                # show what would happen, no codex, no calendar
@@ -51,8 +61,10 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -72,11 +84,12 @@ CAL_STATE_PATH = HERE / "pr_calendar_state.json"   # EventKit event_id index (se
 PROMPT_PATH = HERE / "pr_prompt.md"
 LOG_DIR = HERE / "pr_logs"
 SCRATCH_BASE = Path("/tmp/codex-pr-runs")
-LOCK_DIR = HERE / "locks"                     # per-PR flock files + rerun markers + state lock
+LOCK_DIR = HERE / "locks"                     # per-PR flock files + cancel markers + state lock
 STATE_LOCK_PATH = LOCK_DIR / "state.lock"     # brief flock around state read/merge/write
-FORCE_RERUN_ITER_CAP = 10                     # safety cap on the --force rerun-coalescing loop
 CODEX_SLOT_POLL_SEC = 2.0                     # how often to retry when all slots are full
 CODEX_SLOT_TIMEOUT_SEC = 30 * 60              # max time to wait for a slot before bailing
+CANCEL_POLL_SEC = 0.5                         # how often the leader checks for the cancel marker
+CANCEL_WAIT_LOCK_TIMEOUT_SEC = 90.0           # how long a --force waits for the prior leader to release the lock after signalling cancel
 
 # User-configurable: cap codex executions in flight across all PRs. Override
 # via ~/.config/my-calendar/config.json, e.g. {"codex_concurrency_cap": 4} to
@@ -171,21 +184,45 @@ query($q: String!) {
 
 # ─── lock ──────────────────────────────────────────────────────────────────────
 #
-# Two trigger channels (git pre-push hook + launchd 30-min tick) can fire on the
+# Two trigger channels (git pre-push hook + launchd 2-min tick) can fire on the
 # same PR within seconds. codex runs ~1–2 min, so without serialisation two
 # processes can race past the state check, run codex on the same head_sha, and
 # post duplicate comments.
 #
-# Design: per-PR flock + rerun marker (coalescing).
+# Design: per-PR flock + cancel marker + persist lock (reset/reboot semantics).
 #   - Per-PR lock (locks/<safe_id>.lock) gates codex execution for that one PR.
 #     Different PRs run fully in parallel; within a PR, only one codex at a time.
-#   - Rerun marker (locks/<safe_id>.rerun) coalesces redundant --force runs.
-#     A --force that finds the lock held writes the marker and exits immediately
-#     instead of joining a queue. The leader unlinks the marker before each codex
-#     invocation and re-checks at loop end — if a new marker is present (someone
-#     signaled during the codex run), it loops once more against the freshly
-#     fetched head_sha. Net effect: N rapid pushes during one in-flight review →
-#     at most 1 additional codex run against the FINAL sha, not N.
+#   - Cancel marker (locks/<safe_id>.cancel) implements "new commit aborts the
+#     in-flight review and immediately restarts" (issue #26). A --force that
+#     finds the lock held writes the marker and waits for the leader to release.
+#     The leader runs a watcher thread that polls the marker every
+#     CANCEL_POLL_SEC and kills its codex subprocess when the marker appears.
+#     Once codex is dead, the leader's process_pr short-circuits (no calendar
+#     event, no .meta sidecar, no state mutation) and releases the lock. The
+#     waiting --force then acquires the lock and starts a fresh review against
+#     the latest head_sha. Net effect: the stale review is dropped, the user's
+#     last comment is always against the latest sha.
+#   - Persist lock (locks/<safe_id>.persist.lock) is the atomic commit boundary
+#     PR #27's two follow-up findings asked for. The synchronous late-marker
+#     re-check that used to live alone right before upsert_events was a check-
+#     then-act race; the stat() + mtime-gated unlink() in
+#     clear_stale_cancel_marker was the same shape of race on the cleanup side
+#     (stale stat + concurrent touch landing between stat and unlink → leader
+#     deletes the FRESH marker, watcher never sees it). The persist lock fixes
+#     both by serialising every party that touches the marker file:
+#         · signal_cancel_and_wait_for_lock (the only production marker writer)
+#           acquires persist_lock around its touch();
+#         · clear_stale_cancel_marker acquires persist_lock around its stat() +
+#           conditional unlink();
+#         · the leader's process_pr acquires persist_lock around the final
+#           marker check + upsert_events + .meta sidecar + in-memory state
+#           mutation block.
+#     Either the marker write fully precedes the leader's critical section
+#     (leader sees the marker, short-circuits, drops the stale review), or it
+#     fully follows it (leader's persist completes, the new --force then takes
+#     over and runs a fresh review against the latest sha). The marker write
+#     can no longer be interleaved with either the leader's irreversible
+#     writes or the stale-cleanup's stat/unlink window.
 #   - State save (see save_state) uses a separate brief flock (locks/state.lock)
 #     and does a load-merge-write so concurrent writers for different PRs don't
 #     clobber each other's updates.
@@ -199,8 +236,110 @@ def _pr_lock_path(pr_url: str) -> Path:
     return LOCK_DIR / f"{_pr_safe_id(pr_url)}.lock"
 
 
-def _pr_rerun_path(pr_url: str) -> Path:
-    return LOCK_DIR / f"{_pr_safe_id(pr_url)}.rerun"
+def _pr_cancel_path(pr_url: str) -> Path:
+    return LOCK_DIR / f"{_pr_safe_id(pr_url)}.cancel"
+
+
+def _pr_persist_lock_path(pr_url: str) -> Path:
+    return LOCK_DIR / f"{_pr_safe_id(pr_url)}.persist.lock"
+
+
+def acquire_persist_lock(pr_url: str) -> int:
+    """Acquire the per-PR persist lock, blocking until granted. Returns the fd
+    the caller MUST release with release_lock_fd when done.
+
+    Held by:
+      - signal_cancel_and_wait_for_lock around the touch() of the cancel
+        marker (very brief — usually well under 1ms).
+      - clear_stale_cancel_marker around stat() + conditional unlink() of the
+        marker file (very brief; the second PR #27 follow-up makes the stale-
+        cleanup atomic relative to a concurrent marker writer).
+      - process_pr around its final marker check + upsert_events + .meta
+        sidecar write + in-memory state mutation (bounded by EventKit speed,
+        typically <1s).
+
+    All three of these touch the "was a cancel requested?" state — by
+    creating, deleting, or reading the cancel marker file. Holding the same
+    flock around every side makes the question totally ordered, which closes
+    both PR #27 follow-up races:
+      · marker appearing between the late re-check and upsert_events
+        (process_pr's irreversible writes side); and
+      · marker being touched between clear_stale_cancel_marker's stat() and
+        its mtime-gated unlink() (the stale-cleanup side).
+
+    Lock acquisition order in the leader path: per-PR lock → codex slot →
+    persist lock. Acquisition order in the --force / marker-writer path:
+    persist lock (briefly, released before the per-PR-lock poll loop) → per-PR
+    lock. The two paths never hold both terminal locks concurrently, so this
+    additional flock cannot deadlock with the existing ones."""
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(_pr_persist_lock_path(pr_url)), os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def clear_stale_cancel_marker(pr_url: str, before_ns: int) -> None:
+    """Drop any cancel marker whose mtime predates `before_ns`. MUST be called
+    by the holder of the per-PR lock, and ONLY at lock-acquisition time.
+
+    `before_ns` is the wall-clock nanosecond timestamp captured IMMEDIATELY
+    before the successful flock attempt. The mtime gate exists to fix the
+    race PR #27 review (issue #26 follow-up #2) called out:
+
+        t0: leader L captures pre_lock_ns
+        t1: L's acquire_pr_lock_nb() returns (kernel grants flock atomically)
+        t2: new --force F fails flock (because L holds it), writes marker
+            (marker.mtime_ns > t0 — F's touch happened AFTER L's pre_lock_ns)
+        t3: L calls clear_stale_cancel_marker(pr_url, before_ns=t0)
+
+    Without the mtime gate, t3 would unconditionally unlink F's freshly-
+    written marker, silently dropping F's cancel signal. The mtime check
+    preserves any marker with mtime > before_ns — those can only have been
+    written AFTER our flock attempt (since the only writer is
+    signal_cancel_and_wait_for_lock, which fires only after observing the
+    flock as held — and the flock is held by US after our acquire returned).
+
+    Stale markers (left behind by a crashed prior leader, or written for a
+    previous generation that already finished) have mtime ≤ before_ns and
+    are safely removed.
+
+    Second PR #27 follow-up (codex blocker): the mtime gate alone is still a
+    check-then-act window between stat() and unlink(). If a stale marker is
+    present at lock-acquisition time, a brand-new --force F can fire
+    signal_cancel_and_wait_for_lock between our stat (which reads the OLD
+    mtime) and our conditional unlink (which uses that stale stat), so we
+    end up deleting F's freshly-touched marker even though its real on-disk
+    mtime is now > before_ns. The watcher then never sees a marker and the
+    obsolete codex run lands.
+    Fix: do stat + conditional unlink under the same per-PR persist_lock
+    that signal_cancel_and_wait_for_lock holds around its touch(). The
+    marker-write side is forced to wait until our stat+unlink finishes (it
+    will then re-touch a fresh marker on a clean slate), so the stale-stat-
+    racing-with-fresh-touch interleaving is impossible.
+    """
+    marker = _pr_cancel_path(pr_url)
+    persist_fd = acquire_persist_lock(pr_url)
+    try:
+        try:
+            st = marker.stat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        if st.st_mtime_ns > before_ns:
+            # Fresh signal from a --force that wrote the marker AFTER our flock
+            # attempt. Leave it for run_codex's watcher to react to.
+            return
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+    finally:
+        release_lock_fd(persist_fd)
 
 
 def acquire_pr_lock_nb(pr_url: str) -> int | None:
@@ -218,19 +357,49 @@ def acquire_pr_lock_nb(pr_url: str) -> int | None:
         return None
 
 
-def acquire_pr_lock_or_signal(pr_url: str) -> int | None:
-    """--force entrypoint helper. Try to acquire the per-PR lock; if it's
-    held, write the rerun marker so the current leader re-reviews the latest
-    sha on completion, then retry once (handles the leader-just-released
-    race window). Returns the fd if we became the leader, or None if another
-    leader is in flight and will pick up our signal."""
-    fd = acquire_pr_lock_nb(pr_url)
-    if fd is not None:
-        return fd
+def signal_cancel_and_wait_for_lock(
+    pr_url: str,
+    *,
+    timeout_sec: float = CANCEL_WAIT_LOCK_TIMEOUT_SEC,
+    poll_sec: float = 1.0,
+) -> tuple[int, int] | None:
+    """--force entrypoint helper. Write the cancel marker so the current
+    leader's codex is killed, then poll for the per-PR lock until the leader
+    releases it.
+
+    Returns (fd, pre_lock_ns) on success — pre_lock_ns is the wall-clock ns
+    captured immediately BEFORE the acquire_pr_lock_nb call that succeeded,
+    to be passed to clear_stale_cancel_marker so any marker that appeared
+    after our acquire is preserved (it's a fresh signal targeting US, not
+    leftover from a prior generation).
+
+    Returns None if the leader didn't release within timeout_sec (defensive —
+    should normally take <2s after kill since codex exits, leader's process_pr
+    short-circuits, and the flock is released).
+
+    PR #27 high finding: the touch() runs under the per-PR persist lock. If
+    the leader is currently inside its persist critical section (final marker
+    check + upsert_events + meta sidecar + state mutation), our acquire of
+    persist_lock blocks until that section finishes — making the marker write
+    totally ordered relative to the leader's commit. We release persist_lock
+    BEFORE the per-PR-lock poll loop so the leader (which acquires persist
+    lock NESTED INSIDE the per-PR lock) cannot deadlock with us.
+    """
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    _pr_rerun_path(pr_url).touch()
-    # Retry once: leader may have released between our first try and our touch.
-    return acquire_pr_lock_nb(pr_url)
+    persist_fd = acquire_persist_lock(pr_url)
+    try:
+        _pr_cancel_path(pr_url).touch()
+    finally:
+        release_lock_fd(persist_fd)
+    deadline = time.time() + timeout_sec
+    while True:
+        pre_lock_ns = time.time_ns()
+        fd = acquire_pr_lock_nb(pr_url)
+        if fd is not None:
+            return fd, pre_lock_ns
+        if time.time() >= deadline:
+            return None
+        time.sleep(poll_sec)
 
 
 def release_lock_fd(fd: int) -> None:
@@ -245,7 +414,11 @@ def release_lock_fd(fd: int) -> None:
         pass
 
 
-def acquire_codex_slot(*, timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC) -> tuple[int, int] | None:
+def acquire_codex_slot(
+    *,
+    timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC,
+    cancel_marker: Path | None = None,
+) -> tuple[int, int] | None:
     """Acquire one of CODEX_CONCURRENCY_CAP global codex slots.
 
     Caps how many codex executions can run at once across ALL PRs. Without
@@ -254,7 +427,15 @@ def acquire_codex_slot(*, timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC) -> tuple[
 
     Returns (fd, slot_number) on success (caller must release_lock_fd(fd) when
     done), or None on timeout. Polls every CODEX_SLOT_POLL_SEC; waiting is
-    quiet after the first "all slots busy" notice."""
+    quiet after the first "all slots busy" notice.
+
+    If `cancel_marker` is given (the per-PR `.cancel` Path), the wait loop
+    polls for the marker each cycle and returns None as soon as it appears.
+    Required for issue #26's cancel + restart contract: without it, a new
+    --force on the same PR would wait the full 90s for the per-PR lock
+    while the leader sits in slot-wait under UNRELATED-PR saturation, then
+    silently give up. Callers distinguish timeout vs cancel by inspecting
+    `cancel_marker` after a None return (see run_codex)."""
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + timeout_sec
     announced_wait = False
@@ -266,6 +447,15 @@ def acquire_codex_slot(*, timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC) -> tuple[
                 return fd, n
             except BlockingIOError:
                 os.close(fd)
+        # Cancellable wait: bail immediately on marker so per-PR lock is
+        # released and the new --force can restart against the latest sha.
+        # Marker consumption is the caller's job (same as the watcher thread).
+        if cancel_marker is not None:
+            try:
+                if cancel_marker.exists():
+                    return None
+            except OSError:
+                pass
         if not announced_wait:
             print(
                 f"      all {CODEX_CONCURRENCY_CAP} codex slots busy, waiting up to "
@@ -519,6 +709,9 @@ class CodexResult:
     exit_code: int
     jsonl_path: Path
     scratch_dir: Path
+    cancelled: bool = False     # True iff a cancel marker (issue #26 reset)
+                                # killed the codex subprocess mid-run; callers
+                                # must skip calendar event + state mutation.
 
 
 def _refresh_dashboard(*, reason: str) -> None:
@@ -563,6 +756,14 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     scratch = SCRATCH_BASE / f"{stamp}-{uuid.uuid4().hex[:8]}"
     scratch.mkdir(parents=True, exist_ok=True)
 
+    # NOTE: do NOT clear the cancel marker here. Stale-marker cleanup is the
+    # responsibility of the caller, immediately after they acquire the per-PR
+    # lock (see clear_stale_cancel_marker). Clearing the marker on run_codex
+    # entry would race against a new --force that wrote the marker between
+    # lock acquisition and our arrival here — we'd silently drop its cancel
+    # signal and run the stale review to completion.
+    cancel_marker = _pr_cancel_path(pr.url)
+
     # Block (poll) for a global codex slot BEFORE writing the running sidecar.
     # If acquire times out and raises RuntimeError, we must not leave behind
     # an orphan sidecar (would pin a phantom "running" row in the dashboard
@@ -570,14 +771,78 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     # is already held by the caller, so same-PR is serialised; this cap
     # protects the box from unbounded codex fan-out across UNRELATED PRs
     # (CPU/network/$LLM cost).
-    slot = acquire_codex_slot()
+    #
+    # cancel_marker makes slot-wait itself cancellable: a fresh --force on
+    # this PR can write the marker to interrupt our wait. Without this,
+    # saturated slots from UNRELATED PRs would pin the per-PR lock for up
+    # to 30min and break issue #26's cancel + restart contract.
+    slot = acquire_codex_slot(cancel_marker=cancel_marker)
     if slot is None:
+        # None from acquire means timeout OR cancel-during-wait. The marker
+        # is the disambiguator: if it's still there, treat as cancel and
+        # consume it (same contract the watcher honours mid-run).
+        cancelled_in_slot_wait = False
+        try:
+            cancelled_in_slot_wait = cancel_marker.exists()
+        except OSError:
+            pass
+        if cancelled_in_slot_wait:
+            try:
+                cancel_marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                jsonl_path.write_text(
+                    '{"type":"_killed_by_watcher","reason":"cancelled_in_slot_wait"}\n',
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            # Short-circuit: no codex spawned, no .running sidecar written.
+            # process_pr's cancelled branch rmtree's the (empty) scratch dir.
+            return CodexResult(
+                thread_id=None,
+                last_message="",
+                exit_code=-1,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=True,
+            )
         raise RuntimeError(
             f"codex concurrency cap ({CODEX_CONCURRENCY_CAP}) saturated for "
             f">{CODEX_SLOT_TIMEOUT_SEC}s; aborting this run"
         )
     slot_fd, slot_n = slot
     print(f"      codex slot {slot_n}/{CODEX_CONCURRENCY_CAP} acquired", flush=True)
+
+    # If a same-PR --force wrote the cancel marker while we were acquiring a
+    # global slot, honour it before spawning Codex. Otherwise a free slot can
+    # briefly start a stale Codex run just for the watcher to kill it.
+    try:
+        marker_exists = cancel_marker.exists()
+    except OSError:
+        marker_exists = False
+    if marker_exists:
+        try:
+            cancel_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            jsonl_path.write_text(
+                '{"type":"_killed_by_watcher","reason":"cancelled_before_codex_start"}\n',
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        release_lock_fd(slot_fd)
+        return CodexResult(
+            thread_id=None,
+            last_message="",
+            exit_code=-1,
+            jsonl_path=jsonl_path,
+            scratch_dir=scratch,
+            cancelled=True,
+        )
 
     # Drop the .running sidecar BEFORE codex starts so the dashboard's
     # collect_running() can find it during the 1–2min codex run. Cleaned up
@@ -623,6 +888,87 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
     thread_id: str | None = None
+    cancelled = False
+    proc: subprocess.Popen | None = None
+    stop_cancel_watcher = threading.Event()
+    cancel_observed = threading.Event()
+    cancel_reason_written = False
+
+    def _kill_proc_group(p: subprocess.Popen) -> None:
+        """SIGKILL the codex process group. codex tends to spawn helpers
+        (gh, git, node workers), and a plain proc.kill() only targets the
+        parent — orphaned children keep the stdout pipe open, our main
+        thread's `for line in proc.stdout` blocks until they exit, and the
+        cancel can stall for minutes. Killing the whole group (created via
+        start_new_session=True in Popen) terminates the helpers too, which
+        closes the pipe and lets the read loop drain to EOF."""
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            # Fall back to plain kill; better than no signal at all.
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def _consume_cancel_marker() -> bool:
+        try:
+            marker_exists = cancel_marker.exists()
+        except OSError:
+            marker_exists = False
+        if not marker_exists:
+            return False
+        cancel_observed.set()
+        try:
+            cancel_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return True
+
+    def _append_cancel_reason() -> None:
+        nonlocal cancel_reason_written
+        if cancel_reason_written:
+            return
+        try:
+            with jsonl_path.open("a", encoding="utf-8") as f:
+                f.write('{"type":"_killed_by_watcher","reason":"cancelled_new_commit"}\n')
+            cancel_reason_written = True
+        except OSError:
+            pass
+
+    def _cancel_watcher() -> None:
+        """Poll the cancel marker; any marker observed during the codex run
+        window is a fresh cancel signal from a new --force (with the
+        mtime-based stale cleanup at lock acquisition, no stale marker can
+        reach this point — see clear_stale_cancel_marker docstring).
+
+        Behaviour:
+          - marker + proc alive  → kill codex group, set cancel_observed
+          - marker + proc dead   → still set cancel_observed (PR #27 review
+            blocker 2b: a marker that lands AFTER codex exited naturally
+            but BEFORE process_pr writes calendar/state must still short-
+            circuit the calendar/state writes; otherwise the stale review
+            gets committed and the waiting --force then writes a duplicate
+            for the fresh sha)
+
+        In both cases we unlink the marker so the next leader's stale-cleanup
+        has less to do (and so a marker doesn't survive into a future leader's
+        generation as a phantom signal). Exits when stop_cancel_watcher fires
+        (the main thread already finished post-codex housekeeping).
+        """
+        while True:
+            if _consume_cancel_marker():
+                if proc is not None and proc.poll() is None:
+                    _kill_proc_group(proc)
+                return
+            if stop_cancel_watcher.wait(CANCEL_POLL_SEC):
+                return
+
+    watcher_thread = threading.Thread(target=_cancel_watcher, daemon=True)
+    watcher_started = False
+
     try:
         with jsonl_path.open("w", encoding="utf-8") as f:
             proc = subprocess.Popen(
@@ -632,7 +978,13 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 text=True,
                 env=env,
                 cwd=str(scratch),
+                # New session so the cancel watcher can kill the whole group
+                # (codex + any helpers it spawned). Without this, killing the
+                # parent leaves orphaned helpers holding the stdout pipe open.
+                start_new_session=True,
             )
+            watcher_thread.start()
+            watcher_started = True
             start = time.time()
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -646,13 +998,49 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                     except Exception:
                         pass
                 if time.time() - start > MAX_RUNTIME_PER_TICK_SEC:
-                    proc.kill()
+                    _kill_proc_group(proc)
                     f.write('{"type":"_killed_by_watcher","reason":"timeout"}\n')
                     break
             proc.wait()
+            # Belt-and-suspenders for PR #27 review blocker 2b: a marker
+            # landing in the narrow window between the watcher's last poll
+            # and our about-to-fire stop signal would otherwise be missed
+            # and we'd commit stale calendar/state. Do one synchronous
+            # marker check here so a late marker still flips cancelled=True.
+            if not cancel_observed.is_set():
+                _consume_cancel_marker()
+            if cancel_observed.is_set():
+                cancelled = True
+                f.write('{"type":"_killed_by_watcher","reason":"cancelled_new_commit"}\n')
+                cancel_reason_written = True
     finally:
-        # Release the global codex slot first so a waiter can acquire it
-        # without waiting for the .running sidecar cleanup.
+        # Stop the watcher thread BEFORE releasing the slot so a brand-new
+        # codex (acquired by another --force right after) can't be confused
+        # by our still-running watcher reacting to a fresh marker for itself.
+        #
+        # Only join if the thread was actually started — Popen() above can
+        # raise (codex not in PATH, permission denied, fd exhaustion, etc.)
+        # before watcher_thread.start() runs. join()'ing an unstarted thread
+        # raises RuntimeError, which would mask the original error AND skip
+        # the slot release + sidecar cleanup below. The double-guard
+        # (watcher_started flag + try/except RuntimeError) keeps cleanup
+        # running even if the threading API changes underfoot.
+        stop_cancel_watcher.set()
+        if watcher_started:
+            try:
+                watcher_thread.join(timeout=2)
+            except RuntimeError:
+                pass
+        # Final cancellation decision must happen after the watcher has stopped.
+        # Otherwise the watcher can observe and unlink a marker after the main
+        # thread's post-wait check, leaving process_pr with neither
+        # result.cancelled nor a marker to consume.
+        _consume_cancel_marker()
+        if cancel_observed.is_set():
+            cancelled = True
+            _append_cancel_reason()
+        # Release the global codex slot so a waiter can acquire it without
+        # waiting for the .running sidecar cleanup.
         release_lock_fd(slot_fd)
         # Whether codex exited cleanly, errored, or got killed by the watchdog,
         # the .running sidecar must go away — otherwise the dashboard's running
@@ -670,9 +1058,10 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     return CodexResult(
         thread_id=thread_id,
         last_message=last_msg,
-        exit_code=proc.returncode,
+        exit_code=proc.returncode if proc is not None else -1,
         jsonl_path=jsonl_path,
         scratch_dir=scratch,
+        cancelled=cancelled,
     )
 
 
@@ -902,7 +1291,29 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     t0 = time.time()
     result = run_codex(prompt, pr)
     elapsed = time.time() - t0
-    print(f"      exit={result.exit_code} thread_id={result.thread_id} log={result.jsonl_path.name} elapsed={fmt_duration(elapsed)}", flush=True)
+    print(f"      exit={result.exit_code} thread_id={result.thread_id} log={result.jsonl_path.name} elapsed={fmt_duration(elapsed)} cancelled={result.cancelled}", flush=True)
+
+    if result.cancelled:
+        # Issue #26 reset/reboot semantics: a new commit arrived while this
+        # review was in flight, the watcher killed codex, and a fresh --force
+        # is waiting for our lock to start over against the latest sha. Drop
+        # this run entirely — no calendar event, no .meta sidecar, no state
+        # mutation. The jsonl is kept (marked _killed_by_watcher) for forensic
+        # debugging. Scratch dir is cleaned up; the caller's save_state will
+        # be a no-op for this PR because state["prs"][pr.url] wasn't mutated.
+        notify(
+            title="🛑 PR review 已取消",
+            subtitle=pr.repo,
+            message=f"#{pr.number} 检测到新 commit，已取消进行中的 review",
+            open_url=pr.url,
+            group=notify_group,
+        )
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        _refresh_dashboard(reason="cancelled")
+        return f"cancelled (new commit during review, elapsed={fmt_duration(elapsed)})"
 
     comment_url, comment_body = fetch_latest_comment(pr.repo, pr.number)
     body_preview = (comment_body or "")[:80].replace("\n", " ")
@@ -917,51 +1328,108 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
 
     now = datetime.now()
     event = build_event(pr, result, comment_url, comment_body, now, origin_cwd=origin_cwd)
-    actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
-    cal_action = actions.get(event.key, "?")
 
-    # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
-    meta = {
-        "started_at": started_at,
-        "repo": pr.repo,
-        "pr_number": pr.number,
-        "pr_url": pr.url,
-        "pr_title": pr.title,
-        "head_sha": pr.head_sha,
-        "thread_id": result.thread_id,
-        "comment_url": comment_url,
-        "comment_body": comment_body or "",
-        "codex_exit": result.exit_code,
-        "jsonl_path": str(result.jsonl_path),
-        "origin_cwd": origin_cwd,
-    }
-    meta_path = result.jsonl_path.with_suffix(".meta.json")
+    # PR #27 high finding: the cancel watcher inside run_codex stops in its
+    # finally block, but the per-PR lock is still held here. A new --force
+    # arriving between run_codex's return and the writes below would write a
+    # cancel marker that nobody is watching. The synchronous re-check below
+    # alone was still a check-then-act race: a --force could write the marker
+    # AFTER the check returned False but BEFORE upsert_events / meta sidecar /
+    # state mutation finished, and the stale review for the obsolete sha
+    # would land in calendar/sidecar/state. The waiting --force would then
+    # write again for the fresh sha (two events, state remembering the
+    # obsolete sha), violating issue #26's "新 commit 到达后旧 review 不落盘"
+    # contract.
+    #
+    # Fix: hold the per-PR persist lock across the marker re-check AND every
+    # irreversible write below. signal_cancel_and_wait_for_lock also grabs
+    # the same lock around its touch(), so the marker write is now totally
+    # ordered with this critical section — it either fully precedes the
+    # check (we see the marker, short-circuit) or fully follows the state
+    # mutation (the next --force restarts review on the fresh sha). The
+    # marker can no longer slip in between. See acquire_persist_lock for the
+    # full contract and acquisition-order argument.
+    cancel_marker = _pr_cancel_path(pr.url)
+    persist_fd = acquire_persist_lock(pr.url)
     try:
-        meta_path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError as e:
-        print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
+        if cancel_marker.exists():
+            try:
+                cancel_marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                with result.jsonl_path.open("a", encoding="utf-8") as f:
+                    f.write('{"type":"_killed_by_watcher","reason":"cancelled_post_codex_pre_persist"}\n')
+            except OSError:
+                pass
+            cancelled_late = True
+        else:
+            cancelled_late = False
+            actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
+            cal_action = actions.get(event.key, "?")
 
-    # Refresh again now that the .meta.json sidecar exists: this swaps the
+            # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
+            meta = {
+                "started_at": started_at,
+                "repo": pr.repo,
+                "pr_number": pr.number,
+                "pr_url": pr.url,
+                "pr_title": pr.title,
+                "head_sha": pr.head_sha,
+                "thread_id": result.thread_id,
+                "comment_url": comment_url,
+                "comment_body": comment_body or "",
+                "codex_exit": result.exit_code,
+                "jsonl_path": str(result.jsonl_path),
+                "origin_cwd": origin_cwd,
+            }
+            meta_path = result.jsonl_path.with_suffix(".meta.json")
+            try:
+                meta_path.write_text(
+                    json.dumps(meta, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError as e:
+                print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
+
+            entry = state["prs"].setdefault(pr.url, {})
+            entry.update({
+                "repo": pr.repo,
+                "number": pr.number,
+                "last_commented_sha": pr.head_sha,
+                "last_thread_id": result.thread_id,
+                "last_comment_url": comment_url,
+                "last_run_at": started_at,
+                "last_codex_exit": result.exit_code,
+                "last_jsonl": str(result.jsonl_path),
+            })
+
+            # 同时记录"我们见过这个 sha"，用于 first-run 兼容
+            entry["last_seen_sha"] = pr.head_sha
+    finally:
+        release_lock_fd(persist_fd)
+
+    # ── post-persist housekeeping (intentionally outside persist_lock to keep
+    # the critical section short; nothing here mutates state a marker writer
+    # cares about) ──────────────────────────────────────────────────────────
+    if cancelled_late:
+        notify(
+            title="🛑 PR review 已取消",
+            subtitle=pr.repo,
+            message=f"#{pr.number} 检测到新 commit，已取消进行中的 review",
+            open_url=pr.url,
+            group=notify_group,
+        )
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        _refresh_dashboard(reason="cancelled")
+        return f"cancelled (new commit between codex exit and persist, elapsed={fmt_duration(elapsed)})"
+
+    # Refresh now that the .meta.json sidecar exists: this swaps the
     # "running" row out of the dashboard and shows the finished review.
     _refresh_dashboard(reason="run-end")
-
-    entry = state["prs"].setdefault(pr.url, {})
-    entry.update({
-        "repo": pr.repo,
-        "number": pr.number,
-        "last_commented_sha": pr.head_sha,
-        "last_thread_id": result.thread_id,
-        "last_comment_url": comment_url,
-        "last_run_at": started_at,
-        "last_codex_exit": result.exit_code,
-        "last_jsonl": str(result.jsonl_path),
-    })
-
-    # 同时记录"我们见过这个 sha"，用于 first-run 兼容
-    entry["last_seen_sha"] = pr.head_sha
 
     # 清理 scratch 目录（codex 已退出，无后续依赖）
     try:
@@ -1003,81 +1471,112 @@ def _gh_view_force_pr(pr_url: str) -> PRSnap:
 
 
 def _run_force(args, now: datetime) -> int:
-    """--force entrypoint: per-PR lock + rerun-coalescing loop.
+    """--force entrypoint: per-PR lock + cancel-and-restart (issue #26).
 
     Concurrency model:
-      - If the per-PR lock is held by another leader, write the rerun marker
-        and exit immediately — the leader will pick up the signal and
-        re-review the latest sha when its current codex run finishes.
-      - If we got the lock, loop: unlink marker → fetch fresh head_sha → if
-        not already-reviewed, run codex and save state → re-check marker; if
-        present (someone --force'd during our codex run), loop again. Caps at
-        FORCE_RERUN_ITER_CAP to defend against pathological signal stickiness.
+      - Try to grab the per-PR lock.
+      - If held by another leader (an in-flight review for an older sha),
+        write the cancel marker. The leader's watcher thread sees it, kills
+        codex, and process_pr short-circuits (no calendar event, no state
+        mutation). We then wait for the leader to release the lock and
+        proceed against the fresh head_sha. Notifications fire on both the
+        cancel and the restart.
+      - If we got the lock immediately, just run normally — no prior leader
+        to cancel.
     """
     pr_url = args.force
-    lock_fd = acquire_pr_lock_or_signal(pr_url)
+    # Capture pre_lock_ns BEFORE the acquire so any marker written by a
+    # concurrent --force AFTER our flock attempt has mtime > pre_lock_ns
+    # and is preserved by clear_stale_cancel_marker (see its docstring for
+    # the race this guards against).
+    pre_lock_ns = time.time_ns()
+    lock_fd = acquire_pr_lock_nb(pr_url)
+    cancelled_prior = False
     if lock_fd is None:
-        print(f"  forced: {pr_url}  → another process is reviewing; queued rerun signal")
-        return 0
+        # Another leader is mid-review on an older sha. Signal cancel and
+        # wait. Notify NOW so the user sees the cancellation even before the
+        # restart kicks off; the restart notification goes out below once
+        # we've fetched the new sha.
+        print(f"  forced: {pr_url}  → another review in flight; sending cancel signal")
+        notify(
+            title="🛑 PR review 已取消",
+            subtitle=pr_url.replace("https://github.com/", ""),
+            message="检测到新 commit，正在取消进行中的 review",
+            open_url=pr_url,
+            group=f"pr-watcher:{pr_url}",
+        )
+        result = signal_cancel_and_wait_for_lock(pr_url)
+        if result is None:
+            print(
+                f"  forced: {pr_url}  → cancel signal sent but lock not released "
+                f"within {CANCEL_WAIT_LOCK_TIMEOUT_SEC:.0f}s; bailing — next tick will retry"
+            )
+            return 1
+        # The helper captures its own pre_lock_ns just before the acquire
+        # that won — use THAT one (not our top-of-function timestamp) so the
+        # mtime gate is anchored to the moment we actually got the lock,
+        # not seconds earlier when we first tried.
+        lock_fd, pre_lock_ns = result
+        cancelled_prior = True
 
-    rerun_marker = _pr_rerun_path(pr_url)
+    # We now own the per-PR lock. Drop any leftover cancel marker whose
+    # mtime predates pre_lock_ns (those are stale — left behind by a
+    # crashed prior leader or written for a previous generation that already
+    # finished). Markers with mtime > pre_lock_ns are fresh cancel signals
+    # from a NEW --force that fired its touch() after our flock won; we
+    # MUST preserve them so run_codex's watcher reacts. See
+    # clear_stale_cancel_marker docstring for the race this prevents.
+    clear_stale_cancel_marker(pr_url, before_ns=pre_lock_ns)
+
     try:
-        iteration = 0
-        while True:
-            iteration += 1
-            # Unlink BEFORE the gh fetch + codex run. Any --force that writes
-            # the marker AFTER this point will be observed at the loop tail
-            # and trigger another iteration against the freshly fetched sha.
-            rerun_marker.unlink(missing_ok=True)
+        pr = _gh_view_force_pr(pr_url)
 
-            pr = _gh_view_force_pr(pr_url)
+        state = load_state()
+        if "installed_at" not in state.get("_meta", {}):
+            state.setdefault("_meta", {})["installed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            print(f"[pr-watcher] first run: stamped installed_at = {state['_meta']['installed_at']}")
 
-            # Reload state every iteration: concurrent --force runs on OTHER
-            # PRs may have updated _meta.last_run / installed_at, and our own
-            # previous iteration just wrote to disk.
-            state = load_state()
-            if "installed_at" not in state.get("_meta", {}):
-                state.setdefault("_meta", {})["installed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                print(f"[pr-watcher] first run: stamped installed_at = {state['_meta']['installed_at']}")
-
-            new_origin_cwd: str | None = None
-            if args.origin_cwd:
-                cwd_p = Path(args.origin_cwd).expanduser().resolve()
-                if cwd_p.is_dir():
-                    new_origin_cwd = str(cwd_p)
-                    state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = new_origin_cwd
-                else:
-                    print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
-
-            prev = state.get("prs", {}).get(pr.url) or {}
-            if prev.get("last_commented_sha") == pr.head_sha:
-                suffix = "" if iteration == 1 else f" (after {iteration - 1} rerun iter)"
-                print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping{suffix}")
-                # Mirror freshly-stamped origin_cwd into prior run's .meta.json
-                # sidecar so dashboard / "fix this PR" consumers don't have to
-                # fall back to pr_state.json for that field.
-                if new_origin_cwd:
-                    try:
-                        meta_path, changed = sync_meta_origin_cwd(prev.get("last_jsonl"), new_origin_cwd)
-                        if changed and meta_path is not None:
-                            print(f"      backfilled origin_cwd into {meta_path.name}")
-                    except (OSError, json.JSONDecodeError) as e:
-                        print(f"      warn: failed to backfill origin_cwd in prior .meta.json: {e}")
-                save_state(state, touched_prs={pr.url})
+        new_origin_cwd: str | None = None
+        if args.origin_cwd:
+            cwd_p = Path(args.origin_cwd).expanduser().resolve()
+            if cwd_p.is_dir():
+                new_origin_cwd = str(cwd_p)
+                state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = new_origin_cwd
             else:
-                action = process_pr(pr, state, dry_run=False)
-                save_state(state, touched_prs={pr.url})
-                print(f"  forced: {pr.url}  → {action}")
+                print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
 
-            # Did a new --force write the marker while we were busy? If yes,
-            # loop once more — but cap iterations so a stuck marker (e.g.
-            # filesystem oddity, leftover from a crash) can't pin us forever.
-            if not rerun_marker.exists():
-                break
-            if iteration >= FORCE_RERUN_ITER_CAP:
-                print(f"  forced: {pr_url}  → rerun marker still set after {iteration} iterations; bailing to next tick")
-                break
-            print(f"  forced: {pr_url}  → rerun signal detected, looping (iter={iteration + 1})")
+        prev = state.get("prs", {}).get(pr.url) or {}
+        if prev.get("last_commented_sha") == pr.head_sha:
+            print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
+            # Mirror freshly-stamped origin_cwd into prior run's .meta.json
+            # sidecar so dashboard / "fix this PR" consumers don't have to
+            # fall back to pr_state.json for that field.
+            if new_origin_cwd:
+                try:
+                    meta_path, changed = sync_meta_origin_cwd(prev.get("last_jsonl"), new_origin_cwd)
+                    if changed and meta_path is not None:
+                        print(f"      backfilled origin_cwd into {meta_path.name}")
+                except (OSError, json.JSONDecodeError) as e:
+                    print(f"      warn: failed to backfill origin_cwd in prior .meta.json: {e}")
+            save_state(state, touched_prs={pr.url})
+            return 0
+
+        if cancelled_prior:
+            # Pair-notification for the cancel above — the restart against
+            # the freshly fetched sha. Same notification group so terminal-
+            # notifier collapses prior cancel/start banners into one.
+            notify(
+                title="🔁 PR review 重启",
+                subtitle=pr.repo,
+                message=f"#{pr.number} 基于新 commit {pr.head_sha[:7]} 重启 review",
+                open_url=pr.url,
+                group=f"pr-watcher:{pr.url}",
+            )
+            print(f"  forced: {pr_url}  → restarting review against fresh sha={pr.head_sha[:8]}")
+
+        action = process_pr(pr, state, dry_run=False)
+        save_state(state, touched_prs={pr.url})
+        print(f"  forced: {pr.url}  → {action}")
     finally:
         release_lock_fd(lock_fd)
     return 0
@@ -1117,11 +1616,13 @@ def main() -> int:
             return 0
 
     # Per-PR locks gate codex execution: different PRs run fully in parallel.
-    # --force uses acquire_pr_lock_or_signal so that redundant rapid-fire pushes
-    # coalesce into at most one additional codex run against the FINAL sha
-    # (rather than running once per queued task). The tick path takes per-PR
-    # locks inside its candidates loop and skips PRs that are currently being
-    # reviewed. --dry-run doesn't mutate and takes no lock at all.
+    # --force uses signal_cancel_and_wait_for_lock so a new commit during an
+    # in-flight review kills the stale codex and immediately restarts against
+    # the latest sha (issue #26 reset/reboot semantics). The tick path takes
+    # per-PR locks inside its candidates loop and skips PRs currently being
+    # reviewed — the next tick (or the next push hook) will pick up changes
+    # the in-flight reviewer didn't cover. --dry-run doesn't mutate and takes
+    # no lock at all.
 
     print(f"[pr-watcher] {now.isoformat(timespec='seconds')}  daytime={in_daytime(now)}  dry_run={args.dry_run}  seed_only={args.seed_only}")
 
@@ -1158,10 +1659,18 @@ def main() -> int:
         # duplicate review for a sha the leader already covered.
         pr_fd: int | None = None
         if not args.dry_run:
+            # Capture BEFORE the acquire so any marker written by a
+            # concurrent --force after our flock attempt is preserved (its
+            # mtime will be > pre_lock_ns). See clear_stale_cancel_marker.
+            pre_lock_ns = time.time_ns()
             pr_fd = acquire_pr_lock_nb(pr.url)
             if pr_fd is None:
                 print(f"    busy (another process holds the lock)  {pr.url}")
                 continue
+            # We own the per-PR lock now. Drop any cancel marker whose mtime
+            # predates pre_lock_ns; preserve any fresher one as a real cancel
+            # signal for this run.
+            clear_stale_cancel_marker(pr.url, before_ns=pre_lock_ns)
             # Refresh in-memory state for this PR from disk: a concurrent
             # --force on this PR may have just updated last_commented_sha,
             # and our top-of-main load_state() snapshot would be stale.

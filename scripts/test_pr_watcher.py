@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -89,9 +91,15 @@ class ForceOriginCwdTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "load_state", lambda: state), \
                     mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(s)), \
                     mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
-                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
-                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 999), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run):
+                # NB: release_lock_fd intentionally NOT mocked. clear_stale
+                # _cancel_marker and process_pr both call acquire_persist_lock
+                # under the hood; if release_lock_fd is a no-op, the persist
+                # flock leaks and subsequent acquires in the same process
+                # deadlock. Real release_lock_fd swallows OSError, so the
+                # fake fd 999 from acquire_pr_lock_nb harmlessly silently
+                # fails to close.
                 rc = pr_watcher.main()
 
             self.assertEqual(rc, 0)
@@ -167,8 +175,7 @@ class ForceOriginCwdFreshRunTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "load_state", lambda: state), \
                     mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(s)), \
                     mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
-                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
-                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 999), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run), \
                     mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
                     mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: fake_codex_result), \
@@ -192,92 +199,66 @@ class ForceOriginCwdFreshRunTests(unittest.TestCase):
             self.assertEqual(meta["head_sha"], head_sha)
 
 
-class ForceCoalesceTests(unittest.TestCase):
-    """Per-PR lock + rerun marker semantics.
+class ForceCancelRestartTests(unittest.TestCase):
+    """Issue #26: cancel-and-restart semantics replaces the old rerun-coalescing.
 
-    Two important invariants:
-      A) A --force that can't get the per-PR lock writes the rerun marker and
-         exits immediately (no codex run, no state mutation).
-      B) A leader that finds the marker set after its codex run loops once
-         more against the freshly fetched head_sha, so a stack of N rapid
-         pushes during one in-flight review produces 1 extra codex run, not N.
+    Invariants:
+      A) --force that finds the per-PR lock held writes a `.cancel` marker
+         (signals the leader to kill in-flight codex) and waits for the lock.
+         It also fires a 🛑 notification.
+      B) Once the leader releases the lock, --force fetches the latest sha
+         and runs codex once — no queued reruns, no iteration loop. A second
+         🔁 notification fires for the restart.
+      C) When the lock was free from the start, no cancel marker is touched
+         and no cancel/restart notifications fire — it's just a normal run.
+      D) run_codex's watcher thread kills the subprocess and sets
+         result.cancelled=True iff the cancel marker appears mid-run.
+      E) process_pr short-circuits a cancelled result: no calendar event,
+         no .meta sidecar, no state mutation; a 🛑 notification fires.
     """
 
-    def test_force_signals_and_exits_when_lock_held(self):
+    def test_force_signals_cancel_when_lock_held_and_notifies(self):
         pr_url = "https://github.com/realRoc/my-calendar/pull/10"
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             lock_dir = tmp / "locks"
             lock_dir.mkdir()
-            # acquire_pr_lock_or_signal returns None to simulate "another leader
-            # is in flight"; the rerun marker should be written as a side effect.
-            # We fake this by patching acquire_pr_lock_or_signal directly and
-            # writing the marker ourselves to mimic real behavior.
-            marker_touches: list[str] = []
+            cancel_path = lock_dir / f"{pr_watcher._pr_safe_id(pr_url)}.cancel"
 
-            def fake_acquire(url):
-                # Mirror the real implementation's side effect.
-                marker = lock_dir / f"{pr_watcher._pr_safe_id(url)}.rerun"
-                marker.touch()
-                marker_touches.append(str(marker))
-                return None  # signal "another leader"
-
-            gh_calls: list = []
-
-            def fake_run(*args, **_kwargs):
-                gh_calls.append(args)
-                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-
-            codex_runs: list = []
-
-            argv = ["pr_watcher.py", "--force", pr_url]
-            with mock.patch.object(sys, "argv", argv), \
-                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
-                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
-                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", fake_acquire), \
-                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
-                    mock.patch.object(pr_watcher, "run_codex", lambda *a, **kw: codex_runs.append(a) or None), \
-                    mock.patch.object(pr_watcher.subprocess, "run", fake_run):
-                rc = pr_watcher.main()
-
-            self.assertEqual(rc, 0)
-            self.assertEqual(codex_runs, [], "must not invoke codex when lock is held")
-            self.assertEqual(gh_calls, [], "must not call gh when lock is held")
-            self.assertEqual(len(marker_touches), 1, "rerun marker must be written")
-            self.assertTrue(Path(marker_touches[0]).exists())
-
-    def test_leader_loops_when_marker_set_then_breaks(self):
-        """Simulate: leader runs codex on iter 1, a --force concurrently writes
-        the marker, leader sees marker → loops → codex on iter 2, no further
-        marker writes → exit. Verify exactly 2 codex invocations."""
-        pr_url = "https://github.com/realRoc/my-calendar/pull/10"
-        first_sha = "aaaa1111"
-        second_sha = "bbbb2222"
-
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            lock_dir = tmp / "locks"
-            lock_dir.mkdir()
-            marker_path = lock_dir / f"{pr_watcher._pr_safe_id(pr_url)}.rerun"
-
-            # State will be re-loaded each iteration; mutate it from the codex
-            # mock to mirror what real process_pr would do (set last_commented_sha).
             shared_state = {
                 "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
                 "prs": {pr_url: {"last_commented_sha": None}},
             }
-            # gh pr view returns first_sha on first call, second_sha on second
-            sha_seq = iter([first_sha, second_sha])
+
+            # acquire_pr_lock_nb returns None first (lock held → triggers
+            # cancel path), then 999 (we got the lock after waiting).
+            acquire_calls = iter([None, 999])
+            release_calls: list = []
+
+            def fake_acquire(url):
+                return next(acquire_calls)
+
+            # Spy that ALSO actually releases. release_lock_fd is defensive
+            # (swallows OSError), so calling it on the fake fd 999 is a
+            # silent no-op while real persist-lock fds get properly closed.
+            # A pure-spy that no-ops would leak the persist flock and
+            # deadlock the very next acquire_persist_lock in this process —
+            # see PR #27 follow-up where clear_stale_cancel_marker also
+            # acquires persist_lock.
+            real_release_lock_fd = pr_watcher.release_lock_fd
+
+            def tracking_release(fd):
+                release_calls.append(fd)
+                real_release_lock_fd(fd)
 
             def fake_gh_run(*args, **_kwargs):
-                sha = next(sha_seq)
                 return subprocess.CompletedProcess(
                     args=args, returncode=0,
                     stdout=json.dumps({
                         "url": pr_url, "number": 10, "title": "t",
                         "isDraft": False, "baseRefName": "main",
-                        "headRefOid": sha, "createdAt": "2026-05-22T00:00:00Z",
+                        "headRefOid": "bbbb2222", "createdAt": "2026-05-22T00:00:00Z",
                     }),
                     stderr="",
                 )
@@ -286,33 +267,990 @@ class ForceCoalesceTests(unittest.TestCase):
 
             def fake_process_pr(pr, state, dry_run):
                 codex_shas.append(pr.head_sha)
-                # Simulate "another --force arrives during codex" only on iter 1.
-                if len(codex_shas) == 1:
-                    marker_path.touch()
-                # Mirror real process_pr's state mutation.
                 state.setdefault("prs", {}).setdefault(pr.url, {})["last_commented_sha"] = pr.head_sha
                 return "codex ran (mocked)"
 
-            saved: list = []
+            notifications: list[dict] = []
 
             argv = ["pr_watcher.py", "--force", pr_url]
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
                     mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
                     mock.patch.object(pr_watcher, "load_state", lambda: shared_state), \
-                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(touched_prs)), \
-                    mock.patch.object(pr_watcher, "acquire_pr_lock_or_signal", lambda url: 999), \
-                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", fake_acquire), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", tracking_release), \
                     mock.patch.object(pr_watcher, "process_pr", fake_process_pr), \
+                    mock.patch.object(pr_watcher, "notify",
+                                      lambda *, title="", subtitle="", message="", open_url=None, group=None, **kw:
+                                          notifications.append({"title": title, "subtitle": subtitle, "message": message, "group": group})), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_gh_run):
                 rc = pr_watcher.main()
 
             self.assertEqual(rc, 0)
-            self.assertEqual(codex_shas, [first_sha, second_sha],
-                             "leader should run codex on first sha, then loop once for the second")
-            self.assertFalse(marker_path.exists(), "marker should be unlinked by the leader's final iteration")
-            self.assertEqual(len(saved), 2, "save_state should be called per iteration")
-            self.assertEqual(saved, [{pr_url}, {pr_url}], "each save should be scoped to this PR")
+            # Codex ran once, on the latest sha returned by gh pr view.
+            self.assertEqual(codex_shas, ["bbbb2222"])
+            # Cancel marker should have been written by signal_cancel_and_wait_for_lock
+            # and then consumed (we never simulated a real leader watcher, but
+            # the marker should at least have existed during the call).
+            # Easier assertion: the cancel-marker path was hit, i.e. we got both
+            # a 🛑 notification and a 🔁 notification.
+            titles = [n["title"] for n in notifications]
+            self.assertIn("🛑 PR review 已取消", titles,
+                          f"expected cancel notification; got {titles}")
+            self.assertIn("🔁 PR review 重启", titles,
+                          f"expected restart notification; got {titles}")
+            # Group must match across the cancel/restart pair so terminal-
+            # notifier collapses them on the same banner stack.
+            group = f"pr-watcher:{pr_url}"
+            cancel_n = next(n for n in notifications if n["title"] == "🛑 PR review 已取消")
+            restart_n = next(n for n in notifications if n["title"] == "🔁 PR review 重启")
+            self.assertEqual(cancel_n["group"], group)
+            self.assertEqual(restart_n["group"], group)
+            # Per-PR lock fd 999 must be released exactly once and must be
+            # the LAST release (other release_lock_fd calls in this path are
+            # the persist-lock acquire+release inside
+            # signal_cancel_and_wait_for_lock, which is an implementation
+            # detail of the PR #27 atomic-commit-boundary fix).
+            self.assertEqual(release_calls.count(999), 1,
+                             f"per-PR lock fd should release exactly once; got {release_calls}")
+            self.assertEqual(release_calls[-1], 999,
+                             f"per-PR lock should be the last release; got {release_calls}")
+
+    def test_force_no_cancel_when_lock_free(self):
+        """If acquire_pr_lock_nb succeeds on first try, this is a normal run —
+        no cancel marker, no 🛑/🔁 notifications, codex runs once."""
+        pr_url = "https://github.com/realRoc/my-calendar/pull/10"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            cancel_path = lock_dir / f"{pr_watcher._pr_safe_id(pr_url)}.cancel"
+            # Pre-create a stale marker; verify defensive cleanup nukes it
+            # before codex starts.
+            cancel_path.touch()
+
+            shared_state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {pr_url: {"last_commented_sha": None}},
+            }
+
+            def fake_gh_run(*args, **_kwargs):
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=json.dumps({
+                        "url": pr_url, "number": 10, "title": "t",
+                        "isDraft": False, "baseRefName": "main",
+                        "headRefOid": "abc12345", "createdAt": "2026-05-22T00:00:00Z",
+                    }),
+                    stderr="",
+                )
+
+            codex_shas: list[str] = []
+
+            def fake_process_pr(pr, state, dry_run):
+                codex_shas.append(pr.head_sha)
+                state.setdefault("prs", {}).setdefault(pr.url, {})["last_commented_sha"] = pr.head_sha
+                return "codex ran (mocked)"
+
+            notifications: list[str] = []
+
+            argv = ["pr_watcher.py", "--force", pr_url]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: shared_state), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 999), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process_pr), \
+                    mock.patch.object(pr_watcher, "notify",
+                                      lambda *, title="", **kw: notifications.append(title)), \
+                    mock.patch.object(pr_watcher.subprocess, "run", fake_gh_run):
+                rc = pr_watcher.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(codex_shas, ["abc12345"])
+            self.assertNotIn("🛑 PR review 已取消", notifications)
+            self.assertNotIn("🔁 PR review 重启", notifications)
+            # Defensive cleanup: stale marker must be gone after _run_force
+            # exits even though the codex itself was mocked.
+            self.assertFalse(cancel_path.exists(),
+                             "stale cancel marker must be cleaned up before codex starts")
+
+    def test_signal_cancel_and_wait_writes_marker(self):
+        """Unit-test the helper directly: writing the marker should be the
+        first observable side effect (so a leader watcher can react ASAP)."""
+        pr_url = "https://github.com/realRoc/my-calendar/pull/10"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            cancel_path = lock_dir / f"{pr_watcher._pr_safe_id(pr_url)}.cancel"
+
+            seen_marker_before_acquire = []
+
+            def fake_acquire(url):
+                seen_marker_before_acquire.append(cancel_path.exists())
+                return 777  # pretend leader released immediately
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", fake_acquire):
+                result = pr_watcher.signal_cancel_and_wait_for_lock(pr_url, timeout_sec=5)
+
+            self.assertIsNotNone(result)
+            fd, pre_lock_ns = result
+            self.assertEqual(fd, 777)
+            self.assertIsInstance(pre_lock_ns, int)
+            self.assertEqual(seen_marker_before_acquire, [True],
+                             "marker must exist BEFORE the first acquire attempt")
+
+    def test_signal_cancel_times_out_when_leader_never_releases(self):
+        """Defensive: if the leader is stuck, the helper should return None
+        instead of hanging forever."""
+        pr_url = "https://github.com/realRoc/my-calendar/pull/10"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: None):
+                result = pr_watcher.signal_cancel_and_wait_for_lock(pr_url, timeout_sec=0.5, poll_sec=0.1)
+
+            self.assertIsNone(result)
+
+
+class RunCodexCancelObserveTests(unittest.TestCase):
+    """run_codex's watcher thread is the bit that actually kills codex.
+
+    Drive it end-to-end with a long-running `sleep` as the codex stand-in:
+    write the cancel marker mid-run and assert (a) the subprocess is reaped
+    quickly (well under the natural sleep time), (b) result.cancelled is True,
+    (c) the jsonl has the `_killed_by_watcher reason=cancelled_new_commit`
+    sentinel line."""
+
+    def test_cancel_marker_kills_codex_and_sets_cancelled(self):
+        import time as _time
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/99",
+            number=99, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            # Fake a codex that prints one line then sleeps a long time. We'll
+            # write the cancel marker after seeing output starts.
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-1"}\'\n'
+                "sleep 30\n"
+            )
+            fake_codex.chmod(0o755)
+
+            # Slot acquire returns a real fd we can release; bypass the real
+            # flock by giving back any open fd.
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+
+            cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+
+            def write_marker_after_delay():
+                _time.sleep(1.0)
+                cancel_marker.touch()
+
+            import threading as _t
+            trigger = _t.Thread(target=write_marker_after_delay, daemon=True)
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.dict(pr_watcher.os.environ, {}, clear=False):
+                # Patch the cmd list: replace "codex" with our fake script.
+                # Easiest is monkey-patching subprocess.Popen to rewrite cmd[0].
+                orig_popen = pr_watcher.subprocess.Popen
+
+                def patched_popen(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "codex":
+                        cmd = [str(fake_codex)] + cmd[1:]
+                    return orig_popen(cmd, *args, **kwargs)
+
+                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                    trigger.start()
+                    t0 = _time.time()
+                    result = pr_watcher.run_codex("prompt-text", pr)
+                    elapsed = _time.time() - t0
+
+            self.assertTrue(result.cancelled,
+                            f"run_codex should set cancelled=True. result={result}")
+            self.assertLess(elapsed, 10,
+                            f"codex should have been killed quickly, not after the full 30s sleep "
+                            f"(elapsed={elapsed:.1f}s)")
+            jsonl = result.jsonl_path.read_text(encoding="utf-8")
+            self.assertIn("cancelled_new_commit", jsonl,
+                          "jsonl should record the cancellation marker reason")
+
+    def test_no_marker_means_not_cancelled(self):
+        """Negative case: a clean codex run never sees the marker; result.cancelled
+        stays False even though the watcher thread was running."""
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/100",
+            number=100, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-2"}\'\n'
+                "exit 0\n"
+            )
+            fake_codex.chmod(0o755)
+
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                orig_popen = pr_watcher.subprocess.Popen
+
+                def patched_popen(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "codex":
+                        cmd = [str(fake_codex)] + cmd[1:]
+                    return orig_popen(cmd, *args, **kwargs)
+
+                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                    result = pr_watcher.run_codex("prompt-text", pr)
+
+            self.assertFalse(result.cancelled)
+            self.assertEqual(result.exit_code, 0)
+
+
+class RunCodexPreExistingMarkerTests(unittest.TestCase):
+    """Regression for PR #27 review (issue #26 follow-up).
+
+    Race the fix addresses:
+      1. Leader A grabs the per-PR lock (in --force entrypoint or tick path).
+      2. BEFORE A enters run_codex, --force B arrives, fails to grab the lock,
+         and writes the cancel marker via signal_cancel_and_wait_for_lock().
+      3. A finally enters run_codex.
+
+    Old (buggy) behaviour: run_codex unconditionally `unlink`ed the marker
+    on entry as "stale cleanup". B's freshly-written cancel signal was silently
+    deleted; A's watcher never saw it; A ran codex to completion against the
+    stale sha; B then ran a duplicate review against the fresh sha — defeating
+    cancel + restart.
+
+    Fixed behaviour: stale-marker cleanup is the caller's responsibility,
+    done immediately after lock acquisition (clear_stale_cancel_marker).
+    run_codex no longer touches the marker on entry; any marker present when
+    run_codex starts MUST short-circuit before Codex is spawned.
+    """
+
+    def test_pre_existing_marker_short_circuits_before_codex_start(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/26",
+            number=26, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+
+            # Pre-place the cancel marker — simulating --force B having
+            # written it during the window between A's lock acquisition
+            # and A's entry into run_codex.
+            cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+            cancel_marker.touch()
+            popen_calls = []
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher.subprocess, "Popen",
+                                      lambda *a, **k: popen_calls.append(a) or (_ for _ in ()).throw(AssertionError("no codex"))):
+                result = pr_watcher.run_codex("prompt-text", pr)
+
+            self.assertTrue(
+                result.cancelled,
+                "marker present at run_codex entry MUST be honoured as a cancel "
+                "signal before launching Codex. Old buggy code would start "
+                "Codex and rely on the watcher to kill it.",
+            )
+            self.assertEqual(popen_calls, [], "pre-start cancel must not spawn Codex")
+            self.assertFalse(cancel_marker.exists(), "marker must be consumed")
+            self.assertIn(
+                "cancelled_before_codex_start",
+                result.jsonl_path.read_text(encoding="utf-8"),
+            )
+
+
+class RunCodexPopenFailureCleanupTests(unittest.TestCase):
+    """Regression for PR #27 review (issue #26 follow-up).
+
+    If subprocess.Popen() raises BEFORE watcher_thread.start() runs
+    (codex not in PATH, permission denied, fd exhaustion, etc.), the
+    `finally` in run_codex used to call watcher_thread.join() on an
+    unstarted thread, which raises RuntimeError. That RuntimeError would
+    mask the original error AND skip the slot release + .running sidecar
+    cleanup below the join.
+
+    The fix tracks `watcher_started` and only joins when the thread was
+    actually started — and even then defends with try/except RuntimeError
+    so cleanup always runs.
+    """
+
+    def test_popen_failure_surfaces_original_error_and_cleans_up(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            slot_lock_path = tmp / "slot.lock"
+            slot_fd = os.open(str(slot_lock_path), os.O_CREAT | os.O_WRONLY, 0o644)
+            released = []
+
+            real_release = pr_watcher.release_lock_fd
+
+            def tracking_release(fd):
+                released.append(fd)
+                real_release(fd)
+
+            class CodexNotFound(FileNotFoundError):
+                pass
+
+            def exploding_popen(*args, **kwargs):
+                raise CodexNotFound("codex: command not found")
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", tracking_release), \
+                    mock.patch.object(pr_watcher.subprocess, "Popen", exploding_popen):
+                with self.assertRaises(CodexNotFound):
+                    pr_watcher.run_codex("prompt-text", pr)
+
+            # Slot must have been released even though Popen blew up before
+            # watcher_thread.start() — old code would raise RuntimeError on
+            # the join() of an unstarted thread, skipping this release.
+            self.assertIn(
+                slot_fd, released,
+                "Popen failure must not skip release_lock_fd(slot_fd) — "
+                "otherwise the global codex slot is leaked permanently.",
+            )
+
+            # No orphan .running sidecar either: the cleanup `finally` block
+            # below the join must still run.
+            orphans = list(log_dir.glob("*.running"))
+            self.assertEqual(
+                orphans, [],
+                f"Popen failure must not leave behind a .running sidecar "
+                f"(would pin a phantom dashboard row). Found: {orphans}",
+            )
+
+
+class CancelMarkerWrittenBetweenFlockAndCleanupTests(unittest.TestCase):
+    """Regression for PR #27 review blocker 1b.
+
+    Race window: leader L acquires the per-PR flock; new --force F fails
+    flock (because L holds it), writes the cancel marker via
+    signal_cancel_and_wait_for_lock(); THEN L calls
+    clear_stale_cancel_marker().
+
+    Naive cleanup (unconditional unlink) would delete F's freshly-written
+    marker, silently dropping F's cancel signal. The mtime-based gate
+    distinguishes stale (mtime ≤ pre_lock_ns) from fresh (mtime > pre_lock_ns)
+    and preserves fresh markers for run_codex's watcher to react to.
+    """
+
+    def test_marker_written_after_pre_lock_ns_is_preserved_by_cleanup(self):
+        """Exercise the exact narrow window between flock-success and the
+        clear call: simulate `acquire_pr_lock_nb` succeeding, then a
+        concurrent --force writing the marker, then `clear_stale_cancel_marker`
+        — assert the fresh marker survives."""
+        import time as _time
+        pr_url = "https://github.com/realRoc/my-calendar/pull/26"
+
+        with tempfile.TemporaryDirectory() as td:
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            marker = lock_dir / f"{pr_watcher._pr_safe_id(pr_url)}.cancel"
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                # Simulate the leader-side ordering in _run_force / tick path:
+                #   pre_lock_ns = time.time_ns()
+                #   fd = acquire_pr_lock_nb(...)  ← succeeds
+                #   # <-- concurrent --force F slips in here, writes marker
+                #   clear_stale_cancel_marker(pr_url, before_ns=pre_lock_ns)
+                pre_lock_ns = _time.time_ns()
+                # Tiny sleep so the concurrent marker's mtime is reliably
+                # above pre_lock_ns even on coarse-mtime filesystems.
+                _time.sleep(0.01)
+                marker.touch()  # F's signal_cancel_and_wait_for_lock
+                self.assertTrue(marker.exists())
+
+                pr_watcher.clear_stale_cancel_marker(pr_url, before_ns=pre_lock_ns)
+
+            self.assertTrue(
+                marker.exists(),
+                "marker written after pre_lock_ns is a fresh cancel signal "
+                "from a concurrent --force; clear_stale_cancel_marker MUST "
+                "preserve it, otherwise the new --force's cancel signal is "
+                "silently dropped and the leader runs codex to completion.",
+            )
+
+    def test_marker_written_before_pre_lock_ns_is_removed_by_cleanup(self):
+        """Sanity counter-test: a marker whose mtime is BEFORE the leader's
+        pre_lock_ns is a leftover from a prior generation (e.g., crashed
+        leader) and MUST be removed so run_codex's watcher doesn't kill
+        the new codex on its first poll."""
+        import time as _time
+        pr_url = "https://github.com/realRoc/my-calendar/pull/26"
+
+        with tempfile.TemporaryDirectory() as td:
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            marker = lock_dir / f"{pr_watcher._pr_safe_id(pr_url)}.cancel"
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                marker.touch()  # leftover from prior generation
+                _time.sleep(0.01)
+                pre_lock_ns = _time.time_ns()
+                pr_watcher.clear_stale_cancel_marker(pr_url, before_ns=pre_lock_ns)
+
+            self.assertFalse(
+                marker.exists(),
+                "stale marker (mtime ≤ pre_lock_ns) must be removed; "
+                "otherwise the new run's watcher would cancel itself on "
+                "its first poll.",
+            )
+
+
+class CancelMarkerAfterProcExitTests(unittest.TestCase):
+    """Regression for PR #27 review blocker 2b.
+
+    Race window: codex exits naturally (proc.wait returns), and BEFORE
+    the main thread writes calendar / state in process_pr, a new --force
+    writes the cancel marker. The watcher's old behaviour ignored markers
+    when proc was already dead — so the stale review was committed to
+    calendar/state, and the waiting --force then wrote a duplicate review
+    for the fresh sha.
+
+    The fix: any marker observed during the codex run window (including
+    the late post-exit poll AND the synchronous main-thread re-check after
+    proc.wait) sets cancel_observed, so process_pr short-circuits the
+    calendar/state writes.
+    """
+
+    def test_marker_arriving_after_natural_exit_sets_cancelled(self):
+        """Use the same fake-codex pattern as RunCodexCancelObserveTests:
+        a short script that prints thread.started and exits immediately.
+        After it exits but BEFORE run_codex returns, write the marker
+        from this thread (synchronous — guarantees ordering). The fix's
+        post-wait synchronous re-check must observe the marker and flip
+        result.cancelled to True so process_pr short-circuits."""
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+
+            # A fake codex that exits immediately. We then write the marker
+            # in a wrapped Popen subclass after proc.wait observes the exit
+            # — that's the exact race the fix targets.
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-late"}\'\n'
+                "exit 0\n"
+            )
+            fake_codex.chmod(0o755)
+
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                orig_popen = pr_watcher.subprocess.Popen
+
+                class _LateMarkerPopen(orig_popen):
+                    """Wraps Popen.wait() so the marker appears AFTER the
+                    real codex exit observation but BEFORE the main thread
+                    moves past the wait() call — the precise race window
+                    blocker 2b describes."""
+                    def wait(self_inner, *a, **kw):
+                        rc = super().wait(*a, **kw)
+                        # Drop the late marker (simulating a new --force
+                        # writing it right after the natural exit).
+                        cancel_marker.touch()
+                        return rc
+
+                def patched_popen(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "codex":
+                        cmd = [str(fake_codex)] + cmd[1:]
+                    return _LateMarkerPopen(cmd, *args, **kwargs)
+
+                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                    result = pr_watcher.run_codex("prompt-text", pr)
+
+            self.assertTrue(
+                result.cancelled,
+                "marker written between proc.wait return and the post-wait "
+                "check MUST flip cancelled=True; otherwise process_pr writes "
+                "stale calendar/state for the obsolete sha.",
+            )
+            jsonl = result.jsonl_path.read_text(encoding="utf-8")
+            self.assertIn(
+                "cancelled_new_commit", jsonl,
+                "jsonl should record the cancellation marker reason even "
+                "when the marker landed post-exit.",
+            )
+
+    def test_marker_consumed_by_watcher_after_post_wait_check_sets_cancelled(self):
+        """The marker can arrive after the main thread's post-wait check but
+        before stop_cancel_watcher is set. If the watcher consumes it in that
+        window, run_codex must re-read cancel_observed after join."""
+        import time as _time
+
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-consumed"}\'\n'
+                "exit 0\n"
+            )
+            fake_codex.chmod(0o755)
+
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+            real_event = pr_watcher.threading.Event
+            created_events = []
+
+            class HookedEvent:
+                def __init__(self, idx):
+                    self.idx = idx
+                    self._event = real_event()
+                    self.is_set_calls = 0
+
+                def set(self):
+                    self._event.set()
+
+                def wait(self, timeout=None):
+                    return self._event.wait(timeout)
+
+                def is_set(self):
+                    actual = self._event.is_set()
+                    self.is_set_calls += 1
+                    # cancel_observed is the second Event created by run_codex.
+                    # Its second is_set() call is the main thread's final
+                    # pre-finally decision. Drop the marker there, let the
+                    # watcher consume it, then return the old False value.
+                    if self.idx == 1 and self.is_set_calls == 2 and not actual:
+                        cancel_marker.touch()
+                        deadline = _time.time() + 2.0
+                        while cancel_marker.exists() and _time.time() < deadline:
+                            _time.sleep(0.005)
+                        return False
+                    return actual
+
+            def event_factory():
+                ev = HookedEvent(len(created_events))
+                created_events.append(ev)
+                return ev
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "CANCEL_POLL_SEC", 0.01), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher.threading, "Event", event_factory):
+                orig_popen = pr_watcher.subprocess.Popen
+
+                def patched_popen(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "codex":
+                        cmd = [str(fake_codex)] + cmd[1:]
+                    return orig_popen(cmd, *args, **kwargs)
+
+                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                    result = pr_watcher.run_codex("prompt-text", pr)
+
+            self.assertTrue(
+                result.cancelled,
+                "watcher-consumed marker after the main post-wait check must "
+                "still make run_codex return cancelled=True.",
+            )
+            self.assertFalse(cancel_marker.exists(), "watcher should consume the marker")
+            jsonl = result.jsonl_path.read_text(encoding="utf-8")
+            self.assertIn("cancelled_new_commit", jsonl)
+
+
+class ClearStaleCancelMarkerTests(unittest.TestCase):
+    """The cancel-marker contract: the marker is meaningful only while a
+    leader holds the per-PR lock. The holder MUST drop any leftover marker
+    at acquisition time and MUST NOT touch it again as "stale" later.
+
+    This test pins the contract structurally so a future refactor can't
+    silently re-introduce the run_codex-entry clear that PR #27 fixed.
+    """
+
+    def test_clear_stale_cancel_marker_is_a_no_op_when_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            import time as _time
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                # Must not raise even though no marker exists.
+                pr_watcher.clear_stale_cancel_marker(
+                    "https://github.com/x/y/pull/1",
+                    before_ns=_time.time_ns(),
+                )
+
+    def test_clear_stale_cancel_marker_removes_stale(self):
+        """Marker with mtime ≤ before_ns is stale and gets deleted."""
+        with tempfile.TemporaryDirectory() as td:
+            import time as _time
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                url = "https://github.com/x/y/pull/1"
+                marker = pr_watcher._pr_cancel_path(url)
+                marker.touch()
+                # Capture timestamp AFTER touch — marker mtime is in the past.
+                # Small sleep ensures wall-clock advances past mtime even on
+                # filesystems with coarse mtime resolution.
+                _time.sleep(0.01)
+                before_ns = _time.time_ns()
+                self.assertTrue(marker.exists())
+                pr_watcher.clear_stale_cancel_marker(url, before_ns=before_ns)
+                self.assertFalse(marker.exists())
+
+    def test_clear_stale_cancel_marker_preserves_fresh(self):
+        """Regression for PR #27 review blocker 1b: a marker written AFTER
+        before_ns is a fresh cancel signal from a new --force; it must NOT
+        be deleted, otherwise the new --force's cancel signal is silently
+        lost and the stale review runs to completion."""
+        with tempfile.TemporaryDirectory() as td:
+            import time as _time
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                url = "https://github.com/x/y/pull/1"
+                marker = pr_watcher._pr_cancel_path(url)
+                # Capture before_ns FIRST, then write the marker — marker
+                # mtime is in the "fresh" zone (> before_ns).
+                before_ns = _time.time_ns()
+                _time.sleep(0.01)
+                marker.touch()
+                self.assertTrue(marker.exists())
+                pr_watcher.clear_stale_cancel_marker(url, before_ns=before_ns)
+                self.assertTrue(
+                    marker.exists(),
+                    "marker written AFTER before_ns is a fresh cancel signal "
+                    "and must be preserved for the watcher to act on",
+                )
+
+    def test_run_codex_does_not_clear_cancel_marker_on_entry(self):
+        """Static guard: the buggy line was `cancel_marker.unlink(...)` at the
+        top of run_codex. Search the source to make sure no future edit
+        re-introduces an unconditional unlink/clear of the cancel marker
+        between SCRATCH_BASE.mkdir and acquire_codex_slot().
+        """
+        src = (HERE / "pr_watcher.py").read_text(encoding="utf-8")
+        # Locate run_codex body up to the slot-acquire line.
+        run_codex_start = src.index("def run_codex(")
+        slot_acquire_idx = src.index("acquire_codex_slot(", run_codex_start)
+        prelude = src[run_codex_start:slot_acquire_idx]
+        # Common ways to clear/remove the marker; any of these inside
+        # run_codex's prelude would re-introduce the race.
+        forbidden_patterns = [
+            "cancel_marker.unlink",
+            "_pr_cancel_path(pr.url).unlink",
+            "clear_stale_cancel_marker(pr.url",
+            "clear_stale_cancel_marker(pr_url",
+        ]
+        for pat in forbidden_patterns:
+            self.assertNotIn(
+                pat, prelude,
+                f"run_codex must NOT clear the cancel marker on entry "
+                f"(found `{pat}`). Stale cleanup belongs at the caller's "
+                f"lock-acquisition point — see clear_stale_cancel_marker "
+                f"docstring and PR #27 fix for the race this prevents.",
+            )
+
+
+class ProcessPrCancelShortCircuitTests(unittest.TestCase):
+    """When run_codex returns cancelled=True, process_pr must:
+      - NOT call upsert_events (no calendar event for the stale review)
+      - NOT write a .meta.json sidecar
+      - NOT mutate state["prs"][pr.url] (so the waiting --force runs against
+        the latest sha, not a half-baked record from the cancelled run)
+      - Emit the 🛑 notification so the user sees the cancel landed
+      - Still tear down the scratch dir
+    """
+
+    def test_cancelled_run_skips_calendar_and_state_and_meta(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/26",
+            number=26, title="cancel-restart test", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="cafecafe", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch-cafe"
+            scratch.mkdir()
+            jsonl_path = tmp / "20260525-120000__realRoc_my-calendar_pull_26.jsonl"
+            jsonl_path.write_text('{"x":1}\n{"type":"_killed_by_watcher","reason":"cancelled_new_commit"}\n', encoding="utf-8")
+            meta_path = jsonl_path.with_suffix(".meta.json")
+
+            cancelled_result = pr_watcher.CodexResult(
+                thread_id="t-cancel",
+                last_message="",
+                exit_code=-9,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=True,
+            )
+
+            # Pre-existing state — must not be mutated.
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr.url: {
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_commented_sha": "OLDOLD11",
+                        "last_seen_sha": "OLDOLD11",
+                    }
+                },
+            }
+            prompt_template = "review {pr_link}"
+
+            upsert_calls: list = []
+            notifications: list[str] = []
+
+            def fake_upsert(events, *a, **kw):
+                upsert_calls.append(events)
+                return {}
+
+            with mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: cancelled_result), \
+                    mock.patch.object(pr_watcher, "notify",
+                                      lambda *, title="", **kw: notifications.append(title)), \
+                    mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                    mock.patch.object(pr_watcher, "fetch_latest_comment",
+                                      lambda repo, n: (None, None)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr, state, dry_run=False)
+
+            self.assertIn("cancelled", ret)
+            self.assertEqual(upsert_calls, [],
+                             "no calendar event should be written for a cancelled run")
+            self.assertFalse(meta_path.exists(),
+                             "no .meta.json sidecar should be written for a cancelled run")
+            self.assertEqual(state["prs"][pr.url]["last_commented_sha"], "OLDOLD11",
+                             "state.last_commented_sha must not advance on a cancelled run")
+            self.assertFalse(scratch.exists(),
+                             "scratch dir must be cleaned up even on cancel")
+            self.assertIn("🛑 PR review 已取消", notifications,
+                          f"cancel notification must fire; got {notifications}")
+
+
+class ProcessPrLateMarkerShortCircuitTests(unittest.TestCase):
+    """PR #27 codex review blocker: when run_codex returns cancelled=False
+    (codex finished naturally) but a new --force writes the per-PR cancel
+    marker AFTER run_codex returned and BEFORE process_pr's calendar /
+    sidecar / state writes, the leader must observe the marker and short-
+    circuit just like it does for the in-codex cancel path.
+
+    The cancel watcher thread inside run_codex stops in its finally block,
+    so this late marker has no other observer; the synchronous check just
+    before upsert_events is the only thing standing between us and the
+    "stale review committed for obsolete sha + duplicate write for fresh
+    sha" outcome.
+
+    Setup: drop the cancel marker from inside fetch_latest_comment's mock
+    (precisely the window the reviewer called out — run_codex has returned,
+    process_pr is mid-way through its continuation, calendar hasn't been
+    written yet).
+    """
+
+    def test_late_marker_skips_calendar_meta_and_state(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="late-marker race test", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="cafeb007", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch-cafeb007"
+            scratch.mkdir()
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            jsonl_path = tmp / "20260525-120000__realRoc_my-calendar_pull_27.jsonl"
+            jsonl_path.write_text('{"x":1}\n', encoding="utf-8")
+            meta_path = jsonl_path.with_suffix(".meta.json")
+
+            # run_codex returns a clean (non-cancelled) result — the marker
+            # has NOT been observed inside run_codex yet.
+            clean_result = pr_watcher.CodexResult(
+                thread_id="t-late",
+                last_message="all good",
+                exit_code=0,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=False,
+            )
+
+            # Pre-existing state — must not be mutated by the cancelled run.
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr.url: {
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_commented_sha": "OLDOLD11",
+                        "last_seen_sha": "OLDOLD11",
+                        "origin_cwd": "/some/repo",
+                    }
+                },
+            }
+            prompt_template = "review {pr_link}"
+
+            upsert_calls: list = []
+            notifications: list[str] = []
+
+            def fake_upsert(events, *a, **kw):
+                upsert_calls.append(events)
+                return {events[0].key: "created"}
+
+            # The race window: while we're "fetching the latest comment",
+            # a new --force arrives and writes the cancel marker. The
+            # synchronous check in process_pr (between build_event and
+            # upsert_events) must see this and bail out.
+            def fake_fetch(repo, n):
+                pr_watcher._pr_cancel_path(pr.url).touch()
+                return ("https://example/c/late", "结论：✅ 可以合并\n")
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: clean_result), \
+                    mock.patch.object(pr_watcher, "notify",
+                                      lambda *, title="", **kw: notifications.append(title)), \
+                    mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                    mock.patch.object(pr_watcher, "fetch_latest_comment", fake_fetch), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr, state, dry_run=False)
+
+            self.assertIn("cancelled", ret,
+                          f"process_pr should signal cancellation; got {ret!r}")
+            self.assertEqual(upsert_calls, [],
+                             "no calendar event should be written when a fresh "
+                             "marker lands between run_codex return and upsert_events")
+            self.assertFalse(meta_path.exists(),
+                             "no .meta.json sidecar should be written for a "
+                             "late-marker cancelled run")
+            self.assertEqual(state["prs"][pr.url]["last_commented_sha"], "OLDOLD11",
+                             "state.last_commented_sha must not advance when a "
+                             "late marker cancels the run")
+            self.assertNotIn("last_thread_id", state["prs"][pr.url],
+                             "state must not gain run-specific fields when "
+                             "cancelled by a late marker")
+            self.assertEqual(state["prs"][pr.url].get("origin_cwd"), "/some/repo",
+                             "pre-existing origin_cwd from --force must survive "
+                             "a late-marker cancel (next --force still needs it)")
+            self.assertFalse(scratch.exists(),
+                             "scratch dir must be cleaned up even on late cancel")
+            self.assertIn("🛑 PR review 已取消", notifications,
+                          f"cancel notification must fire on late marker; got {notifications}")
+            self.assertFalse(pr_watcher._pr_cancel_path(pr.url).exists(),
+                             "process_pr must consume the marker so the next "
+                             "leader's stale-cleanup has nothing to do")
+            jsonl_after = jsonl_path.read_text(encoding="utf-8")
+            self.assertIn("cancelled_post_codex_pre_persist", jsonl_after,
+                          "jsonl should record the late-marker cancellation "
+                          "reason for forensic debugging")
 
 
 class TickSaveStateOrderTests(unittest.TestCase):
@@ -384,6 +1322,7 @@ class TickSaveStateOrderTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "acquire_pr_lock_nb", fake_acquire), \
                     mock.patch.object(pr_watcher, "release_lock_fd", fake_release_lock_fd), \
                     mock.patch.object(pr_watcher, "fetch_open_prs", fake_fetch_open_prs), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
                     mock.patch.object(pr_watcher, "process_pr", fake_process_pr):
                 rc = pr_watcher.main()
 
@@ -1596,6 +2535,570 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
         body = self.FIX_PROMPT_PATH.read_text(encoding="utf-8")
         self.assertIn("pr_prompt.md", body)
         self.assertIn("AI 共著", body)
+
+
+class AcquireCodexSlotHonoursCancelMarkerTests(unittest.TestCase):
+    """Real-flock-loop coverage: acquire_codex_slot's poll loop must check
+    the cancel marker each cycle and return None when present. The e2e test
+    below mocks acquire_codex_slot, so without this we wouldn't catch a
+    regression where the marker check is dropped from the slot function."""
+
+    def test_saturated_slots_with_marker_returns_none_promptly(self):
+        import fcntl as _fcntl
+        import time as _time
+        with tempfile.TemporaryDirectory() as td:
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "CODEX_CONCURRENCY_CAP", 1), \
+                    mock.patch.object(pr_watcher, "CODEX_SLOT_POLL_SEC", 0.05):
+                held = os.open(str(lock_dir / "codex-slot-1.lock"),
+                               os.O_CREAT | os.O_WRONLY, 0o644)
+                _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                marker = lock_dir / "x_y_pull_1.cancel"
+                marker.touch()
+                t0 = _time.time()
+                try:
+                    result = pr_watcher.acquire_codex_slot(
+                        timeout_sec=30.0, cancel_marker=marker,
+                    )
+                finally:
+                    pr_watcher.release_lock_fd(held)
+                elapsed = _time.time() - t0
+            self.assertIsNone(result)
+            self.assertLess(elapsed, 2.0,
+                            f"slot wait must bail on marker quickly (got {elapsed:.2f}s)")
+
+
+class RunCodexSlotWaitCancelTests(unittest.TestCase):
+    """E2E: cancel marker present at slot-acquire MUST short-circuit run_codex
+    with cancelled=True, no codex spawned, no .running sidecar, marker
+    consumed, forensic JSONL written. The broken pre-fix path would either
+    spawn codex anyway or raise RuntimeError as if it timed out."""
+
+    def test_marker_during_slot_wait_short_circuits_with_cancelled(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"; log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"; lock_dir.mkdir()
+            cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+            cancel_marker.touch()
+            popen_calls = []
+
+            def fake_acquire(*, timeout_sec=300.0, cancel_marker=None):
+                # Real function honours marker; stub mirrors that contract.
+                if cancel_marker is not None and cancel_marker.exists():
+                    return None
+                raise AssertionError("stub should only be hit on cancel path")
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher.subprocess, "Popen",
+                                      lambda *a, **k: popen_calls.append(a) or (_ for _ in ()).throw(AssertionError("no codex"))), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", fake_acquire):
+                result = pr_watcher.run_codex("prompt-text", pr)
+
+            self.assertTrue(result.cancelled)
+            self.assertEqual(popen_calls, [])
+            self.assertFalse(cancel_marker.exists(), "marker MUST be consumed")
+            self.assertEqual(list(log_dir.glob("*.running")), [],
+                             "no .running sidecar on slot-cancel path")
+            self.assertIn("cancelled_in_slot_wait",
+                          result.jsonl_path.read_text(encoding="utf-8"))
+
+class ProcessPrPersistLockSerialisesCancelMarkerTests(unittest.TestCase):
+    """PR #27 high finding: the synchronous late-marker re-check just before
+    upsert_events was still a check-then-act race. A new --force could call
+    signal_cancel_and_wait_for_lock AFTER the check returned False but BEFORE
+    upsert_events / meta sidecar / state mutation finished, leaving the stale
+    review for the obsolete sha on disk while the marker remained for the
+    waiter — violating issue #26's "新 commit 到达后旧 review 不落盘" contract.
+
+    Fix: process_pr holds a per-PR persist_lock around the final marker check
+    AND every irreversible write. signal_cancel_and_wait_for_lock acquires the
+    same persist_lock around its touch(). The two writers are now totally
+    ordered: a marker write either fully precedes the leader's check (leader
+    short-circuits, no stale persist) or fully follows the state mutation (no
+    interleaving — the next --force will take over and run a fresh review).
+
+    This test fires a real signal_cancel_and_wait_for_lock from a worker
+    thread, lets it land DURING upsert_events, and asserts the marker did NOT
+    appear during the critical section. The pre-fix path would let the worker
+    touch the marker mid-upsert_events while the leader marched on.
+    """
+
+    def test_signal_cancel_during_persist_is_blocked_until_release(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="persist-lock race", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="latest12", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch-latest12"
+            scratch.mkdir()
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            jsonl_path = tmp / "20260525-120000__realRoc_my-calendar_pull_27.jsonl"
+            jsonl_path.write_text('{"x":1}\n', encoding="utf-8")
+            meta_path = jsonl_path.with_suffix(".meta.json")
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                cancel_marker = pr_watcher._pr_cancel_path(pr.url)
+
+                clean_result = pr_watcher.CodexResult(
+                    thread_id="t-persist",
+                    last_message="ok",
+                    exit_code=0,
+                    jsonl_path=jsonl_path,
+                    scratch_dir=scratch,
+                    cancelled=False,
+                )
+
+                state = {
+                    "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                    "prs": {
+                        pr.url: {
+                            "repo": pr.repo,
+                            "number": pr.number,
+                            "last_commented_sha": "oldOLD11",
+                            "last_seen_sha": "oldOLD11",
+                            "origin_cwd": "/some/repo",
+                        }
+                    },
+                }
+                prompt_template = "review {pr_link}"
+
+                # Spy state shared between worker and main thread.
+                marker_present_during_persist: list[bool] = []
+                worker_done = threading.Event()
+                worker_started_signal_cancel = threading.Event()
+                worker_lock_fd: list[int | None] = []
+                start_worker = threading.Event()
+
+                # Hold the per-PR lock from this thread so the worker's
+                # signal_cancel_and_wait_for_lock takes the realistic
+                # "lock held → poll" branch. Released in `finally` so the
+                # worker's poll loop can wrap up.
+                held_pr_fd = pr_watcher.acquire_pr_lock_nb(pr.url)
+                self.assertIsNotNone(held_pr_fd,
+                                     "main thread must own per-PR lock for this test")
+
+                def worker():
+                    # Wait until process_pr has ENTERED its persist critical
+                    # section (signalled from fake_upsert below). Only then
+                    # do we try to signal cancel, so the worker's touch
+                    # contends on persist_lock exactly during the leader's
+                    # upsert_events window — the precise race PR #27 fixes.
+                    start_worker.wait(timeout=5)
+                    worker_started_signal_cancel.set()
+                    result = pr_watcher.signal_cancel_and_wait_for_lock(
+                        pr.url, timeout_sec=10, poll_sec=0.05,
+                    )
+                    if result is not None:
+                        worker_lock_fd.append(result[0])
+                    else:
+                        worker_lock_fd.append(None)
+                    worker_done.set()
+
+                t = threading.Thread(target=worker, daemon=True)
+
+                def fake_upsert(events, *a, **kw):
+                    # We are INSIDE persist_lock here (process_pr holds it).
+                    # Unblock the worker so it tries acquire_persist_lock
+                    # now. Its touch() must NOT land during this window.
+                    start_worker.set()
+                    # Give the worker time to contend.
+                    t0 = time.monotonic()
+                    while time.monotonic() - t0 < 0.3:
+                        marker_present_during_persist.append(cancel_marker.exists())
+                        time.sleep(0.02)
+                    return {events[0].key: "created"}
+
+                try:
+                    with mock.patch.object(
+                                pr_watcher, "PROMPT_PATH",
+                                mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                            mock.patch.object(pr_watcher, "run_codex",
+                                              lambda prompt, pr: clean_result), \
+                            mock.patch.object(pr_watcher, "notify",
+                                              lambda *a, **kw: None), \
+                            mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                            mock.patch.object(
+                                pr_watcher, "fetch_latest_comment",
+                                lambda *a: ("https://example/c/1", "结论：✅ 可以合并\n")), \
+                            mock.patch.object(pr_watcher, "_refresh_dashboard",
+                                              lambda *, reason: None):
+                        t.start()
+                        ret = pr_watcher.process_pr(pr, state, dry_run=False)
+                finally:
+                    pr_watcher.release_lock_fd(held_pr_fd)
+                    worker_done.wait(timeout=5)
+                    t.join(timeout=2)
+                    for fd in worker_lock_fd:
+                        if fd is not None:
+                            pr_watcher.release_lock_fd(fd)
+
+                # Worker actually entered the marker-writer path.
+                self.assertTrue(worker_started_signal_cancel.is_set(),
+                                "worker should have invoked signal_cancel")
+                # Persist_lock kept the cancel marker absent for the entire
+                # upsert_events window.
+                self.assertTrue(marker_present_during_persist,
+                                "fake_upsert should have sampled the marker")
+                self.assertTrue(
+                    all(present is False for present in marker_present_during_persist),
+                    f"persist_lock must keep the cancel marker absent for the "
+                    f"entire upsert_events window; observed samples: "
+                    f"{marker_present_during_persist}",
+                )
+
+                # Leader's persist completed normally (no cancel short-circuit).
+                self.assertNotIn("cancelled", ret,
+                                 f"persist should have finished normally; got {ret!r}")
+                self.assertTrue(meta_path.exists(),
+                                "leader's persist should have written the .meta sidecar")
+                self.assertEqual(state["prs"][pr.url]["last_commented_sha"], "latest12",
+                                 "leader's persist should have advanced state to the fresh sha")
+
+                # Once persist_lock was released, the worker's touch must
+                # have eventually landed (this is the "next --force still
+                # sees the cancel signal and runs a fresh review" half of
+                # the contract).
+                self.assertTrue(
+                    cancel_marker.exists(),
+                    "after process_pr released persist_lock, the worker's "
+                    "delayed touch() must have landed so the next --force "
+                    "still has a cancel signal to act on",
+                )
+
+
+class SignalCancelAcquiresPersistLockTests(unittest.TestCase):
+    """signal_cancel_and_wait_for_lock MUST acquire the per-PR persist_lock
+    around its touch() of the cancel marker. If a leader (or this test) is
+    already holding persist_lock, the touch must block until release.
+
+    The PR #27 high finding fix relies on this property — if the marker
+    writer ever skips persist_lock, the leader's atomic commit boundary in
+    process_pr is meaningless.
+    """
+
+    def test_touch_blocks_while_persist_lock_held_by_other_holder(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/27"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                cancel_marker = pr_watcher._pr_cancel_path(pr_url)
+                persist_fd = pr_watcher.acquire_persist_lock(pr_url)
+
+                touched = threading.Event()
+                acquire_returned = threading.Event()
+                worker_lock_fd: list[int | None] = []
+
+                def fake_acquire_pr_lock_nb(url):
+                    # We don't care about the per-PR lock for this test;
+                    # pretend it's immediately available so the helper
+                    # returns as soon as the touch goes through.
+                    acquire_returned.set()
+                    return 9999
+
+                def worker():
+                    with mock.patch.object(
+                            pr_watcher, "acquire_pr_lock_nb", fake_acquire_pr_lock_nb):
+                        result = pr_watcher.signal_cancel_and_wait_for_lock(
+                            pr_url, timeout_sec=5, poll_sec=0.05,
+                        )
+                    if result is not None:
+                        worker_lock_fd.append(result[0])
+                    touched.set()
+
+                t = threading.Thread(target=worker, daemon=True)
+                try:
+                    t.start()
+                    # Give the worker time to try acquire_persist_lock.
+                    # While we hold persist_fd, the touch MUST be blocked,
+                    # so the marker must NOT yet exist.
+                    time.sleep(0.2)
+                    self.assertFalse(
+                        cancel_marker.exists(),
+                        "marker must not appear while another holder owns "
+                        "persist_lock — signal_cancel must wait its turn",
+                    )
+                    self.assertFalse(
+                        touched.is_set(),
+                        "signal_cancel must not return while persist_lock is held",
+                    )
+                finally:
+                    pr_watcher.release_lock_fd(persist_fd)
+
+                # After we release, the worker's touch should land quickly.
+                self.assertTrue(touched.wait(timeout=5),
+                                "worker must complete shortly after persist_lock release")
+                self.assertTrue(cancel_marker.exists(),
+                                "touch must land once persist_lock is released")
+                t.join(timeout=2)
+
+
+class _MarkerStatHook:
+    """Proxy around the cancel-marker Path that:
+      · fires a one-shot callback AFTER the first stat() call, and
+      · exposes a threading.Event (`touch_event`) that fires inside touch()
+        AFTER the underlying file has actually been refreshed.
+
+    All other Path operations (unlink / exists / __fspath__) delegate to
+    the wrapped path so other code that pulls _pr_cancel_path(pr_url) —
+    notably signal_cancel_and_wait_for_lock — keeps working unmodified.
+
+    Used by ClearStaleCancelMarkerStatUnlinkRaceTests to deterministically
+    open the historically-unsafe window between
+    clear_stale_cancel_marker()'s stat() and its conditional unlink(). The
+    Event lets the hook synchronise on the worker's touch landing instead
+    of busy-polling stat() mtime (which is timing-sensitive and was making
+    the regression test flaky on fast machines).
+    """
+
+    def __init__(self, real_path: Path, on_first_stat):
+        self._real = real_path
+        self._on_first_stat = on_first_stat
+        self._stat_fired = False
+        self.touch_event = threading.Event()
+
+    def stat(self):
+        result = self._real.stat()
+        if not self._stat_fired:
+            self._stat_fired = True
+            if self._on_first_stat is not None:
+                self._on_first_stat()
+        return result
+
+    def unlink(self, missing_ok=False):
+        return self._real.unlink(missing_ok=missing_ok)
+
+    def exists(self):
+        return self._real.exists()
+
+    def touch(self):
+        result = self._real.touch()
+        # Set AFTER the real touch so anyone waiting on this event can
+        # trust the file's mtime has already been refreshed.
+        self.touch_event.set()
+        return result
+
+    def __fspath__(self):
+        return str(self._real)
+
+    def __str__(self):
+        return str(self._real)
+
+
+class ClearStaleCancelMarkerStatUnlinkRaceTests(unittest.TestCase):
+    """PR #27 codex review's second follow-up blocker:
+    clear_stale_cancel_marker() used to do an unlocked stat() + mtime-gated
+    unlink(). With a stale marker on disk, a brand-new --force F could fire
+    signal_cancel_and_wait_for_lock between our stat() and our unlink(),
+    refreshing the marker — but our unlink decision was still based on the
+    OLD stat, so we'd silently delete F's FRESH cancel signal. The watcher
+    would then never observe a marker, the obsolete codex run would finish,
+    and the stale review would land. That violates issue #26's "新 commit
+    到达后旧 review 不落盘" contract.
+
+    Fix: clear_stale_cancel_marker acquires the per-PR persist_lock around
+    its stat + conditional unlink, sharing the lock with
+    signal_cancel_and_wait_for_lock's touch(). The marker write is forced
+    to wait until our stat+unlink finishes, so the only possible
+    interleavings are:
+      · touch fully precedes our stat → fresh mtime → we preserve;
+      · touch fully follows our unlink → fresh marker survives on a
+        clean slate.
+    The "touch lands between stat and unlink" interleaving is no longer
+    possible.
+
+    This regression test reproduces the historical race deterministically:
+    we use a Path proxy whose stat() fires a callback that starts a real
+    signal_cancel_and_wait_for_lock worker. The callback then polls until
+    the worker has touched the marker (pre-fix path) or hits a short
+    timeout (post-fix path: the worker is blocked on persist_lock, so it
+    never touches inside this window). Either way the test then verifies
+    the invariant: at the end, a cancel marker MUST exist — the fresh
+    signal from the concurrent --force must not have been silently
+    swallowed by the stale-cleanup.
+    """
+
+    def test_stale_marker_plus_touch_between_stat_and_unlink_preserves_signal(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/27"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                real_marker = pr_watcher._pr_cancel_path(pr_url)
+                # Stale marker (well-defined OLD mtime so the mtime gate
+                # in clear_stale_cancel_marker would unlink it on its own).
+                real_marker.touch()
+                stale_mtime = time.time() - 3600.0
+                os.utime(real_marker, (stale_mtime, stale_mtime))
+                stale_mtime_ns = int(stale_mtime * 1e9)
+
+                # before_ns AFTER the stale touch — far enough that the
+                # stale marker is unambiguously "stale" and would be
+                # unlinked by the unguarded path.
+                leader_before_ns = time.time_ns()
+
+                worker_done = threading.Event()
+                worker_lock_fd: list[int | None] = []
+
+                proxy = _MarkerStatHook(real_marker, on_first_stat=None)
+
+                def stat_hook():
+                    """Fire a real signal_cancel_and_wait_for_lock from a
+                    worker thread, then synchronise on the worker's touch
+                    landing via proxy.touch_event:
+                      · pre-fix (no persist_lock around stat+unlink):
+                        the worker acquires persist_lock immediately,
+                        calls proxy.touch() (which sets the event right
+                        after the real refresh), and the event fires
+                        within milliseconds — the hook returns to
+                        clear_stale_cancel_marker, whose captured stat
+                        still says "stale" → it unlinks the FRESH marker.
+                      · post-fix: clear_stale holds persist_lock around
+                        stat+unlink, so the worker's acquire_persist_lock
+                        blocks. The event never fires inside this window,
+                        the wait times out, the hook returns, the
+                        (truly) stale marker gets unlinked under the
+                        lock, and only AFTER the unlock does the worker
+                        proceed to touch a fresh marker on a clean slate.
+
+                    1.0s is comfortably larger than the few-ms a real
+                    touch needs, AND comfortably bounded to keep the
+                    fixed-path test snappy."""
+                    def worker():
+                        result = pr_watcher.signal_cancel_and_wait_for_lock(
+                            pr_url, timeout_sec=10, poll_sec=0.05,
+                        )
+                        if result is not None:
+                            worker_lock_fd.append(result[0])
+                        else:
+                            worker_lock_fd.append(None)
+                        worker_done.set()
+
+                    t = threading.Thread(target=worker, daemon=True)
+                    t.start()
+                    proxy.touch_event.wait(timeout=1.0)
+
+                proxy._on_first_stat = stat_hook
+                real_cancel_path = pr_watcher._pr_cancel_path
+
+                def fake_cancel_path(url):
+                    return proxy if url == pr_url else real_cancel_path(url)
+
+                try:
+                    with mock.patch.object(pr_watcher, "_pr_cancel_path",
+                                           fake_cancel_path):
+                        pr_watcher.clear_stale_cancel_marker(
+                            pr_url, before_ns=leader_before_ns,
+                        )
+
+                    self.assertTrue(
+                        worker_done.wait(timeout=5),
+                        "worker thread must complete after clear_stale releases persist_lock",
+                    )
+                finally:
+                    for fd in worker_lock_fd:
+                        if fd is not None:
+                            pr_watcher.release_lock_fd(fd)
+
+                # Invariant: with persist_lock around clear_stale's stat +
+                # unlink, the worker's touch lands either entirely BEFORE
+                # stat (mtime check preserves the file) or entirely AFTER
+                # unlink (touch creates a fresh file on a clean slate). In
+                # both cases a cancel marker exists at the end. The pre-fix
+                # path could land the touch BETWEEN stat and unlink and
+                # then unlink it — that's the bug.
+                self.assertTrue(
+                    real_marker.exists(),
+                    "fresh cancel marker from concurrent --force must not "
+                    "be lost to a stat+unlink race in clear_stale_cancel_marker",
+                )
+
+    def test_clear_stale_blocks_while_persist_lock_held_elsewhere(self):
+        """Direct lock-contract test: if any other holder owns persist_lock,
+        clear_stale_cancel_marker MUST wait its turn before observing or
+        unlinking the marker. Prevents a future refactor from accidentally
+        dropping the persist_lock acquire and reintroducing the stat+unlink
+        race."""
+        pr_url = "https://github.com/realRoc/my-calendar/pull/27"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                cancel_marker = pr_watcher._pr_cancel_path(pr_url)
+                cancel_marker.touch()
+                stale_mtime = time.time() - 3600.0
+                os.utime(cancel_marker, (stale_mtime, stale_mtime))
+
+                # Main thread holds persist_lock — worker's
+                # clear_stale_cancel_marker must NOT make progress until
+                # we release it.
+                persist_fd = pr_watcher.acquire_persist_lock(pr_url)
+
+                cleared = threading.Event()
+
+                def worker():
+                    pr_watcher.clear_stale_cancel_marker(
+                        pr_url, before_ns=time.time_ns(),
+                    )
+                    cleared.set()
+
+                t = threading.Thread(target=worker, daemon=True)
+                try:
+                    t.start()
+                    # Give the worker time to attempt acquire_persist_lock.
+                    time.sleep(0.2)
+                    self.assertFalse(
+                        cleared.is_set(),
+                        "clear_stale_cancel_marker must wait for persist_lock — "
+                        "if this fires, the function is taking the unsafe "
+                        "stat+unlink path again",
+                    )
+                    self.assertTrue(
+                        cancel_marker.exists(),
+                        "marker must still be on disk while worker is blocked",
+                    )
+                finally:
+                    pr_watcher.release_lock_fd(persist_fd)
+
+                self.assertTrue(
+                    cleared.wait(timeout=5),
+                    "worker must complete shortly after persist_lock release",
+                )
+                self.assertFalse(
+                    cancel_marker.exists(),
+                    "after persist_lock release the stale marker should "
+                    "have been unlinked by the now-unblocked worker",
+                )
+                t.join(timeout=2)
 
 
 if __name__ == "__main__":

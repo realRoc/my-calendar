@@ -67,9 +67,11 @@ chmod +x "$RESOURCES/launch_fix.sh"
 cp "$URL_PARSER" "$RESOURCES/parse_fix_url.py"
 # launch_fix.sh reads `mycalfix_config.py claude-flag` to decide whether to add
 # `--dangerously-skip-permissions`. Missing this file → the helper call fails
-# → launch_fix.sh's fail-safe defaults to yolo. That silently nullifies the
-# `mycalfix_interactive_claude: true` safety valve in deployed installs, so
-# the helper MUST be bundled alongside launch_fix.sh.
+# → launch_fix.sh's fail-safe defaults to interactive (empty flag, requires
+# per-tool approval). That's the safe direction, but it also means users who
+# explicitly opted into yolo via `mycalfix_interactive_claude: false` would
+# silently get interactive instead. Either way, the helper MUST be bundled
+# alongside launch_fix.sh so the config knob behaves as configured.
 cp "$CONFIG_HELPER" "$RESOURCES/mycalfix_config.py"
 cp "$PROMPT" "$RESOURCES/fix_prompt.md"
 
