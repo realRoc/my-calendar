@@ -1188,6 +1188,42 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
 
     now = datetime.now()
     event = build_event(pr, result, comment_url, comment_body, now, origin_cwd=origin_cwd)
+
+    # PR #27 blocker fix: the cancel watcher inside run_codex stops in its
+    # finally block, but the per-PR lock is still held here. A new --force
+    # arriving between run_codex's return and the writes below will write a
+    # cancel marker and then block on our lock — and nobody else is watching
+    # the marker. Without this synchronous check the stale review for the
+    # obsolete sha lands in calendar/sidecar/state, then the waiting --force
+    # writes again for the fresh sha (two events, state remembers the
+    # obsolete sha). Consume the marker just before upsert_events so the
+    # late --force wins, matching issue #26's "新 commit 到达后旧 review
+    # 不落盘" contract.
+    cancel_marker = _pr_cancel_path(pr.url)
+    if cancel_marker.exists():
+        try:
+            cancel_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            with result.jsonl_path.open("a", encoding="utf-8") as f:
+                f.write('{"type":"_killed_by_watcher","reason":"cancelled_post_codex_pre_persist"}\n')
+        except OSError:
+            pass
+        notify(
+            title="🛑 PR review 已取消",
+            subtitle=pr.repo,
+            message=f"#{pr.number} 检测到新 commit，已取消进行中的 review",
+            open_url=pr.url,
+            group=notify_group,
+        )
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        _refresh_dashboard(reason="cancelled")
+        return f"cancelled (new commit between codex exit and persist, elapsed={fmt_duration(elapsed)})"
+
     actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
     cal_action = actions.get(event.key, "?")
 

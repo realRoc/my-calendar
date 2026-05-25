@@ -1032,6 +1032,125 @@ class ProcessPrCancelShortCircuitTests(unittest.TestCase):
                           f"cancel notification must fire; got {notifications}")
 
 
+class ProcessPrLateMarkerShortCircuitTests(unittest.TestCase):
+    """PR #27 codex review blocker: when run_codex returns cancelled=False
+    (codex finished naturally) but a new --force writes the per-PR cancel
+    marker AFTER run_codex returned and BEFORE process_pr's calendar /
+    sidecar / state writes, the leader must observe the marker and short-
+    circuit just like it does for the in-codex cancel path.
+
+    The cancel watcher thread inside run_codex stops in its finally block,
+    so this late marker has no other observer; the synchronous check just
+    before upsert_events is the only thing standing between us and the
+    "stale review committed for obsolete sha + duplicate write for fresh
+    sha" outcome.
+
+    Setup: drop the cancel marker from inside fetch_latest_comment's mock
+    (precisely the window the reviewer called out — run_codex has returned,
+    process_pr is mid-way through its continuation, calendar hasn't been
+    written yet).
+    """
+
+    def test_late_marker_skips_calendar_meta_and_state(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="late-marker race test", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="cafeb007", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch-cafeb007"
+            scratch.mkdir()
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            jsonl_path = tmp / "20260525-120000__realRoc_my-calendar_pull_27.jsonl"
+            jsonl_path.write_text('{"x":1}\n', encoding="utf-8")
+            meta_path = jsonl_path.with_suffix(".meta.json")
+
+            # run_codex returns a clean (non-cancelled) result — the marker
+            # has NOT been observed inside run_codex yet.
+            clean_result = pr_watcher.CodexResult(
+                thread_id="t-late",
+                last_message="all good",
+                exit_code=0,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=False,
+            )
+
+            # Pre-existing state — must not be mutated by the cancelled run.
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr.url: {
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_commented_sha": "OLDOLD11",
+                        "last_seen_sha": "OLDOLD11",
+                        "origin_cwd": "/some/repo",
+                    }
+                },
+            }
+            prompt_template = "review {pr_link}"
+
+            upsert_calls: list = []
+            notifications: list[str] = []
+
+            def fake_upsert(events, *a, **kw):
+                upsert_calls.append(events)
+                return {events[0].key: "created"}
+
+            # The race window: while we're "fetching the latest comment",
+            # a new --force arrives and writes the cancel marker. The
+            # synchronous check in process_pr (between build_event and
+            # upsert_events) must see this and bail out.
+            def fake_fetch(repo, n):
+                pr_watcher._pr_cancel_path(pr.url).touch()
+                return ("https://example/c/late", "结论：✅ 可以合并\n")
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: clean_result), \
+                    mock.patch.object(pr_watcher, "notify",
+                                      lambda *, title="", **kw: notifications.append(title)), \
+                    mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                    mock.patch.object(pr_watcher, "fetch_latest_comment", fake_fetch), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr, state, dry_run=False)
+
+            self.assertIn("cancelled", ret,
+                          f"process_pr should signal cancellation; got {ret!r}")
+            self.assertEqual(upsert_calls, [],
+                             "no calendar event should be written when a fresh "
+                             "marker lands between run_codex return and upsert_events")
+            self.assertFalse(meta_path.exists(),
+                             "no .meta.json sidecar should be written for a "
+                             "late-marker cancelled run")
+            self.assertEqual(state["prs"][pr.url]["last_commented_sha"], "OLDOLD11",
+                             "state.last_commented_sha must not advance when a "
+                             "late marker cancels the run")
+            self.assertNotIn("last_thread_id", state["prs"][pr.url],
+                             "state must not gain run-specific fields when "
+                             "cancelled by a late marker")
+            self.assertEqual(state["prs"][pr.url].get("origin_cwd"), "/some/repo",
+                             "pre-existing origin_cwd from --force must survive "
+                             "a late-marker cancel (next --force still needs it)")
+            self.assertFalse(scratch.exists(),
+                             "scratch dir must be cleaned up even on late cancel")
+            self.assertIn("🛑 PR review 已取消", notifications,
+                          f"cancel notification must fire on late marker; got {notifications}")
+            self.assertFalse(pr_watcher._pr_cancel_path(pr.url).exists(),
+                             "process_pr must consume the marker so the next "
+                             "leader's stale-cleanup has nothing to do")
+            jsonl_after = jsonl_path.read_text(encoding="utf-8")
+            self.assertIn("cancelled_post_codex_pre_persist", jsonl_after,
+                          "jsonl should record the late-marker cancellation "
+                          "reason for forensic debugging")
+
+
 class TickSaveStateOrderTests(unittest.TestCase):
     """Regression test for the race called out by codex on PR #19.
 
