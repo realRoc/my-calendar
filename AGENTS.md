@@ -298,11 +298,18 @@ ls history/*/*__mothers-day__mom.md
 4. 旧 leader 的 `process_pr` 走 cancel 短路：**不写日历事件、不写 `.meta.json` sidecar、不更新 `pr_state.json[<pr_url>].last_commented_sha`**，只保留 `.jsonl`（末尾追加 `_killed_by_watcher reason=cancelled_new_commit`）方便事后排查
 5. 旧 leader 释放 flock；新 --force 拿到锁，发右上角通知 **🔁 PR review 重启** ，对最新的 head_sha 重新跑一次完整 review
 
+**Persist 锁的原子边界（PR #27 high finding 修复）**：codex 退出后、`process_pr` 写日历 / `.meta` / state 之前还有一段窗口。早先的"在 upsert_events 之前 synchronously 再 check 一次 marker"是 check-then-act：marker writer 可以在 check 通过 *之后* 但 `upsert_events` *之前/之中* 出现，旧 review 还是会落盘。
+现在做法：每个 PR 多一把 `locks/<safe_id>.persist.lock`，
+- `signal_cancel_and_wait_for_lock` 在 `touch()` cancel marker 时持这把锁；
+- `process_pr` 在"最终 check marker + `upsert_events` + 写 `.meta` + 推进内存 state"这一段持同一把锁。
+两者互斥，于是 marker write 与 leader 的不可逆写入完全 totally ordered：要么 marker 在 leader 进入临界区之前落地（leader 看到 marker，短路，不写日历），要么 marker 在 leader 释放 persist 锁之后才落地（leader 这次 review 完整落盘，下一轮 --force 用新 marker 再触发一次 fresh review）。marker 不再可能"夹在 check 和 write 中间"。
+
 要点：
 - 同一 PR 串行（cancel + restart 保持这个语义）；不同 PR 之间继续并行
 - N 次快速 push 不会堆 N 个 review；最终只会留下 1 个 review，对应最后一个 sha
 - launchd 兜底 tick 路径遇到 in-flight review 时仍然 **skip**，不参与 cancel（设计取舍：兜底每 2 分钟跑一次，没必要打断当前 review；下一轮自然 re-check）
 - 通知用同一 `group="pr-watcher:<pr_url>"`，terminal-notifier 会把同组旧 banner 替换成最新一条，多次 cancel/restart 不会刷屏
+- **不要**再加"写 cancel marker"的新代码路径而绕过 `signal_cancel_and_wait_for_lock`：persist 锁约定要求 marker writer 必须在 persist 锁里 `touch()`，绕过会让 PR #27 修复失效
 
 ### 关键文件
 

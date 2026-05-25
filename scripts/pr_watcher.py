@@ -189,7 +189,7 @@ query($q: String!) {
 # processes can race past the state check, run codex on the same head_sha, and
 # post duplicate comments.
 #
-# Design: per-PR flock + cancel marker (reset/reboot semantics).
+# Design: per-PR flock + cancel marker + persist lock (reset/reboot semantics).
 #   - Per-PR lock (locks/<safe_id>.lock) gates codex execution for that one PR.
 #     Different PRs run fully in parallel; within a PR, only one codex at a time.
 #   - Cancel marker (locks/<safe_id>.cancel) implements "new commit aborts the
@@ -202,6 +202,23 @@ query($q: String!) {
 #     waiting --force then acquires the lock and starts a fresh review against
 #     the latest head_sha. Net effect: the stale review is dropped, the user's
 #     last comment is always against the latest sha.
+#   - Persist lock (locks/<safe_id>.persist.lock) is the atomic commit boundary
+#     PR #27 high finding asked for. The synchronous late-marker re-check that
+#     used to live alone right before upsert_events was still a check-then-act
+#     race: a --force could write the marker AFTER our check returned False but
+#     BEFORE upsert_events / meta sidecar / state mutation finished, and the
+#     stale review would land anyway. The persist lock fixes this by serialising
+#     the two writers that touch the marker file:
+#         · signal_cancel_and_wait_for_lock (the only production marker writer)
+#           acquires persist_lock around its touch();
+#         · the leader's process_pr acquires persist_lock around the final
+#           marker check + upsert_events + .meta sidecar + in-memory state
+#           mutation block.
+#     Either the marker write fully precedes the leader's critical section
+#     (leader sees the marker, short-circuits, drops the stale review), or it
+#     fully follows it (leader's persist completes, the new --force then takes
+#     over and runs a fresh review against the latest sha). The marker write
+#     can no longer be interleaved with the leader's irreversible writes.
 #   - State save (see save_state) uses a separate brief flock (locks/state.lock)
 #     and does a load-merge-write so concurrent writers for different PRs don't
 #     clobber each other's updates.
@@ -217,6 +234,42 @@ def _pr_lock_path(pr_url: str) -> Path:
 
 def _pr_cancel_path(pr_url: str) -> Path:
     return LOCK_DIR / f"{_pr_safe_id(pr_url)}.cancel"
+
+
+def _pr_persist_lock_path(pr_url: str) -> Path:
+    return LOCK_DIR / f"{_pr_safe_id(pr_url)}.persist.lock"
+
+
+def acquire_persist_lock(pr_url: str) -> int:
+    """Acquire the per-PR persist lock, blocking until granted. Returns the fd
+    the caller MUST release with release_lock_fd when done.
+
+    Held by:
+      - signal_cancel_and_wait_for_lock around the touch() of the cancel
+        marker (very brief — usually well under 1ms).
+      - process_pr around its final marker check + upsert_events + .meta
+        sidecar write + in-memory state mutation (bounded by EventKit speed,
+        typically <1s).
+
+    These two writers are the only entities that mutate "was a cancel
+    requested by the time the leader committed?" state. Holding the same
+    flock around both sides makes the question totally ordered, which closes
+    the PR #27 high finding race (marker appearing between the late re-check
+    and upsert_events).
+
+    Lock acquisition order in the leader path: per-PR lock → codex slot →
+    persist lock. Acquisition order in the --force / marker-writer path:
+    persist lock (briefly, released before the per-PR-lock poll loop) → per-PR
+    lock. The two paths never hold both terminal locks concurrently, so this
+    additional flock cannot deadlock with the existing ones."""
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(_pr_persist_lock_path(pr_url)), os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
 
 
 def clear_stale_cancel_marker(pr_url: str, before_ns: int) -> None:
@@ -295,9 +348,21 @@ def signal_cancel_and_wait_for_lock(
     Returns None if the leader didn't release within timeout_sec (defensive —
     should normally take <2s after kill since codex exits, leader's process_pr
     short-circuits, and the flock is released).
+
+    PR #27 high finding: the touch() runs under the per-PR persist lock. If
+    the leader is currently inside its persist critical section (final marker
+    check + upsert_events + meta sidecar + state mutation), our acquire of
+    persist_lock blocks until that section finishes — making the marker write
+    totally ordered relative to the leader's commit. We release persist_lock
+    BEFORE the per-PR-lock poll loop so the leader (which acquires persist
+    lock NESTED INSIDE the per-PR lock) cannot deadlock with us.
     """
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    _pr_cancel_path(pr_url).touch()
+    persist_fd = acquire_persist_lock(pr_url)
+    try:
+        _pr_cancel_path(pr_url).touch()
+    finally:
+        release_lock_fd(persist_fd)
     deadline = time.time() + timeout_sec
     while True:
         pre_lock_ns = time.time_ns()
@@ -1236,27 +1301,90 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     now = datetime.now()
     event = build_event(pr, result, comment_url, comment_body, now, origin_cwd=origin_cwd)
 
-    # PR #27 blocker fix: the cancel watcher inside run_codex stops in its
+    # PR #27 high finding: the cancel watcher inside run_codex stops in its
     # finally block, but the per-PR lock is still held here. A new --force
-    # arriving between run_codex's return and the writes below will write a
-    # cancel marker and then block on our lock — and nobody else is watching
-    # the marker. Without this synchronous check the stale review for the
-    # obsolete sha lands in calendar/sidecar/state, then the waiting --force
-    # writes again for the fresh sha (two events, state remembers the
-    # obsolete sha). Consume the marker just before upsert_events so the
-    # late --force wins, matching issue #26's "新 commit 到达后旧 review
-    # 不落盘" contract.
+    # arriving between run_codex's return and the writes below would write a
+    # cancel marker that nobody is watching. The synchronous re-check below
+    # alone was still a check-then-act race: a --force could write the marker
+    # AFTER the check returned False but BEFORE upsert_events / meta sidecar /
+    # state mutation finished, and the stale review for the obsolete sha
+    # would land in calendar/sidecar/state. The waiting --force would then
+    # write again for the fresh sha (two events, state remembering the
+    # obsolete sha), violating issue #26's "新 commit 到达后旧 review 不落盘"
+    # contract.
+    #
+    # Fix: hold the per-PR persist lock across the marker re-check AND every
+    # irreversible write below. signal_cancel_and_wait_for_lock also grabs
+    # the same lock around its touch(), so the marker write is now totally
+    # ordered with this critical section — it either fully precedes the
+    # check (we see the marker, short-circuit) or fully follows the state
+    # mutation (the next --force restarts review on the fresh sha). The
+    # marker can no longer slip in between. See acquire_persist_lock for the
+    # full contract and acquisition-order argument.
     cancel_marker = _pr_cancel_path(pr.url)
-    if cancel_marker.exists():
-        try:
-            cancel_marker.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            with result.jsonl_path.open("a", encoding="utf-8") as f:
-                f.write('{"type":"_killed_by_watcher","reason":"cancelled_post_codex_pre_persist"}\n')
-        except OSError:
-            pass
+    persist_fd = acquire_persist_lock(pr.url)
+    try:
+        if cancel_marker.exists():
+            try:
+                cancel_marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                with result.jsonl_path.open("a", encoding="utf-8") as f:
+                    f.write('{"type":"_killed_by_watcher","reason":"cancelled_post_codex_pre_persist"}\n')
+            except OSError:
+                pass
+            cancelled_late = True
+        else:
+            cancelled_late = False
+            actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
+            cal_action = actions.get(event.key, "?")
+
+            # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
+            meta = {
+                "started_at": started_at,
+                "repo": pr.repo,
+                "pr_number": pr.number,
+                "pr_url": pr.url,
+                "pr_title": pr.title,
+                "head_sha": pr.head_sha,
+                "thread_id": result.thread_id,
+                "comment_url": comment_url,
+                "comment_body": comment_body or "",
+                "codex_exit": result.exit_code,
+                "jsonl_path": str(result.jsonl_path),
+                "origin_cwd": origin_cwd,
+            }
+            meta_path = result.jsonl_path.with_suffix(".meta.json")
+            try:
+                meta_path.write_text(
+                    json.dumps(meta, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError as e:
+                print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
+
+            entry = state["prs"].setdefault(pr.url, {})
+            entry.update({
+                "repo": pr.repo,
+                "number": pr.number,
+                "last_commented_sha": pr.head_sha,
+                "last_thread_id": result.thread_id,
+                "last_comment_url": comment_url,
+                "last_run_at": started_at,
+                "last_codex_exit": result.exit_code,
+                "last_jsonl": str(result.jsonl_path),
+            })
+
+            # 同时记录"我们见过这个 sha"，用于 first-run 兼容
+            entry["last_seen_sha"] = pr.head_sha
+    finally:
+        release_lock_fd(persist_fd)
+
+    # ── post-persist housekeeping (intentionally outside persist_lock to keep
+    # the critical section short; nothing here mutates state a marker writer
+    # cares about) ──────────────────────────────────────────────────────────
+    if cancelled_late:
         notify(
             title="🛑 PR review 已取消",
             subtitle=pr.repo,
@@ -1271,51 +1399,9 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
         _refresh_dashboard(reason="cancelled")
         return f"cancelled (new commit between codex exit and persist, elapsed={fmt_duration(elapsed)})"
 
-    actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
-    cal_action = actions.get(event.key, "?")
-
-    # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
-    meta = {
-        "started_at": started_at,
-        "repo": pr.repo,
-        "pr_number": pr.number,
-        "pr_url": pr.url,
-        "pr_title": pr.title,
-        "head_sha": pr.head_sha,
-        "thread_id": result.thread_id,
-        "comment_url": comment_url,
-        "comment_body": comment_body or "",
-        "codex_exit": result.exit_code,
-        "jsonl_path": str(result.jsonl_path),
-        "origin_cwd": origin_cwd,
-    }
-    meta_path = result.jsonl_path.with_suffix(".meta.json")
-    try:
-        meta_path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError as e:
-        print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
-
-    # Refresh again now that the .meta.json sidecar exists: this swaps the
+    # Refresh now that the .meta.json sidecar exists: this swaps the
     # "running" row out of the dashboard and shows the finished review.
     _refresh_dashboard(reason="run-end")
-
-    entry = state["prs"].setdefault(pr.url, {})
-    entry.update({
-        "repo": pr.repo,
-        "number": pr.number,
-        "last_commented_sha": pr.head_sha,
-        "last_thread_id": result.thread_id,
-        "last_comment_url": comment_url,
-        "last_run_at": started_at,
-        "last_codex_exit": result.exit_code,
-        "last_jsonl": str(result.jsonl_path),
-    })
-
-    # 同时记录"我们见过这个 sha"，用于 first-run 兼容
-    entry["last_seen_sha"] = pr.head_sha
 
     # 清理 scratch 目录（codex 已退出，无后续依赖）
     try:

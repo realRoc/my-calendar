@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -287,8 +289,15 @@ class ForceCancelRestartTests(unittest.TestCase):
             restart_n = next(n for n in notifications if n["title"] == "🔁 PR review 重启")
             self.assertEqual(cancel_n["group"], group)
             self.assertEqual(restart_n["group"], group)
-            # Lock released exactly once at the end.
-            self.assertEqual(release_calls, [999])
+            # Per-PR lock fd 999 must be released exactly once and must be
+            # the LAST release (other release_lock_fd calls in this path are
+            # the persist-lock acquire+release inside
+            # signal_cancel_and_wait_for_lock, which is an implementation
+            # detail of the PR #27 atomic-commit-boundary fix).
+            self.assertEqual(release_calls.count(999), 1,
+                             f"per-PR lock fd should release exactly once; got {release_calls}")
+            self.assertEqual(release_calls[-1], 999,
+                             f"per-PR lock should be the last release; got {release_calls}")
 
     def test_force_no_cancel_when_lock_free(self):
         """If acquire_pr_lock_nb succeeds on first try, this is a normal run —
@@ -2589,6 +2598,246 @@ class RunCodexSlotWaitCancelTests(unittest.TestCase):
                              "no .running sidecar on slot-cancel path")
             self.assertIn("cancelled_in_slot_wait",
                           result.jsonl_path.read_text(encoding="utf-8"))
+
+class ProcessPrPersistLockSerialisesCancelMarkerTests(unittest.TestCase):
+    """PR #27 high finding: the synchronous late-marker re-check just before
+    upsert_events was still a check-then-act race. A new --force could call
+    signal_cancel_and_wait_for_lock AFTER the check returned False but BEFORE
+    upsert_events / meta sidecar / state mutation finished, leaving the stale
+    review for the obsolete sha on disk while the marker remained for the
+    waiter — violating issue #26's "新 commit 到达后旧 review 不落盘" contract.
+
+    Fix: process_pr holds a per-PR persist_lock around the final marker check
+    AND every irreversible write. signal_cancel_and_wait_for_lock acquires the
+    same persist_lock around its touch(). The two writers are now totally
+    ordered: a marker write either fully precedes the leader's check (leader
+    short-circuits, no stale persist) or fully follows the state mutation (no
+    interleaving — the next --force will take over and run a fresh review).
+
+    This test fires a real signal_cancel_and_wait_for_lock from a worker
+    thread, lets it land DURING upsert_events, and asserts the marker did NOT
+    appear during the critical section. The pre-fix path would let the worker
+    touch the marker mid-upsert_events while the leader marched on.
+    """
+
+    def test_signal_cancel_during_persist_is_blocked_until_release(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="persist-lock race", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="latest12", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch-latest12"
+            scratch.mkdir()
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            jsonl_path = tmp / "20260525-120000__realRoc_my-calendar_pull_27.jsonl"
+            jsonl_path.write_text('{"x":1}\n', encoding="utf-8")
+            meta_path = jsonl_path.with_suffix(".meta.json")
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                cancel_marker = pr_watcher._pr_cancel_path(pr.url)
+
+                clean_result = pr_watcher.CodexResult(
+                    thread_id="t-persist",
+                    last_message="ok",
+                    exit_code=0,
+                    jsonl_path=jsonl_path,
+                    scratch_dir=scratch,
+                    cancelled=False,
+                )
+
+                state = {
+                    "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                    "prs": {
+                        pr.url: {
+                            "repo": pr.repo,
+                            "number": pr.number,
+                            "last_commented_sha": "oldOLD11",
+                            "last_seen_sha": "oldOLD11",
+                            "origin_cwd": "/some/repo",
+                        }
+                    },
+                }
+                prompt_template = "review {pr_link}"
+
+                # Spy state shared between worker and main thread.
+                marker_present_during_persist: list[bool] = []
+                worker_done = threading.Event()
+                worker_started_signal_cancel = threading.Event()
+                worker_lock_fd: list[int | None] = []
+                start_worker = threading.Event()
+
+                # Hold the per-PR lock from this thread so the worker's
+                # signal_cancel_and_wait_for_lock takes the realistic
+                # "lock held → poll" branch. Released in `finally` so the
+                # worker's poll loop can wrap up.
+                held_pr_fd = pr_watcher.acquire_pr_lock_nb(pr.url)
+                self.assertIsNotNone(held_pr_fd,
+                                     "main thread must own per-PR lock for this test")
+
+                def worker():
+                    # Wait until process_pr has ENTERED its persist critical
+                    # section (signalled from fake_upsert below). Only then
+                    # do we try to signal cancel, so the worker's touch
+                    # contends on persist_lock exactly during the leader's
+                    # upsert_events window — the precise race PR #27 fixes.
+                    start_worker.wait(timeout=5)
+                    worker_started_signal_cancel.set()
+                    result = pr_watcher.signal_cancel_and_wait_for_lock(
+                        pr.url, timeout_sec=10, poll_sec=0.05,
+                    )
+                    if result is not None:
+                        worker_lock_fd.append(result[0])
+                    else:
+                        worker_lock_fd.append(None)
+                    worker_done.set()
+
+                t = threading.Thread(target=worker, daemon=True)
+
+                def fake_upsert(events, *a, **kw):
+                    # We are INSIDE persist_lock here (process_pr holds it).
+                    # Unblock the worker so it tries acquire_persist_lock
+                    # now. Its touch() must NOT land during this window.
+                    start_worker.set()
+                    # Give the worker time to contend.
+                    t0 = time.monotonic()
+                    while time.monotonic() - t0 < 0.3:
+                        marker_present_during_persist.append(cancel_marker.exists())
+                        time.sleep(0.02)
+                    return {events[0].key: "created"}
+
+                try:
+                    with mock.patch.object(
+                                pr_watcher, "PROMPT_PATH",
+                                mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                            mock.patch.object(pr_watcher, "run_codex",
+                                              lambda prompt, pr: clean_result), \
+                            mock.patch.object(pr_watcher, "notify",
+                                              lambda *a, **kw: None), \
+                            mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                            mock.patch.object(
+                                pr_watcher, "fetch_latest_comment",
+                                lambda *a: ("https://example/c/1", "结论：✅ 可以合并\n")), \
+                            mock.patch.object(pr_watcher, "_refresh_dashboard",
+                                              lambda *, reason: None):
+                        t.start()
+                        ret = pr_watcher.process_pr(pr, state, dry_run=False)
+                finally:
+                    pr_watcher.release_lock_fd(held_pr_fd)
+                    worker_done.wait(timeout=5)
+                    t.join(timeout=2)
+                    for fd in worker_lock_fd:
+                        if fd is not None:
+                            pr_watcher.release_lock_fd(fd)
+
+                # Worker actually entered the marker-writer path.
+                self.assertTrue(worker_started_signal_cancel.is_set(),
+                                "worker should have invoked signal_cancel")
+                # Persist_lock kept the cancel marker absent for the entire
+                # upsert_events window.
+                self.assertTrue(marker_present_during_persist,
+                                "fake_upsert should have sampled the marker")
+                self.assertTrue(
+                    all(present is False for present in marker_present_during_persist),
+                    f"persist_lock must keep the cancel marker absent for the "
+                    f"entire upsert_events window; observed samples: "
+                    f"{marker_present_during_persist}",
+                )
+
+                # Leader's persist completed normally (no cancel short-circuit).
+                self.assertNotIn("cancelled", ret,
+                                 f"persist should have finished normally; got {ret!r}")
+                self.assertTrue(meta_path.exists(),
+                                "leader's persist should have written the .meta sidecar")
+                self.assertEqual(state["prs"][pr.url]["last_commented_sha"], "latest12",
+                                 "leader's persist should have advanced state to the fresh sha")
+
+                # Once persist_lock was released, the worker's touch must
+                # have eventually landed (this is the "next --force still
+                # sees the cancel signal and runs a fresh review" half of
+                # the contract).
+                self.assertTrue(
+                    cancel_marker.exists(),
+                    "after process_pr released persist_lock, the worker's "
+                    "delayed touch() must have landed so the next --force "
+                    "still has a cancel signal to act on",
+                )
+
+
+class SignalCancelAcquiresPersistLockTests(unittest.TestCase):
+    """signal_cancel_and_wait_for_lock MUST acquire the per-PR persist_lock
+    around its touch() of the cancel marker. If a leader (or this test) is
+    already holding persist_lock, the touch must block until release.
+
+    The PR #27 high finding fix relies on this property — if the marker
+    writer ever skips persist_lock, the leader's atomic commit boundary in
+    process_pr is meaningless.
+    """
+
+    def test_touch_blocks_while_persist_lock_held_by_other_holder(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/27"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                cancel_marker = pr_watcher._pr_cancel_path(pr_url)
+                persist_fd = pr_watcher.acquire_persist_lock(pr_url)
+
+                touched = threading.Event()
+                acquire_returned = threading.Event()
+                worker_lock_fd: list[int | None] = []
+
+                def fake_acquire_pr_lock_nb(url):
+                    # We don't care about the per-PR lock for this test;
+                    # pretend it's immediately available so the helper
+                    # returns as soon as the touch goes through.
+                    acquire_returned.set()
+                    return 9999
+
+                def worker():
+                    with mock.patch.object(
+                            pr_watcher, "acquire_pr_lock_nb", fake_acquire_pr_lock_nb):
+                        result = pr_watcher.signal_cancel_and_wait_for_lock(
+                            pr_url, timeout_sec=5, poll_sec=0.05,
+                        )
+                    if result is not None:
+                        worker_lock_fd.append(result[0])
+                    touched.set()
+
+                t = threading.Thread(target=worker, daemon=True)
+                try:
+                    t.start()
+                    # Give the worker time to try acquire_persist_lock.
+                    # While we hold persist_fd, the touch MUST be blocked,
+                    # so the marker must NOT yet exist.
+                    time.sleep(0.2)
+                    self.assertFalse(
+                        cancel_marker.exists(),
+                        "marker must not appear while another holder owns "
+                        "persist_lock — signal_cancel must wait its turn",
+                    )
+                    self.assertFalse(
+                        touched.is_set(),
+                        "signal_cancel must not return while persist_lock is held",
+                    )
+                finally:
+                    pr_watcher.release_lock_fd(persist_fd)
+
+                # After we release, the worker's touch should land quickly.
+                self.assertTrue(touched.wait(timeout=5),
+                                "worker must complete shortly after persist_lock release")
+                self.assertTrue(cancel_marker.exists(),
+                                "touch must land once persist_lock is released")
+                t.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()
