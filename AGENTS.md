@@ -283,10 +283,26 @@ ls history/*/*__mothers-day__mom.md
    - 首次见到 → seed 落 head_sha，**不评论**
    - head_sha 未变 → 跳过
    - head_sha 变了 → 触发 codex
-4. codex 调用：`codex exec --json --dangerously-bypass-approvals-and-sandbox -s danger-full-access --skip-git-repo-check -C /tmp/codex-pr-runs/<uuid> "<prompt>"`
+4. codex 调用：`codex exec --json --dangerously-bypass-approvals-and-sandbox -s danger-full-access --skip-git-repo-check -C /tmp/codex-pr-runs/<uuid> "<prompt>"`，用 `start_new_session=True` 起独立进程组以便 cancel 时能 `killpg` 整片
 5. 从 JSONL 第一行抓 `thread_id`（用于 `codex resume`）
 6. codex 自己用 `gh pr comment` 发评论；watcher 用 `gh api ...issues/<n>/comments` 兜底取 URL
 7. EventKit 写到独立日历 **"PR 监控"**，UID = `my-calendar:pr-comment:<pr_url>:<sha>`
+
+### 进行中收到新 commit：cancel + restart（issue #26）
+
+同一 PR 在 codex review 进行中又收到新 commit（典型场景：本机连续 `git push`），不再排队，而是 **立即把进行中的 review 取消，并基于最新 sha 重新开始**：
+
+1. 新的 `pr_watcher --force <url>` 抢 per-PR flock 失败（旧 leader 还在跑）
+2. 立刻写 `locks/<safe_id>.cancel` marker，并发右上角通知 **🛑 PR review 已取消**
+3. 旧 leader 的后台 watcher 线程每 500ms 轮询 marker，发现就 `killpg` 掉 codex 整个进程组（codex + 子 gh / git / node helpers）
+4. 旧 leader 的 `process_pr` 走 cancel 短路：**不写日历事件、不写 `.meta.json` sidecar、不更新 `pr_state.json[<pr_url>].last_commented_sha`**，只保留 `.jsonl`（末尾追加 `_killed_by_watcher reason=cancelled_new_commit`）方便事后排查
+5. 旧 leader 释放 flock；新 --force 拿到锁，发右上角通知 **🔁 PR review 重启** ，对最新的 head_sha 重新跑一次完整 review
+
+要点：
+- 同一 PR 串行（cancel + restart 保持这个语义）；不同 PR 之间继续并行
+- N 次快速 push 不会堆 N 个 review；最终只会留下 1 个 review，对应最后一个 sha
+- launchd 兜底 tick 路径遇到 in-flight review 时仍然 **skip**，不参与 cancel（设计取舍：兜底每 2 分钟跑一次，没必要打断当前 review；下一轮自然 re-check）
+- 通知用同一 `group="pr-watcher:<pr_url>"`，terminal-notifier 会把同组旧 banner 替换成最新一条，多次 cancel/restart 不会刷屏
 
 ### 关键文件
 
