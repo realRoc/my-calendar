@@ -203,14 +203,17 @@ query($q: String!) {
 #     the latest head_sha. Net effect: the stale review is dropped, the user's
 #     last comment is always against the latest sha.
 #   - Persist lock (locks/<safe_id>.persist.lock) is the atomic commit boundary
-#     PR #27 high finding asked for. The synchronous late-marker re-check that
-#     used to live alone right before upsert_events was still a check-then-act
-#     race: a --force could write the marker AFTER our check returned False but
-#     BEFORE upsert_events / meta sidecar / state mutation finished, and the
-#     stale review would land anyway. The persist lock fixes this by serialising
-#     the two writers that touch the marker file:
+#     PR #27's two follow-up findings asked for. The synchronous late-marker
+#     re-check that used to live alone right before upsert_events was a check-
+#     then-act race; the stat() + mtime-gated unlink() in
+#     clear_stale_cancel_marker was the same shape of race on the cleanup side
+#     (stale stat + concurrent touch landing between stat and unlink → leader
+#     deletes the FRESH marker, watcher never sees it). The persist lock fixes
+#     both by serialising every party that touches the marker file:
 #         · signal_cancel_and_wait_for_lock (the only production marker writer)
 #           acquires persist_lock around its touch();
+#         · clear_stale_cancel_marker acquires persist_lock around its stat() +
+#           conditional unlink();
 #         · the leader's process_pr acquires persist_lock around the final
 #           marker check + upsert_events + .meta sidecar + in-memory state
 #           mutation block.
@@ -218,7 +221,8 @@ query($q: String!) {
 #     (leader sees the marker, short-circuits, drops the stale review), or it
 #     fully follows it (leader's persist completes, the new --force then takes
 #     over and runs a fresh review against the latest sha). The marker write
-#     can no longer be interleaved with the leader's irreversible writes.
+#     can no longer be interleaved with either the leader's irreversible
+#     writes or the stale-cleanup's stat/unlink window.
 #   - State save (see save_state) uses a separate brief flock (locks/state.lock)
 #     and does a load-merge-write so concurrent writers for different PRs don't
 #     clobber each other's updates.
@@ -247,15 +251,21 @@ def acquire_persist_lock(pr_url: str) -> int:
     Held by:
       - signal_cancel_and_wait_for_lock around the touch() of the cancel
         marker (very brief — usually well under 1ms).
+      - clear_stale_cancel_marker around stat() + conditional unlink() of the
+        marker file (very brief; the second PR #27 follow-up makes the stale-
+        cleanup atomic relative to a concurrent marker writer).
       - process_pr around its final marker check + upsert_events + .meta
         sidecar write + in-memory state mutation (bounded by EventKit speed,
         typically <1s).
 
-    These two writers are the only entities that mutate "was a cancel
-    requested by the time the leader committed?" state. Holding the same
-    flock around both sides makes the question totally ordered, which closes
-    the PR #27 high finding race (marker appearing between the late re-check
-    and upsert_events).
+    All three of these touch the "was a cancel requested?" state — by
+    creating, deleting, or reading the cancel marker file. Holding the same
+    flock around every side makes the question totally ordered, which closes
+    both PR #27 follow-up races:
+      · marker appearing between the late re-check and upsert_events
+        (process_pr's irreversible writes side); and
+      · marker being touched between clear_stale_cancel_marker's stat() and
+        its mtime-gated unlink() (the stale-cleanup side).
 
     Lock acquisition order in the leader path: per-PR lock → codex slot →
     persist lock. Acquisition order in the --force / marker-writer path:
@@ -296,22 +306,40 @@ def clear_stale_cancel_marker(pr_url: str, before_ns: int) -> None:
     Stale markers (left behind by a crashed prior leader, or written for a
     previous generation that already finished) have mtime ≤ before_ns and
     are safely removed.
+
+    Second PR #27 follow-up (codex blocker): the mtime gate alone is still a
+    check-then-act window between stat() and unlink(). If a stale marker is
+    present at lock-acquisition time, a brand-new --force F can fire
+    signal_cancel_and_wait_for_lock between our stat (which reads the OLD
+    mtime) and our conditional unlink (which uses that stale stat), so we
+    end up deleting F's freshly-touched marker even though its real on-disk
+    mtime is now > before_ns. The watcher then never sees a marker and the
+    obsolete codex run lands.
+    Fix: do stat + conditional unlink under the same per-PR persist_lock
+    that signal_cancel_and_wait_for_lock holds around its touch(). The
+    marker-write side is forced to wait until our stat+unlink finishes (it
+    will then re-touch a fresh marker on a clean slate), so the stale-stat-
+    racing-with-fresh-touch interleaving is impossible.
     """
     marker = _pr_cancel_path(pr_url)
+    persist_fd = acquire_persist_lock(pr_url)
     try:
-        st = marker.stat()
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
-    if st.st_mtime_ns > before_ns:
-        # Fresh signal from a --force that wrote the marker AFTER our flock
-        # attempt. Leave it for run_codex's watcher to react to.
-        return
-    try:
-        marker.unlink(missing_ok=True)
-    except OSError:
-        pass
+        try:
+            st = marker.stat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        if st.st_mtime_ns > before_ns:
+            # Fresh signal from a --force that wrote the marker AFTER our flock
+            # attempt. Leave it for run_codex's watcher to react to.
+            return
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+    finally:
+        release_lock_fd(persist_fd)
 
 
 def acquire_pr_lock_nb(pr_url: str) -> int | None:

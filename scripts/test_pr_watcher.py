@@ -92,8 +92,14 @@ class ForceOriginCwdTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(s)), \
                     mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
                     mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 999), \
-                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run):
+                # NB: release_lock_fd intentionally NOT mocked. clear_stale
+                # _cancel_marker and process_pr both call acquire_persist_lock
+                # under the hood; if release_lock_fd is a no-op, the persist
+                # flock leaks and subsequent acquires in the same process
+                # deadlock. Real release_lock_fd swallows OSError, so the
+                # fake fd 999 from acquire_pr_lock_nb harmlessly silently
+                # fails to close.
                 rc = pr_watcher.main()
 
             self.assertEqual(rc, 0)
@@ -170,7 +176,6 @@ class ForceOriginCwdFreshRunTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: saved.append(s)), \
                     mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
                     mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 999), \
-                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run), \
                     mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
                     mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: fake_codex_result), \
@@ -234,6 +239,19 @@ class ForceCancelRestartTests(unittest.TestCase):
             def fake_acquire(url):
                 return next(acquire_calls)
 
+            # Spy that ALSO actually releases. release_lock_fd is defensive
+            # (swallows OSError), so calling it on the fake fd 999 is a
+            # silent no-op while real persist-lock fds get properly closed.
+            # A pure-spy that no-ops would leak the persist flock and
+            # deadlock the very next acquire_persist_lock in this process —
+            # see PR #27 follow-up where clear_stale_cancel_marker also
+            # acquires persist_lock.
+            real_release_lock_fd = pr_watcher.release_lock_fd
+
+            def tracking_release(fd):
+                release_calls.append(fd)
+                real_release_lock_fd(fd)
+
             def fake_gh_run(*args, **_kwargs):
                 return subprocess.CompletedProcess(
                     args=args, returncode=0,
@@ -261,7 +279,7 @@ class ForceCancelRestartTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "load_state", lambda: shared_state), \
                     mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
                     mock.patch.object(pr_watcher, "acquire_pr_lock_nb", fake_acquire), \
-                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: release_calls.append(fd)), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", tracking_release), \
                     mock.patch.object(pr_watcher, "process_pr", fake_process_pr), \
                     mock.patch.object(pr_watcher, "notify",
                                       lambda *, title="", subtitle="", message="", open_url=None, group=None, **kw:
@@ -345,7 +363,6 @@ class ForceCancelRestartTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "load_state", lambda: shared_state), \
                     mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
                     mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 999), \
-                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
                     mock.patch.object(pr_watcher, "process_pr", fake_process_pr), \
                     mock.patch.object(pr_watcher, "notify",
                                       lambda *, title="", **kw: notifications.append(title)), \
@@ -2836,6 +2853,251 @@ class SignalCancelAcquiresPersistLockTests(unittest.TestCase):
                                 "worker must complete shortly after persist_lock release")
                 self.assertTrue(cancel_marker.exists(),
                                 "touch must land once persist_lock is released")
+                t.join(timeout=2)
+
+
+class _MarkerStatHook:
+    """Proxy around the cancel-marker Path that:
+      · fires a one-shot callback AFTER the first stat() call, and
+      · exposes a threading.Event (`touch_event`) that fires inside touch()
+        AFTER the underlying file has actually been refreshed.
+
+    All other Path operations (unlink / exists / __fspath__) delegate to
+    the wrapped path so other code that pulls _pr_cancel_path(pr_url) —
+    notably signal_cancel_and_wait_for_lock — keeps working unmodified.
+
+    Used by ClearStaleCancelMarkerStatUnlinkRaceTests to deterministically
+    open the historically-unsafe window between
+    clear_stale_cancel_marker()'s stat() and its conditional unlink(). The
+    Event lets the hook synchronise on the worker's touch landing instead
+    of busy-polling stat() mtime (which is timing-sensitive and was making
+    the regression test flaky on fast machines).
+    """
+
+    def __init__(self, real_path: Path, on_first_stat):
+        self._real = real_path
+        self._on_first_stat = on_first_stat
+        self._stat_fired = False
+        self.touch_event = threading.Event()
+
+    def stat(self):
+        result = self._real.stat()
+        if not self._stat_fired:
+            self._stat_fired = True
+            if self._on_first_stat is not None:
+                self._on_first_stat()
+        return result
+
+    def unlink(self, missing_ok=False):
+        return self._real.unlink(missing_ok=missing_ok)
+
+    def exists(self):
+        return self._real.exists()
+
+    def touch(self):
+        result = self._real.touch()
+        # Set AFTER the real touch so anyone waiting on this event can
+        # trust the file's mtime has already been refreshed.
+        self.touch_event.set()
+        return result
+
+    def __fspath__(self):
+        return str(self._real)
+
+    def __str__(self):
+        return str(self._real)
+
+
+class ClearStaleCancelMarkerStatUnlinkRaceTests(unittest.TestCase):
+    """PR #27 codex review's second follow-up blocker:
+    clear_stale_cancel_marker() used to do an unlocked stat() + mtime-gated
+    unlink(). With a stale marker on disk, a brand-new --force F could fire
+    signal_cancel_and_wait_for_lock between our stat() and our unlink(),
+    refreshing the marker — but our unlink decision was still based on the
+    OLD stat, so we'd silently delete F's FRESH cancel signal. The watcher
+    would then never observe a marker, the obsolete codex run would finish,
+    and the stale review would land. That violates issue #26's "新 commit
+    到达后旧 review 不落盘" contract.
+
+    Fix: clear_stale_cancel_marker acquires the per-PR persist_lock around
+    its stat + conditional unlink, sharing the lock with
+    signal_cancel_and_wait_for_lock's touch(). The marker write is forced
+    to wait until our stat+unlink finishes, so the only possible
+    interleavings are:
+      · touch fully precedes our stat → fresh mtime → we preserve;
+      · touch fully follows our unlink → fresh marker survives on a
+        clean slate.
+    The "touch lands between stat and unlink" interleaving is no longer
+    possible.
+
+    This regression test reproduces the historical race deterministically:
+    we use a Path proxy whose stat() fires a callback that starts a real
+    signal_cancel_and_wait_for_lock worker. The callback then polls until
+    the worker has touched the marker (pre-fix path) or hits a short
+    timeout (post-fix path: the worker is blocked on persist_lock, so it
+    never touches inside this window). Either way the test then verifies
+    the invariant: at the end, a cancel marker MUST exist — the fresh
+    signal from the concurrent --force must not have been silently
+    swallowed by the stale-cleanup.
+    """
+
+    def test_stale_marker_plus_touch_between_stat_and_unlink_preserves_signal(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/27"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                real_marker = pr_watcher._pr_cancel_path(pr_url)
+                # Stale marker (well-defined OLD mtime so the mtime gate
+                # in clear_stale_cancel_marker would unlink it on its own).
+                real_marker.touch()
+                stale_mtime = time.time() - 3600.0
+                os.utime(real_marker, (stale_mtime, stale_mtime))
+                stale_mtime_ns = int(stale_mtime * 1e9)
+
+                # before_ns AFTER the stale touch — far enough that the
+                # stale marker is unambiguously "stale" and would be
+                # unlinked by the unguarded path.
+                leader_before_ns = time.time_ns()
+
+                worker_done = threading.Event()
+                worker_lock_fd: list[int | None] = []
+
+                proxy = _MarkerStatHook(real_marker, on_first_stat=None)
+
+                def stat_hook():
+                    """Fire a real signal_cancel_and_wait_for_lock from a
+                    worker thread, then synchronise on the worker's touch
+                    landing via proxy.touch_event:
+                      · pre-fix (no persist_lock around stat+unlink):
+                        the worker acquires persist_lock immediately,
+                        calls proxy.touch() (which sets the event right
+                        after the real refresh), and the event fires
+                        within milliseconds — the hook returns to
+                        clear_stale_cancel_marker, whose captured stat
+                        still says "stale" → it unlinks the FRESH marker.
+                      · post-fix: clear_stale holds persist_lock around
+                        stat+unlink, so the worker's acquire_persist_lock
+                        blocks. The event never fires inside this window,
+                        the wait times out, the hook returns, the
+                        (truly) stale marker gets unlinked under the
+                        lock, and only AFTER the unlock does the worker
+                        proceed to touch a fresh marker on a clean slate.
+
+                    1.0s is comfortably larger than the few-ms a real
+                    touch needs, AND comfortably bounded to keep the
+                    fixed-path test snappy."""
+                    def worker():
+                        result = pr_watcher.signal_cancel_and_wait_for_lock(
+                            pr_url, timeout_sec=10, poll_sec=0.05,
+                        )
+                        if result is not None:
+                            worker_lock_fd.append(result[0])
+                        else:
+                            worker_lock_fd.append(None)
+                        worker_done.set()
+
+                    t = threading.Thread(target=worker, daemon=True)
+                    t.start()
+                    proxy.touch_event.wait(timeout=1.0)
+
+                proxy._on_first_stat = stat_hook
+                real_cancel_path = pr_watcher._pr_cancel_path
+
+                def fake_cancel_path(url):
+                    return proxy if url == pr_url else real_cancel_path(url)
+
+                try:
+                    with mock.patch.object(pr_watcher, "_pr_cancel_path",
+                                           fake_cancel_path):
+                        pr_watcher.clear_stale_cancel_marker(
+                            pr_url, before_ns=leader_before_ns,
+                        )
+
+                    self.assertTrue(
+                        worker_done.wait(timeout=5),
+                        "worker thread must complete after clear_stale releases persist_lock",
+                    )
+                finally:
+                    for fd in worker_lock_fd:
+                        if fd is not None:
+                            pr_watcher.release_lock_fd(fd)
+
+                # Invariant: with persist_lock around clear_stale's stat +
+                # unlink, the worker's touch lands either entirely BEFORE
+                # stat (mtime check preserves the file) or entirely AFTER
+                # unlink (touch creates a fresh file on a clean slate). In
+                # both cases a cancel marker exists at the end. The pre-fix
+                # path could land the touch BETWEEN stat and unlink and
+                # then unlink it — that's the bug.
+                self.assertTrue(
+                    real_marker.exists(),
+                    "fresh cancel marker from concurrent --force must not "
+                    "be lost to a stat+unlink race in clear_stale_cancel_marker",
+                )
+
+    def test_clear_stale_blocks_while_persist_lock_held_elsewhere(self):
+        """Direct lock-contract test: if any other holder owns persist_lock,
+        clear_stale_cancel_marker MUST wait its turn before observing or
+        unlinking the marker. Prevents a future refactor from accidentally
+        dropping the persist_lock acquire and reintroducing the stat+unlink
+        race."""
+        pr_url = "https://github.com/realRoc/my-calendar/pull/27"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir):
+                cancel_marker = pr_watcher._pr_cancel_path(pr_url)
+                cancel_marker.touch()
+                stale_mtime = time.time() - 3600.0
+                os.utime(cancel_marker, (stale_mtime, stale_mtime))
+
+                # Main thread holds persist_lock — worker's
+                # clear_stale_cancel_marker must NOT make progress until
+                # we release it.
+                persist_fd = pr_watcher.acquire_persist_lock(pr_url)
+
+                cleared = threading.Event()
+
+                def worker():
+                    pr_watcher.clear_stale_cancel_marker(
+                        pr_url, before_ns=time.time_ns(),
+                    )
+                    cleared.set()
+
+                t = threading.Thread(target=worker, daemon=True)
+                try:
+                    t.start()
+                    # Give the worker time to attempt acquire_persist_lock.
+                    time.sleep(0.2)
+                    self.assertFalse(
+                        cleared.is_set(),
+                        "clear_stale_cancel_marker must wait for persist_lock — "
+                        "if this fires, the function is taking the unsafe "
+                        "stat+unlink path again",
+                    )
+                    self.assertTrue(
+                        cancel_marker.exists(),
+                        "marker must still be on disk while worker is blocked",
+                    )
+                finally:
+                    pr_watcher.release_lock_fd(persist_fd)
+
+                self.assertTrue(
+                    cleared.wait(timeout=5),
+                    "worker must complete shortly after persist_lock release",
+                )
+                self.assertFalse(
+                    cancel_marker.exists(),
+                    "after persist_lock release the stale marker should "
+                    "have been unlinked by the now-unblocked worker",
+                )
                 t.join(timeout=2)
 
 
