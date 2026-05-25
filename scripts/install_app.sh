@@ -12,6 +12,7 @@ ROOT=$(cd "$HERE/.." && pwd)
 SRC_APPLESCRIPT="$ROOT/app/MyCalFix/main.applescript"
 LAUNCHER="$HERE/launch_fix.sh"
 URL_PARSER="$HERE/parse_fix_url.py"
+CONFIG_HELPER="$HERE/mycalfix_config.py"
 PROMPT="$HERE/fix_prompt.md"
 
 APP_DIR="$HOME/Applications"
@@ -35,6 +36,10 @@ if [[ ! -f "$URL_PARSER" ]]; then
   echo "✗ url parser not found: $URL_PARSER" >&2
   exit 1
 fi
+if [[ ! -f "$CONFIG_HELPER" ]]; then
+  echo "✗ config helper not found: $CONFIG_HELPER" >&2
+  exit 1
+fi
 if [[ ! -f "$PROMPT" ]]; then
   echo "✗ fix prompt not found: $PROMPT" >&2
   exit 1
@@ -56,10 +61,16 @@ osacompile -o "$APP_PATH" "$SRC_APPLESCRIPT"
 # matters because the repo may live under a TCC-protected folder (~/Desktop,
 # ~/Documents, ~/Downloads) — reading scripts/launch_fix.sh from there would
 # EPERM. Files inside the .app bundle are not TCC-gated for the .app itself.
-echo "  → installing launcher + url parser + prompt into $RESOURCES"
+echo "  → installing launcher + url parser + config helper + prompt into $RESOURCES"
 cp "$LAUNCHER" "$RESOURCES/launch_fix.sh"
 chmod +x "$RESOURCES/launch_fix.sh"
 cp "$URL_PARSER" "$RESOURCES/parse_fix_url.py"
+# launch_fix.sh reads `mycalfix_config.py claude-flag` to decide whether to add
+# `--dangerously-skip-permissions`. Missing this file → the helper call fails
+# → launch_fix.sh's fail-safe defaults to yolo. That silently nullifies the
+# `mycalfix_interactive_claude: true` safety valve in deployed installs, so
+# the helper MUST be bundled alongside launch_fix.sh.
+cp "$CONFIG_HELPER" "$RESOURCES/mycalfix_config.py"
 cp "$PROMPT" "$RESOURCES/fix_prompt.md"
 
 # Verify the bundled parser is actually runnable end-to-end. Catches a missing
@@ -76,6 +87,26 @@ fi
 if [[ "$smoke_out" == *URL_ERROR=* ]]; then
   echo "✗ bundled parser rejected a known-good URL — regression?" >&2
   echo "$smoke_out" >&2
+  exit 3
+fi
+
+# Smoke-test the bundled config helper exactly the way launch_fix.sh calls it.
+# Use a clean HOME so the user's real ~/.config/my-calendar/config.json doesn't
+# influence the assertion. Default contract: `claude-flag` prints the empty
+# string (interactive — claude asks for approval on every tool call). If the
+# helper isn't bundled or emits the yolo flag by default, launch_fix.sh would
+# silently upgrade every click to no-approval execution. Catch it at install.
+echo "  → smoke-testing bundled config helper"
+CONFIG_TMP_HOME=$(mktemp -d)
+if ! cfg_out=$(HOME="$CONFIG_TMP_HOME" python3 "$RESOURCES/mycalfix_config.py" claude-flag 2>&1); then
+  echo "✗ bundled mycalfix_config.py failed to run: $cfg_out" >&2
+  rm -rf "$CONFIG_TMP_HOME"
+  exit 3
+fi
+rm -rf "$CONFIG_TMP_HOME"
+if [[ -n "$(printf '%s' "$cfg_out" | tr -d '[:space:]')" ]]; then
+  echo "✗ bundled mycalfix_config.py emitted unexpected claude-flag: $cfg_out" >&2
+  echo "  (expected empty string under a clean HOME — interactive is the safe default)" >&2
   exit 3
 fi
 
@@ -146,6 +177,7 @@ echo "   bundle:    $BUNDLE_ID"
 echo "   scheme:    $URL_SCHEME://"
 echo "   launcher:  $RESOURCES/launch_fix.sh  (bundled)"
 echo "   parser:    $RESOURCES/parse_fix_url.py  (bundled)"
+echo "   config:    $RESOURCES/mycalfix_config.py  (bundled)"
 echo "   prompt:    $RESOURCES/fix_prompt.md  (bundled)"
 echo
 echo "smoke test:"

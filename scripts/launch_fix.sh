@@ -41,7 +41,25 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 LOG_DIR="$HOME/Library/Logs/MyCalFix"
 LOG_FILE="$LOG_DIR/launch_fix.log"
 PROMPT_FILE="$HERE/fix_prompt.md"
+MYCALFIX_CONFIG="$HERE/mycalfix_config.py"
 mkdir -p "$LOG_DIR"
+
+# Read claude CLI flag from ~/.config/my-calendar/config.json. Default is
+# empty (interactive: each tool call asks for approval); set
+# `mycalfix_interactive_claude: false` to opt into
+# `--dangerously-skip-permissions` (yolo) in the disposable worktree.
+#
+# Fail-CLOSED: if the helper is missing or crashes, fall back to interactive
+# (empty flag). A partial install or a broken helper must NOT silently
+# upgrade the click to no-approval tool execution — codex flagged the
+# previous fail-open behaviour as a blocker on PR #22.
+if ! CLAUDE_FLAG=$(python3 "$MYCALFIX_CONFIG" claude-flag 2>>"$LOG_FILE"); then
+  CLAUDE_FLAG=""
+  echo "  warn: mycalfix_config.py failed; failing CLOSED to interactive (CLAUDE_FLAG empty)" >> "$LOG_FILE"
+fi
+# Trim trailing newline from the python output.
+CLAUDE_FLAG="${CLAUDE_FLAG%$'\n'}"
+echo "  CLAUDE_FLAG: ${CLAUDE_FLAG:-<interactive (empty)>}" >> "$LOG_FILE"
 
 # osascript helpers for the .app's own UI. These display dialogs owned by
 # osascript itself — no AppleEvent sent to other apps, so no Automation TCC
@@ -171,10 +189,23 @@ sys.stdout.write(text)
 #   4. cd into the worktree and launch claude.
 # claude is told (via fix_prompt.md) to push back with `git push origin
 # HEAD:<branch>` and to print a `git worktree remove` command for cleanup.
+# NOTE on quoting: we feed the python source via `python3 - <<'PYEOF'` heredoc,
+# NOT via `python3 -c '<source>'`. The python source below contains many literal
+# single quotes (e.g. `printf '%s' ...`, `sed -E 's|...'`). With `python3 -c`,
+# bash's outer single-quoted string would be closed by the first literal `'`
+# inside the python source, leaving the rest as unquoted shell tokens — exactly
+# the regression that broke this path in PR #19 (issue #25): `s|(\\.git)?/*$||`
+# would parse as glob/$var/path tokens and bash would abort with
+# `syntax error near unexpected token ?/*$'`. `bash -n` doesn't catch it
+# because it only static-parses; substitution bodies aren't expanded. The
+# `<<'PYEOF'` form keeps every byte of the python source literal — single
+# quotes inside have no special meaning to the shell. All data still flows in
+# via os.environ so the script needs no shell-side interpolation.
 cmd=$(
   CWD="$origin_cwd" REPO="$repo" BRANCH="$branch" PROMPT="$rendered_prompt" \
   WORKTREE_DIR="$worktree_dir" WORKTREE_ROOT="$worktree_root" LOCAL_BRANCH="$local_branch" \
-  python3 -c '
+  CLAUDE_FLAG="$CLAUDE_FLAG" \
+  python3 - <<'PYEOF'
 import os, shlex
 cwd = shlex.quote(os.environ["CWD"])
 repo = shlex.quote(os.environ["REPO"])
@@ -185,6 +216,14 @@ worktree_root = shlex.quote(os.environ["WORKTREE_ROOT"])
 local_branch = shlex.quote(os.environ["LOCAL_BRANCH"])
 refspec = shlex.quote("+refs/heads/{0}:refs/remotes/origin/{0}".format(os.environ["BRANCH"]))
 origin_ref = shlex.quote("origin/" + os.environ["BRANCH"])
+# CLAUDE_FLAG is one of two fixed literals: "--dangerously-skip-permissions"
+# or "" (interactive mode). Splice unquoted so the empty string yields no
+# argument (NOT `claude '' <prompt>`, which would feed claude an empty prompt
+# arg). The two possible values have no shell metacharacters.
+claude_flag = os.environ["CLAUDE_FLAG"]
+claude_invocation = (
+    "claude " + claude_flag + " " + prompt if claude_flag else "claude " + prompt
+)
 print(f"""set -euo pipefail
 # Helper: print error + keep the Terminal window open so the user can read it.
 # Without this, `set -e` would silently exit and Terminal might close the tab.
@@ -220,8 +259,8 @@ git -C {cwd} fetch origin {refspec} || mycalfix_abort "git fetch origin failed"
 printf '[MyCalFix] creating worktree at %s\\n' {worktree_dir}
 git -C {cwd} worktree add -b {local_branch} {worktree_dir} {origin_ref} || mycalfix_abort "git worktree add failed"
 cd {worktree_dir} || mycalfix_abort "cd to worktree failed"
-claude {prompt}""")
-'
+{claude_invocation}""")
+PYEOF
 )
 
 # Write the command to a .command file and let `open -a Terminal` execute it

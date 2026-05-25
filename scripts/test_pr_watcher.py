@@ -9,6 +9,9 @@ or:
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import pr_watcher  # noqa: E402
+import mycalfix_config  # noqa: E402
 
 
 class ForceOriginCwdTests(unittest.TestCase):
@@ -1017,6 +1021,365 @@ class CodexCapConfigTests(unittest.TestCase):
         val, err = self._run('{not valid json')
         self.assertEqual(val, 10)
         self.assertIn("cannot read", err)
+
+
+class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
+    """Test mycalfix_interactive_claude knob in ~/.config/my-calendar/config.json.
+
+    Default (True) → claude_flag() returns '' (interactive — every tool call
+    asks for approval). Explicit False → returns '--dangerously-skip-permissions'
+    (yolo, the user-opted-in mode).
+
+    Fail-closed contract: missing file, missing key, malformed JSON, wrong
+    type — every error path resolves to interactive. Codex flagged the
+    previous fail-open behaviour (defaulted to yolo) as a PR #22 blocker.
+
+    Strict bool check matters: a stray `"true"` string or `1` must NOT
+    silently match — only JSON bool literals count. Otherwise an
+    accidentally-stringified config could flip the user *out* of safe mode.
+    """
+
+    def _run(self, contents: str | None) -> tuple[bool, str, str]:
+        import contextlib
+        import io as _io
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            if contents is not None:
+                cfg.write_text(contents, encoding="utf-8")
+            buf = _io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                interactive = mycalfix_config.read_interactive_claude(config_path=cfg)
+                flag = mycalfix_config.claude_flag(config_path=cfg)
+            return interactive, flag, buf.getvalue()
+
+    def test_missing_file_default_interactive_silent(self):
+        interactive, flag, err = self._run(contents=None)
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "", "default is interactive (empty flag)")
+        self.assertEqual(err, "", "missing config file should not warn")
+
+    def test_missing_key_default_interactive_silent(self):
+        interactive, flag, err = self._run('{"codex_concurrency_cap": 4}')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
+        self.assertEqual(err, "", "missing key should not warn")
+
+    def test_explicit_true_interactive(self):
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": true}')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "", "interactive mode emits empty flag")
+        self.assertEqual(err, "", "valid override should not warn")
+
+    def test_explicit_false_opts_into_yolo(self):
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": false}')
+        self.assertFalse(interactive)
+        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertEqual(err, "", "valid opt-in should not warn")
+
+    def test_string_true_rejected_fails_closed(self):
+        # "true" must NOT silently match — only JSON bool true does. Failing
+        # closed means the misconfig stays in interactive (safer) rather than
+        # accidentally upgrading to yolo.
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": "true"}')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
+        self.assertIn("not a JSON boolean", err)
+        self.assertIn("str", err)
+
+    def test_int_one_rejected_fails_closed(self):
+        # Mirrors codex_cap's strict-bool check. int(1) == True but type isn't bool.
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": 1}')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
+        self.assertIn("not a JSON boolean", err)
+        self.assertIn("int", err)
+
+    def test_int_zero_rejected_fails_closed(self):
+        # Belt-and-suspenders: 0 mustn't slip through as a JSON-bool false
+        # and silently flip the user into yolo. Strict bool check rejects it.
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": 0}')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
+        self.assertIn("not a JSON boolean", err)
+        self.assertIn("int", err)
+
+    def test_null_rejected_fails_closed(self):
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": null}')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
+        self.assertIn("not a JSON boolean", err)
+
+    def test_malformed_json_fails_closed_with_warning(self):
+        # Warn on stderr, return default (interactive) — not yolo.
+        interactive, flag, err = self._run('{not valid json')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
+        self.assertIn("cannot read", err)
+
+    def test_cli_subcommand_emits_flag(self):
+        # launch_fix.sh shells out via `python3 mycalfix_config.py claude-flag`.
+        # The CLI is the public contract; lock it. Default = empty stdout
+        # (interactive). If this ever prints --dangerously-skip-permissions
+        # under a clean HOME, the codex PR #22 blocker has regressed.
+        result = subprocess.run(
+            [sys.executable, str(HERE / "mycalfix_config.py"), "claude-flag"],
+            capture_output=True,
+            text=True,
+            check=False,
+            # Use a tmp HOME so the user's real config doesn't taint the test.
+            env={**{"PATH": "/usr/bin:/bin"}, "HOME": tempfile.mkdtemp()},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
+
+
+class InstallAppBundleManifestTests(unittest.TestCase):
+    """Regression for PR #22 blocker: launch_fix.sh references runtime helpers
+    via `$HERE/<helper>` after .app install, but install_app.sh used to only
+    bundle launch_fix.sh + parse_fix_url.py + fix_prompt.md. mycalfix_config.py
+    was missing → `python3 .../mycalfix_config.py claude-flag` failed → the
+    fail-safe in launch_fix.sh fell through to `--dangerously-skip-permissions`
+    even when the user opted into interactive mode via config.json.
+
+    These tests are static: they read install_app.sh and assert that every
+    runtime helper that launch_fix.sh expects in its directory is also
+    copy-installed and smoke-tested by the installer. They don't actually run
+    `bash install_app.sh` (which would touch ~/Applications, lsregister, and
+    tccutil)."""
+
+    INSTALLER = HERE / "install_app.sh"
+    LAUNCHER = HERE / "launch_fix.sh"
+
+    # Helpers that launch_fix.sh resolves via `$HERE/<name>` (i.e. expects to
+    # find next to itself inside the .app bundle). Update this set whenever
+    # launch_fix.sh starts shelling out to a new sibling script.
+    BUNDLED_RUNTIME_HELPERS = (
+        "launch_fix.sh",
+        "parse_fix_url.py",
+        "mycalfix_config.py",
+        "fix_prompt.md",
+    )
+
+    def test_installer_copies_each_runtime_helper_into_resources(self):
+        # Codex PR #22 follow-up suggestion: matching only `"$RESOURCES/<f>"`
+        # was too permissive — deleting the actual `cp` line but leaving the
+        # trailing `echo ... "$RESOURCES/<f> (bundled)"` confirmation would
+        # still pass. Require a real `cp <src> "$RESOURCES/<helper>"` line so
+        # an accidental deletion of the install step fails the test.
+        import re
+        installer = self.INSTALLER.read_text(encoding="utf-8")
+        for helper in self.BUNDLED_RUNTIME_HELPERS:
+            with self.subTest(helper=helper):
+                pattern = re.compile(
+                    # `cp <src> "$RESOURCES/<helper>"` — src must be one of
+                    # the variables defined at the top of install_app.sh.
+                    # No leading anchor so indentation is irrelevant.
+                    r'(?m)^[ \t]*cp[ \t]+"?\$[A-Za-z_][A-Za-z_0-9]*"?[ \t]+'
+                    r'"\$RESOURCES/' + re.escape(helper) + r'"[ \t]*$'
+                )
+                self.assertRegex(
+                    installer, pattern,
+                    f"install_app.sh must contain a literal "
+                    f"`cp <var> \"$RESOURCES/{helper}\"` line so the helper "
+                    f"is actually copied into the .app bundle at install "
+                    f"time. Just mentioning the path in an echo/comment is "
+                    f"not enough — it reproduces the PR #22 blocker (silent "
+                    f"interactive→yolo downgrade when helper is missing).",
+                )
+
+    def test_installer_smoke_tests_bundled_config_helper(self):
+        # The fail-safe in launch_fix.sh now fails CLOSED to interactive when
+        # the bundled helper is missing/broken — but installer-time validation
+        # is still worth keeping: a bundle that silently can't run the config
+        # helper means the `mycalfix_interactive_claude: false` opt-in never
+        # takes effect for that user. Catch that at install rather than at
+        # runtime (where the misbehaviour is invisible).
+        installer = self.INSTALLER.read_text(encoding="utf-8")
+        section = (
+            installer.split("smoke-testing bundled config helper", 1)[-1][:1500]
+            if "smoke-testing bundled config helper" in installer
+            else ""
+        )
+        self.assertIn(
+            "mycalfix_config.py", section,
+            "install_app.sh must smoke-test the bundled mycalfix_config.py "
+            "(invoke `claude-flag` from a clean HOME) so a copy regression "
+            "fails the install rather than silently shipping a bundle whose "
+            "config helper can't be invoked at click-time.",
+        )
+        self.assertIn(
+            "claude-flag", section,
+            "smoke-test must call the public `claude-flag` CLI subcommand "
+            "(that's what launch_fix.sh shells out to) rather than just "
+            "importing the module — only the CLI path is the real contract.",
+        )
+
+    def test_launcher_references_match_bundled_manifest(self):
+        # Belt-and-suspenders: any `"$HERE/<file>"` reference in launch_fix.sh
+        # must be in BUNDLED_RUNTIME_HELPERS (otherwise we have a runtime
+        # dependency the installer doesn't know about). This catches the
+        # reverse mistake — adding a new helper to launch_fix.sh without
+        # extending the bundle manifest.
+        import re
+        launcher = self.LAUNCHER.read_text(encoding="utf-8")
+        # Match $HERE/<filename> with extension. Allow letters, digits, _ - .
+        referenced = set(re.findall(r'\$HERE/([A-Za-z0-9_.\-]+\.[A-Za-z0-9]+)', launcher))
+        # launch_fix.sh itself is the launcher; it doesn't reference itself
+        # via $HERE, but the bundle still contains it. Drop from comparison.
+        expected = set(self.BUNDLED_RUNTIME_HELPERS) - {"launch_fix.sh"}
+        unknown = referenced - expected
+        self.assertFalse(
+            unknown,
+            f"launch_fix.sh references helpers that aren't in the bundle "
+            f"manifest: {sorted(unknown)}. Add them to "
+            f"InstallAppBundleManifestTests.BUNDLED_RUNTIME_HELPERS *and* "
+            f"to scripts/install_app.sh.",
+        )
+
+
+class LaunchFixCommandFileRenderTests(unittest.TestCase):
+    """Regression test for issue #25 / PR #19. The .command file body is
+    built by embedding a python source inside `python3 -c '<source>'`. PR #19
+    rewrote that python source from a parts[]+`\\x27` builder into an
+    f-string that contains many *literal* single quotes (printf '...', sed
+    -E 's|...'). Those literal quotes closed bash's outer single-quoted
+    string after the first `'` inside the python source, leaving the rest
+    (including `s|(\\.git)?/*$||`) as unquoted shell tokens. bash aborted
+    the command substitution with `syntax error near unexpected token ?/*$'`,
+    the .command file was never written, and Terminal never launched.
+
+    Crucially, `bash -n scripts/launch_fix.sh` did NOT catch it — bash's
+    static parser doesn't peer inside `$(...)` bodies. The regression was
+    invisible until the user clicked a real `mycalfix://` URL.
+
+    This test drives launch_fix.sh end-to-end with a valid URL, stubs `open`
+    so Terminal is never actually launched, captures the path of the
+    generated .command file, and asserts (a) launch_fix.sh exited 0,
+    (b) the .command file parses as bash, (c) marker strings from the
+    renderer's output are present (catches the failure mode where the
+    python source breaks but `cmd=` still ends up empty/partial).
+    """
+
+    LAUNCHER = HERE / "launch_fix.sh"
+
+    # URL chosen to satisfy parse_fix_url.py: matching pr+comment repos,
+    # non-empty branch, origin_cwd present so the picker doesn't fire.
+    SMOKE_URL = (
+        "mycalfix://fix?"
+        "repo=foo%2Fbar"
+        "&branch=feat%2Fdummy"
+        "&comment=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1%23issuecomment-1"
+        "&pr=https%3A%2F%2Fgithub.com%2Ffoo%2Fbar%2Fpull%2F1"
+        "&origin_cwd=%2Ftmp"
+    )
+
+    def _run_launcher_with_stubbed_open(self):
+        """Run launch_fix.sh with a fake `open` on PATH that records the
+        .command file path instead of launching Terminal. Returns
+        (returncode, stdout, stderr, captured_command_path_or_None)."""
+        tmphome = Path(tempfile.mkdtemp(prefix="mycalfix-smoke-home-"))
+        try:
+            stub_dir = tmphome / "bin"
+            stub_dir.mkdir()
+            captured = tmphome / "captured.txt"
+            stub = stub_dir / "open"
+            # `open -a Terminal <file>` — record the final arg (the .command
+            # path). `${!#}` indirectly indexes the last positional arg.
+            stub.write_text(
+                "#!/bin/bash\n"
+                f'printf "%s" "${{!#}}" > {shlex.quote(str(captured))}\n'
+                "exit 0\n"
+            )
+            stub.chmod(0o755)
+            env = os.environ.copy()
+            env["HOME"] = str(tmphome)
+            env["PATH"] = f"{stub_dir}{os.pathsep}{env.get('PATH', '')}"
+            result = subprocess.run(
+                ["bash", str(self.LAUNCHER), self.SMOKE_URL],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            captured_path = None
+            if captured.exists():
+                raw = captured.read_text(encoding="utf-8").strip()
+                if raw:
+                    captured_path = Path(raw)
+            return result, captured_path
+        finally:
+            shutil.rmtree(tmphome, ignore_errors=True)
+
+    def test_launcher_exits_zero_and_writes_command_file(self):
+        result, cmd_path = self._run_launcher_with_stubbed_open()
+        self.assertEqual(
+            result.returncode, 0,
+            f"launch_fix.sh exited {result.returncode} — likely a quoting "
+            f"regression inside the python heredoc (see issue #25). "
+            f"`bash -n` won't catch this; only end-to-end execution does.\n"
+            f"--- stderr ---\n{result.stderr}\n"
+            f"--- stdout ---\n{result.stdout}",
+        )
+        self.assertIsNotNone(
+            cmd_path,
+            "stub `open` was never invoked — launch_fix.sh aborted before "
+            "reaching `open -a Terminal`.\n"
+            f"--- stderr ---\n{result.stderr}",
+        )
+        self.assertTrue(
+            cmd_path.is_file(),
+            f"recorded .command path does not exist on disk: {cmd_path}",
+        )
+
+    def test_command_file_parses_as_bash(self):
+        result, cmd_path = self._run_launcher_with_stubbed_open()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNotNone(cmd_path)
+        check = subprocess.run(
+            ["bash", "-n", str(cmd_path)],
+            capture_output=True, text=True,
+        )
+        body = cmd_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            check.returncode, 0,
+            f"`bash -n` rejected the rendered .command file:\n"
+            f"--- bash -n stderr ---\n{check.stderr}\n"
+            f"--- .command body ---\n{body}",
+        )
+
+    def test_command_file_contains_renderer_output(self):
+        # Belt-and-suspenders: even if launch_fix.sh exits 0 and bash -n
+        # passes, the python heredoc might silently emit an empty/partial
+        # cmd (e.g. command substitution swallowed an error). Marker
+        # assertions catch that — these strings only appear if the python
+        # source ran to completion and printed the full Terminal recipe.
+        _, cmd_path = self._run_launcher_with_stubbed_open()
+        self.assertIsNotNone(cmd_path)
+        body = cmd_path.read_text(encoding="utf-8")
+        for marker in (
+            "mycalfix_abort",            # error helper function rendered
+            "actual_repo=",              # remote-validation gate present
+            "git worktree add",          # worktree-creation step present
+            "claude '",                  # claude invocation rendered (single-quoted prompt arg)
+        ):
+            self.assertIn(
+                marker, body,
+                f"marker {marker!r} missing from rendered .command body. "
+                f"The python heredoc silently produced an empty/partial "
+                f"string — likely an issue-#25-style quoting regression.\n"
+                f"--- body ---\n{body}",
+            )
+        # Codex PR #22 blocker regression guard: default render must NOT
+        # include the yolo flag. The user opts into yolo by writing
+        # `mycalfix_interactive_claude: false`; a stub `open` test with no
+        # config file must produce the safe (interactive) invocation.
+        self.assertNotIn(
+            "--dangerously-skip-permissions", body,
+            "default .command body must launch claude in interactive mode. "
+            "If --dangerously-skip-permissions appears here, the safe-by-"
+            "default contract from PR #22 has regressed.\n"
+            f"--- body ---\n{body}",
+        )
 
 
 class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):
