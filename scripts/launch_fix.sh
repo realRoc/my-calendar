@@ -44,14 +44,18 @@ PROMPT_FILE="$HERE/fix_prompt.md"
 MYCALFIX_CONFIG="$HERE/mycalfix_config.py"
 mkdir -p "$LOG_DIR"
 
-# Read claude CLI flag from ~/.config/my-calendar/config.json. Default value
-# is `--dangerously-skip-permissions` (yolo mode in the disposable worktree);
-# set `mycalfix_interactive_claude: true` to fall back to per-tool approval.
-# Fail-safe to the yolo default if the helper is missing/broken so a partial
-# install doesn't downgrade UX silently.
+# Read claude CLI flag from ~/.config/my-calendar/config.json. Default is
+# empty (interactive: each tool call asks for approval); set
+# `mycalfix_interactive_claude: false` to opt into
+# `--dangerously-skip-permissions` (yolo) in the disposable worktree.
+#
+# Fail-CLOSED: if the helper is missing or crashes, fall back to interactive
+# (empty flag). A partial install or a broken helper must NOT silently
+# upgrade the click to no-approval tool execution — codex flagged the
+# previous fail-open behaviour as a blocker on PR #22.
 if ! CLAUDE_FLAG=$(python3 "$MYCALFIX_CONFIG" claude-flag 2>>"$LOG_FILE"); then
-  CLAUDE_FLAG="--dangerously-skip-permissions"
-  echo "  warn: mycalfix_config.py failed; defaulting CLAUDE_FLAG=$CLAUDE_FLAG" >> "$LOG_FILE"
+  CLAUDE_FLAG=""
+  echo "  warn: mycalfix_config.py failed; failing CLOSED to interactive (CLAUDE_FLAG empty)" >> "$LOG_FILE"
 fi
 # Trim trailing newline from the python output.
 CLAUDE_FLAG="${CLAUDE_FLAG%$'\n'}"

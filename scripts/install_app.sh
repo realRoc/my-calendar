@@ -92,10 +92,10 @@ fi
 
 # Smoke-test the bundled config helper exactly the way launch_fix.sh calls it.
 # Use a clean HOME so the user's real ~/.config/my-calendar/config.json doesn't
-# influence the assertion. Default contract: `claude-flag` prints
-# `--dangerously-skip-permissions` (yolo). If the helper isn't bundled, this
-# would print nothing and launch_fix.sh would fall back silently — breaking
-# the `mycalfix_interactive_claude: true` safety valve. Catch it at install.
+# influence the assertion. Default contract: `claude-flag` prints the empty
+# string (interactive — claude asks for approval on every tool call). If the
+# helper isn't bundled or emits the yolo flag by default, launch_fix.sh would
+# silently upgrade every click to no-approval execution. Catch it at install.
 echo "  → smoke-testing bundled config helper"
 CONFIG_TMP_HOME=$(mktemp -d)
 if ! cfg_out=$(HOME="$CONFIG_TMP_HOME" python3 "$RESOURCES/mycalfix_config.py" claude-flag 2>&1); then
@@ -104,9 +104,9 @@ if ! cfg_out=$(HOME="$CONFIG_TMP_HOME" python3 "$RESOURCES/mycalfix_config.py" c
   exit 3
 fi
 rm -rf "$CONFIG_TMP_HOME"
-if [[ "$(printf '%s' "$cfg_out" | tr -d '[:space:]')" != "--dangerously-skip-permissions" ]]; then
+if [[ -n "$(printf '%s' "$cfg_out" | tr -d '[:space:]')" ]]; then
   echo "✗ bundled mycalfix_config.py emitted unexpected claude-flag: $cfg_out" >&2
-  echo "  (expected '--dangerously-skip-permissions' under a clean HOME)" >&2
+  echo "  (expected empty string under a clean HOME — interactive is the safe default)" >&2
   exit 3
 fi
 

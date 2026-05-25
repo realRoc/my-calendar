@@ -1026,11 +1026,17 @@ class CodexCapConfigTests(unittest.TestCase):
 class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
     """Test mycalfix_interactive_claude knob in ~/.config/my-calendar/config.json.
 
-    Default (False) → claude_flag() returns '--dangerously-skip-permissions'.
-    Explicit True   → returns '' (interactive mode).
+    Default (True) → claude_flag() returns '' (interactive — every tool call
+    asks for approval). Explicit False → returns '--dangerously-skip-permissions'
+    (yolo, the user-opted-in mode).
 
-    Strict bool check matters: a stray `"true"` string or `1` must NOT silently
-    flip the flag, since flipping = "claude runs without per-tool approval".
+    Fail-closed contract: missing file, missing key, malformed JSON, wrong
+    type — every error path resolves to interactive. Codex flagged the
+    previous fail-open behaviour (defaulted to yolo) as a PR #22 blocker.
+
+    Strict bool check matters: a stray `"true"` string or `1` must NOT
+    silently match — only JSON bool literals count. Otherwise an
+    accidentally-stringified config could flip the user *out* of safe mode.
     """
 
     def _run(self, contents: str | None) -> tuple[bool, str, str]:
@@ -1046,16 +1052,16 @@ class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
                 flag = mycalfix_config.claude_flag(config_path=cfg)
             return interactive, flag, buf.getvalue()
 
-    def test_missing_file_default_yolo_silent(self):
+    def test_missing_file_default_interactive_silent(self):
         interactive, flag, err = self._run(contents=None)
-        self.assertFalse(interactive)
-        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "", "default is interactive (empty flag)")
         self.assertEqual(err, "", "missing config file should not warn")
 
-    def test_missing_key_default_yolo_silent(self):
+    def test_missing_key_default_interactive_silent(self):
         interactive, flag, err = self._run('{"codex_concurrency_cap": 4}')
-        self.assertFalse(interactive)
-        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
         self.assertEqual(err, "", "missing key should not warn")
 
     def test_explicit_true_interactive(self):
@@ -1064,43 +1070,57 @@ class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
         self.assertEqual(flag, "", "interactive mode emits empty flag")
         self.assertEqual(err, "", "valid override should not warn")
 
-    def test_explicit_false_yolo(self):
+    def test_explicit_false_opts_into_yolo(self):
         interactive, flag, err = self._run('{"mycalfix_interactive_claude": false}')
         self.assertFalse(interactive)
         self.assertEqual(flag, "--dangerously-skip-permissions")
-        self.assertEqual(err, "")
+        self.assertEqual(err, "", "valid opt-in should not warn")
 
-    def test_string_true_rejected(self):
-        # "true" must NOT silently enable interactive — only JSON bool true does.
+    def test_string_true_rejected_fails_closed(self):
+        # "true" must NOT silently match — only JSON bool true does. Failing
+        # closed means the misconfig stays in interactive (safer) rather than
+        # accidentally upgrading to yolo.
         interactive, flag, err = self._run('{"mycalfix_interactive_claude": "true"}')
-        self.assertFalse(interactive)
-        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
         self.assertIn("not a JSON boolean", err)
         self.assertIn("str", err)
 
-    def test_int_one_rejected(self):
+    def test_int_one_rejected_fails_closed(self):
         # Mirrors codex_cap's strict-bool check. int(1) == True but type isn't bool.
         interactive, flag, err = self._run('{"mycalfix_interactive_claude": 1}')
-        self.assertFalse(interactive)
-        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
         self.assertIn("not a JSON boolean", err)
         self.assertIn("int", err)
 
-    def test_null_rejected(self):
+    def test_int_zero_rejected_fails_closed(self):
+        # Belt-and-suspenders: 0 mustn't slip through as a JSON-bool false
+        # and silently flip the user into yolo. Strict bool check rejects it.
+        interactive, flag, err = self._run('{"mycalfix_interactive_claude": 0}')
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
+        self.assertIn("not a JSON boolean", err)
+        self.assertIn("int", err)
+
+    def test_null_rejected_fails_closed(self):
         interactive, flag, err = self._run('{"mycalfix_interactive_claude": null}')
-        self.assertFalse(interactive)
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
         self.assertIn("not a JSON boolean", err)
 
-    def test_malformed_json_falls_back_silently_to_default(self):
-        # Same contract as codex_cap: warn on stderr, return default (yolo).
+    def test_malformed_json_fails_closed_with_warning(self):
+        # Warn on stderr, return default (interactive) — not yolo.
         interactive, flag, err = self._run('{not valid json')
-        self.assertFalse(interactive)
-        self.assertEqual(flag, "--dangerously-skip-permissions")
+        self.assertTrue(interactive)
+        self.assertEqual(flag, "")
         self.assertIn("cannot read", err)
 
     def test_cli_subcommand_emits_flag(self):
         # launch_fix.sh shells out via `python3 mycalfix_config.py claude-flag`.
-        # The CLI is the public contract; lock it.
+        # The CLI is the public contract; lock it. Default = empty stdout
+        # (interactive). If this ever prints --dangerously-skip-permissions
+        # under a clean HOME, the codex PR #22 blocker has regressed.
         result = subprocess.run(
             [sys.executable, str(HERE / "mycalfix_config.py"), "claude-flag"],
             capture_output=True,
@@ -1110,7 +1130,7 @@ class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
             env={**{"PATH": "/usr/bin:/bin"}, "HOME": tempfile.mkdtemp()},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "--dangerously-skip-permissions")
+        self.assertEqual(result.stdout.strip(), "")
 
 
 class InstallAppBundleManifestTests(unittest.TestCase):
@@ -1141,34 +1161,58 @@ class InstallAppBundleManifestTests(unittest.TestCase):
     )
 
     def test_installer_copies_each_runtime_helper_into_resources(self):
+        # Codex PR #22 follow-up suggestion: matching only `"$RESOURCES/<f>"`
+        # was too permissive — deleting the actual `cp` line but leaving the
+        # trailing `echo ... "$RESOURCES/<f> (bundled)"` confirmation would
+        # still pass. Require a real `cp <src> "$RESOURCES/<helper>"` line so
+        # an accidental deletion of the install step fails the test.
+        import re
         installer = self.INSTALLER.read_text(encoding="utf-8")
         for helper in self.BUNDLED_RUNTIME_HELPERS:
             with self.subTest(helper=helper):
-                self.assertIn(
-                    f'"$RESOURCES/{helper}"',
-                    installer,
-                    f"install_app.sh must copy {helper} into the .app bundle "
-                    f"so launch_fix.sh can find it at runtime. Missing copy "
-                    f"reproduces PR #22 blocker (silent yolo-mode fallback).",
+                pattern = re.compile(
+                    # `cp <src> "$RESOURCES/<helper>"` — src must be one of
+                    # the variables defined at the top of install_app.sh.
+                    # No leading anchor so indentation is irrelevant.
+                    r'(?m)^[ \t]*cp[ \t]+"?\$[A-Za-z_][A-Za-z_0-9]*"?[ \t]+'
+                    r'"\$RESOURCES/' + re.escape(helper) + r'"[ \t]*$'
+                )
+                self.assertRegex(
+                    installer, pattern,
+                    f"install_app.sh must contain a literal "
+                    f"`cp <var> \"$RESOURCES/{helper}\"` line so the helper "
+                    f"is actually copied into the .app bundle at install "
+                    f"time. Just mentioning the path in an echo/comment is "
+                    f"not enough — it reproduces the PR #22 blocker (silent "
+                    f"interactive→yolo downgrade when helper is missing).",
                 )
 
     def test_installer_smoke_tests_bundled_config_helper(self):
-        # The fail-safe in launch_fix.sh swallows a missing/broken helper and
-        # defaults to yolo, which is exactly what made the original blocker
-        # invisible to the user. Make the installer reject that state at
-        # install-time so a regression can't ship silently again.
+        # The fail-safe in launch_fix.sh now fails CLOSED to interactive when
+        # the bundled helper is missing/broken — but installer-time validation
+        # is still worth keeping: a bundle that silently can't run the config
+        # helper means the `mycalfix_interactive_claude: false` opt-in never
+        # takes effect for that user. Catch that at install rather than at
+        # runtime (where the misbehaviour is invisible).
         installer = self.INSTALLER.read_text(encoding="utf-8")
-        self.assertIn(
-            "mycalfix_config.py",
+        section = (
             installer.split("smoke-testing bundled config helper", 1)[-1][:1500]
             if "smoke-testing bundled config helper" in installer
-            else "",
-            "install_app.sh must smoke-test the bundled mycalfix_config.py "
-            "(invoke `claude-flag` and assert the default flag) so a copy "
-            "regression fails the install rather than silently downgrading "
-            "to yolo mode at runtime.",
+            else ""
         )
-        self.assertIn("--dangerously-skip-permissions", installer)
+        self.assertIn(
+            "mycalfix_config.py", section,
+            "install_app.sh must smoke-test the bundled mycalfix_config.py "
+            "(invoke `claude-flag` from a clean HOME) so a copy regression "
+            "fails the install rather than silently shipping a bundle whose "
+            "config helper can't be invoked at click-time.",
+        )
+        self.assertIn(
+            "claude-flag", section,
+            "smoke-test must call the public `claude-flag` CLI subcommand "
+            "(that's what launch_fix.sh shells out to) rather than just "
+            "importing the module — only the CLI path is the real contract.",
+        )
 
     def test_launcher_references_match_bundled_manifest(self):
         # Belt-and-suspenders: any `"$HERE/<file>"` reference in launch_fix.sh
@@ -1316,7 +1360,7 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
             "mycalfix_abort",            # error helper function rendered
             "actual_repo=",              # remote-validation gate present
             "git worktree add",          # worktree-creation step present
-            "claude --dangerously-skip-permissions ",  # claude invocation w/ default flag
+            "claude '",                  # claude invocation rendered (single-quoted prompt arg)
         ):
             self.assertIn(
                 marker, body,
@@ -1325,6 +1369,17 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
                 f"string — likely an issue-#25-style quoting regression.\n"
                 f"--- body ---\n{body}",
             )
+        # Codex PR #22 blocker regression guard: default render must NOT
+        # include the yolo flag. The user opts into yolo by writing
+        # `mycalfix_interactive_claude: false`; a stub `open` test with no
+        # config file must produce the safe (interactive) invocation.
+        self.assertNotIn(
+            "--dangerously-skip-permissions", body,
+            "default .command body must launch claude in interactive mode. "
+            "If --dangerously-skip-permissions appears here, the safe-by-"
+            "default contract from PR #22 has regressed.\n"
+            f"--- body ---\n{body}",
+        )
 
 
 class SlotTimeoutDoesNotOrphanRunningSidecarTests(unittest.TestCase):
