@@ -55,7 +55,9 @@ gh api -H "Accept: application/vnd.github+json" \
 
 - commit message 格式：`fix(review): <一句话总结这次修了什么 blocker>`
   - 例：`fix(review): chmod +x hook when cmp -s skips deploy`
-- 在 commit message body 里贴 `Reviewed-Comment: {comment_url}` 一行（方便回溯）
+- commit message body 里**必须**包含：
+  - `Reviewed-Comment: {comment_url}` —— 方便回溯到触发本次 fix 的 review 评论
+  - `Co-Authored-By: Claude <noreply@anthropic.com>` —— Claude Code 默认会自动加，但若编辑器或 hook 把它吃掉了，请手动补回来。这条 trailer 是仓库"AI 共著"标记的一部分（与 pr_prompt.md 顶部的 `> 🤖 由 Codex 自动生成 ...` 块互为镜像），下游的人类活跃度统计依赖它来识别 MyCalFix 起的修复 commit
 - push **必须**用：`git push origin HEAD:{branch}`
   - 你本地分支叫 `{local_branch}`（带时间戳），跟远端 `{branch}` 不同名。直接 `git push` 会推到错的 remote ref。
   - **不要** `--force-with-lease` / `--force`；同分支 fast-forward

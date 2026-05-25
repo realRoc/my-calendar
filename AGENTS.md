@@ -392,6 +392,45 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 ---
 
+## AI 共著标记约定（issue #18）
+
+本仓库所有"AI 自动生成、人类未介入"的产物在 GitHub 上**必须**带可机器识别的共著标记。GitHub 没有 first-class 的"共著评论"概念（commit 里有 `Co-Authored-By:` trailer，但评论里没有），所以靠**约定的 footer / 头部标记**+ prompt 模板硬约束实现。
+
+### 三个落点
+
+| 产物 | 标记位置 | 规范文本 |
+|---|---|---|
+| codex 通过 pr_watcher 发的 PR review 评论 | 评论 body **第一行** | <pre>> 🤖 由 Codex 自动生成（pr_watcher 触发，无人工干预）· 本仓库所有者未介入此条评论的撰写<br>&lt;!-- ai-coauthor: codex; agent: pr_watcher; mode: automated --&gt;</pre> |
+| claude 通过 MyCalFix 起的修复 commit | commit message body | `Co-Authored-By: Claude <noreply@anthropic.com>`（Claude Code 默认自动加，fix_prompt.md 强制保留） |
+| 手敲的、纯人类 PR / 评论 | 无标记 | — |
+
+### 为什么 codex 评论用 blockquote + HTML 注释两层
+
+- **blockquote**（可见）让 GitHub 上看到评论的人立刻知道这条不是手敲的——避免外人误以为我亲自写了 30 个文件的 review
+- **HTML 注释**（GitHub 渲染时不显示）给未来的扫描器一个**稳定的 grep key**：`<!-- ai-coauthor: ...`。下游 dashboard（issue #17）可以靠这一行做精确 bucket，不用解析中文 emoji 文本
+- 两个都丢掉的话，统计就会把 AI 评论错算成人类活跃度
+
+### 为什么 MyCalFix 修复 commit 用 `Co-Authored-By:`
+
+- GitHub 原生识别这个 trailer：commit 页面会显示两个头像
+- Claude Code 默认会自动加；fix_prompt.md 第四步显式要求保留，防 hook / 编辑器吃掉
+- 与 pr_prompt.md 的 blockquote 标记互为镜像——一个标记 PR 评论，一个标记 PR commits，#17 dashboard 可以从两个数据源交叉验证
+
+### prompt 模板的硬约束
+
+- `scripts/pr_prompt.md` 第 4 步要求 codex 在评论 body **第一行**就 emit 这两行（原样照抄，包括 HTML 注释），下面才允许空一行 + 正文
+- `scripts/fix_prompt.md` 第 4 步要求 commit message body 同时包含 `Reviewed-Comment:` 和 `Co-Authored-By: Claude` 两条 trailer，并解释这是与 pr_prompt.md 镜像的同一套约定
+
+### 测试守门
+
+`scripts/test_pr_watcher.py::AICoAuthorMarkerContractTests` 锁住两个 prompt 文件的 canonical 字符串：blockquote、HTML metadata、`Co-Authored-By:` trailer、以及 pr_prompt.md 里"marker 必须先于 section 规则出现"的结构断言。任何编辑 prompt 时把这些字符串拼错或挪到末尾，测试都会红。
+
+### 老评论怎么办
+
+不动。向前生效。历史评论保持原样，#17 dashboard 的人类活跃度统计应该从启用日（PR #23 land 起）开始算才干净。
+
+---
+
 ## PR review 修复入口（MyCalFix.app + mycalfix:// URL scheme）
 
 第三条独立功能：codex 写了 review 之后，从日历事件直接一键起本地 `claude` 修复会话，不用手 cd / checkout / 拷链接。

@@ -13,6 +13,15 @@
    - **可优化建议**：可读性、命名、潜在 bug、重复代码、缺失测试等真正有价值的修改建议。没有就略过，不要凑数。
 
 4. **发布评论**：用 `gh pr comment {pr_link} --body "..."` 把 review 结果发到 PR 上。评论格式遵循"按需出现、简洁优先"：
+   - **评论 body 的第一行必须是下面这段 AI 共著标记（原样照抄，包括 HTML 注释）**——下游的"人类活跃度"统计依赖这两行识别 AI 自动产物，不允许省略、改写、翻译或挪到末尾：
+
+     ```
+     > 🤖 由 Codex 自动生成（pr_watcher 触发，无人工干预）· 本仓库所有者未介入此条评论的撰写
+     <!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->
+     ```
+
+     （HTML 注释行在 GitHub 上不显示，但保留它——机器扫描会读它来分桶）
+   - 标记块之后空一行，再写评论正文。
    - **章节按内容是否存在决定写不写**，不要硬塞空节：
      - 有 blocker → 写 `## Blocker / 必须修正` 并列出具体问题；没有 blocker 就**整节省略**。
      - 有真实的成本 / 资源影响 → 写 `## 成本与资源影响`，针对此 PR 实际涉及的维度评估，给一句话资源结论；没有就**整节省略**。
@@ -24,7 +33,6 @@
      - `结论：⚠️ 修正后可合并`
      - `结论：❌ 暂不可合并（存在 blocker）`
    - 判定规则：`## Blocker / 必须修正` 这一节存在且有内容 → "存在 blocker"；该节被省略 → "未发现 blocker"。
-   - 评论末尾加一行小字：`_— 由 codex cowork 自动生成_`
 
 5. 评论发送成功后，**在你的最终回复中只打印一行**：评论的 HTML URL（形如 `https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`）。如果 `gh pr comment` 的输出已经给出这个 URL，直接复述即可；如果没有，用 `gh api repos/<owner>/<repo>/issues/<n>/comments --jq '.[-1].html_url'` 拿到。
 
