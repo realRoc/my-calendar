@@ -2108,5 +2108,84 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
         self.assertIn("AI 共著", body)
 
 
+class AcquireCodexSlotHonoursCancelMarkerTests(unittest.TestCase):
+    """Real-flock-loop coverage: acquire_codex_slot's poll loop must check
+    the cancel marker each cycle and return None when present. The e2e test
+    below mocks acquire_codex_slot, so without this we wouldn't catch a
+    regression where the marker check is dropped from the slot function."""
+
+    def test_saturated_slots_with_marker_returns_none_promptly(self):
+        import fcntl as _fcntl
+        import time as _time
+        with tempfile.TemporaryDirectory() as td:
+            lock_dir = Path(td) / "locks"
+            lock_dir.mkdir()
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "CODEX_CONCURRENCY_CAP", 1), \
+                    mock.patch.object(pr_watcher, "CODEX_SLOT_POLL_SEC", 0.05):
+                held = os.open(str(lock_dir / "codex-slot-1.lock"),
+                               os.O_CREAT | os.O_WRONLY, 0o644)
+                _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                marker = lock_dir / "x_y_pull_1.cancel"
+                marker.touch()
+                t0 = _time.time()
+                try:
+                    result = pr_watcher.acquire_codex_slot(
+                        timeout_sec=30.0, cancel_marker=marker,
+                    )
+                finally:
+                    pr_watcher.release_lock_fd(held)
+                elapsed = _time.time() - t0
+            self.assertIsNone(result)
+            self.assertLess(elapsed, 2.0,
+                            f"slot wait must bail on marker quickly (got {elapsed:.2f}s)")
+
+
+class RunCodexSlotWaitCancelTests(unittest.TestCase):
+    """E2E: cancel marker present at slot-acquire MUST short-circuit run_codex
+    with cancelled=True, no codex spawned, no .running sidecar, marker
+    consumed, forensic JSONL written. The broken pre-fix path would either
+    spawn codex anyway or raise RuntimeError as if it timed out."""
+
+    def test_marker_during_slot_wait_short_circuits_with_cancelled(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/27",
+            number=27, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"; log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"; lock_dir.mkdir()
+            cancel_marker = lock_dir / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+            cancel_marker.touch()
+            popen_calls = []
+
+            def fake_acquire(*, timeout_sec=300.0, cancel_marker=None):
+                # Real function honours marker; stub mirrors that contract.
+                if cancel_marker is not None and cancel_marker.exists():
+                    return None
+                raise AssertionError("stub should only be hit on cancel path")
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher.subprocess, "Popen",
+                                      lambda *a, **k: popen_calls.append(a) or (_ for _ in ()).throw(AssertionError("no codex"))), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", fake_acquire):
+                result = pr_watcher.run_codex("prompt-text", pr)
+
+            self.assertTrue(result.cancelled)
+            self.assertEqual(popen_calls, [])
+            self.assertFalse(cancel_marker.exists(), "marker MUST be consumed")
+            self.assertEqual(list(log_dir.glob("*.running")), [],
+                             "no .running sidecar on slot-cancel path")
+            self.assertIn("cancelled_in_slot_wait",
+                          result.jsonl_path.read_text(encoding="utf-8"))
+
 if __name__ == "__main__":
     unittest.main()

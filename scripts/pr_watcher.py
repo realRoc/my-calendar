@@ -291,7 +291,11 @@ def release_lock_fd(fd: int) -> None:
         pass
 
 
-def acquire_codex_slot(*, timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC) -> tuple[int, int] | None:
+def acquire_codex_slot(
+    *,
+    timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC,
+    cancel_marker: Path | None = None,
+) -> tuple[int, int] | None:
     """Acquire one of CODEX_CONCURRENCY_CAP global codex slots.
 
     Caps how many codex executions can run at once across ALL PRs. Without
@@ -300,7 +304,15 @@ def acquire_codex_slot(*, timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC) -> tuple[
 
     Returns (fd, slot_number) on success (caller must release_lock_fd(fd) when
     done), or None on timeout. Polls every CODEX_SLOT_POLL_SEC; waiting is
-    quiet after the first "all slots busy" notice."""
+    quiet after the first "all slots busy" notice.
+
+    If `cancel_marker` is given (the per-PR `.cancel` Path), the wait loop
+    polls for the marker each cycle and returns None as soon as it appears.
+    Required for issue #26's cancel + restart contract: without it, a new
+    --force on the same PR would wait the full 90s for the per-PR lock
+    while the leader sits in slot-wait under UNRELATED-PR saturation, then
+    silently give up. Callers distinguish timeout vs cancel by inspecting
+    `cancel_marker` after a None return (see run_codex)."""
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + timeout_sec
     announced_wait = False
@@ -312,6 +324,15 @@ def acquire_codex_slot(*, timeout_sec: float = CODEX_SLOT_TIMEOUT_SEC) -> tuple[
                 return fd, n
             except BlockingIOError:
                 os.close(fd)
+        # Cancellable wait: bail immediately on marker so per-PR lock is
+        # released and the new --force can restart against the latest sha.
+        # Marker consumption is the caller's job (same as the watcher thread).
+        if cancel_marker is not None:
+            try:
+                if cancel_marker.exists():
+                    return None
+            except OSError:
+                pass
         if not announced_wait:
             print(
                 f"      all {CODEX_CONCURRENCY_CAP} codex slots busy, waiting up to "
@@ -627,8 +648,43 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     # is already held by the caller, so same-PR is serialised; this cap
     # protects the box from unbounded codex fan-out across UNRELATED PRs
     # (CPU/network/$LLM cost).
-    slot = acquire_codex_slot()
+    #
+    # cancel_marker makes slot-wait itself cancellable: a fresh --force on
+    # this PR can write the marker to interrupt our wait. Without this,
+    # saturated slots from UNRELATED PRs would pin the per-PR lock for up
+    # to 30min and break issue #26's cancel + restart contract.
+    slot = acquire_codex_slot(cancel_marker=cancel_marker)
     if slot is None:
+        # None from acquire means timeout OR cancel-during-wait. The marker
+        # is the disambiguator: if it's still there, treat as cancel and
+        # consume it (same contract the watcher honours mid-run).
+        cancelled_in_slot_wait = False
+        try:
+            cancelled_in_slot_wait = cancel_marker.exists()
+        except OSError:
+            pass
+        if cancelled_in_slot_wait:
+            try:
+                cancel_marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                jsonl_path.write_text(
+                    '{"type":"_killed_by_watcher","reason":"cancelled_in_slot_wait"}\n',
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            # Short-circuit: no codex spawned, no .running sidecar written.
+            # process_pr's cancelled branch rmtree's the (empty) scratch dir.
+            return CodexResult(
+                thread_id=None,
+                last_message="",
+                exit_code=-1,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=True,
+            )
         raise RuntimeError(
             f"codex concurrency cap ({CODEX_CONCURRENCY_CAP}) saturated for "
             f">{CODEX_SLOT_TIMEOUT_SEC}s; aborting this run"
