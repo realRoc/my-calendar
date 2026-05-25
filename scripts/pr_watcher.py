@@ -219,23 +219,44 @@ def _pr_cancel_path(pr_url: str) -> Path:
     return LOCK_DIR / f"{_pr_safe_id(pr_url)}.cancel"
 
 
-def clear_stale_cancel_marker(pr_url: str) -> None:
-    """Drop any leftover cancel marker for this PR. MUST be called only by
-    the holder of the per-PR lock, and ONLY at lock-acquisition time.
+def clear_stale_cancel_marker(pr_url: str, before_ns: int) -> None:
+    """Drop any cancel marker whose mtime predates `before_ns`. MUST be called
+    by the holder of the per-PR lock, and ONLY at lock-acquisition time.
 
-    Why the restriction matters: the marker is the contract between a new
-    --force and the current leader's watcher. A new --force that fails to
-    grab the lock writes the marker via signal_cancel_and_wait_for_lock();
-    the current leader's watcher must observe it and kill its codex run.
-    If anyone other than "the holder, at acquisition time" clears the marker
-    — e.g. clearing it again later, in run_codex(), after a new --force has
-    already written its cancel signal — that cancel signal is silently lost,
-    the stale review runs to completion, and the new --force ends up running
-    a duplicate review on the fresh sha. See regression test
-    test_run_codex_does_not_clear_concurrent_cancel_marker.
+    `before_ns` is the wall-clock nanosecond timestamp captured IMMEDIATELY
+    before the successful flock attempt. The mtime gate exists to fix the
+    race PR #27 review (issue #26 follow-up #2) called out:
+
+        t0: leader L captures pre_lock_ns
+        t1: L's acquire_pr_lock_nb() returns (kernel grants flock atomically)
+        t2: new --force F fails flock (because L holds it), writes marker
+            (marker.mtime_ns > t0 — F's touch happened AFTER L's pre_lock_ns)
+        t3: L calls clear_stale_cancel_marker(pr_url, before_ns=t0)
+
+    Without the mtime gate, t3 would unconditionally unlink F's freshly-
+    written marker, silently dropping F's cancel signal. The mtime check
+    preserves any marker with mtime > before_ns — those can only have been
+    written AFTER our flock attempt (since the only writer is
+    signal_cancel_and_wait_for_lock, which fires only after observing the
+    flock as held — and the flock is held by US after our acquire returned).
+
+    Stale markers (left behind by a crashed prior leader, or written for a
+    previous generation that already finished) have mtime ≤ before_ns and
+    are safely removed.
     """
+    marker = _pr_cancel_path(pr_url)
     try:
-        _pr_cancel_path(pr_url).unlink(missing_ok=True)
+        st = marker.stat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if st.st_mtime_ns > before_ns:
+        # Fresh signal from a --force that wrote the marker AFTER our flock
+        # attempt. Leave it for run_codex's watcher to react to.
+        return
+    try:
+        marker.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -260,20 +281,29 @@ def signal_cancel_and_wait_for_lock(
     *,
     timeout_sec: float = CANCEL_WAIT_LOCK_TIMEOUT_SEC,
     poll_sec: float = 1.0,
-) -> int | None:
+) -> tuple[int, int] | None:
     """--force entrypoint helper. Write the cancel marker so the current
     leader's codex is killed, then poll for the per-PR lock until the leader
-    releases it. Returns the lock fd on success, None if the leader didn't
-    release within timeout_sec (defensive — should normally take <2s after
-    kill since codex exits, leader's process_pr short-circuits, and the
-    flock is released)."""
+    releases it.
+
+    Returns (fd, pre_lock_ns) on success — pre_lock_ns is the wall-clock ns
+    captured immediately BEFORE the acquire_pr_lock_nb call that succeeded,
+    to be passed to clear_stale_cancel_marker so any marker that appeared
+    after our acquire is preserved (it's a fresh signal targeting US, not
+    leftover from a prior generation).
+
+    Returns None if the leader didn't release within timeout_sec (defensive —
+    should normally take <2s after kill since codex exits, leader's process_pr
+    short-circuits, and the flock is released).
+    """
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
     _pr_cancel_path(pr_url).touch()
     deadline = time.time() + timeout_sec
     while True:
+        pre_lock_ns = time.time_ns()
         fd = acquire_pr_lock_nb(pr_url)
         if fd is not None:
-            return fd
+            return fd, pre_lock_ns
         if time.time() >= deadline:
             return None
         time.sleep(poll_sec)
@@ -761,33 +791,38 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 pass
 
     def _cancel_watcher() -> None:
-        """Poll the cancel marker; if it appears while codex is running, kill
-        the subprocess group and set cancel_observed. Exits when
-        stop_cancel_watcher fires (i.e. the main thread already finished with
-        codex)."""
+        """Poll the cancel marker; any marker observed during the codex run
+        window is a fresh cancel signal from a new --force (with the
+        mtime-based stale cleanup at lock acquisition, no stale marker can
+        reach this point — see clear_stale_cancel_marker docstring).
+
+        Behaviour:
+          - marker + proc alive  → kill codex group, set cancel_observed
+          - marker + proc dead   → still set cancel_observed (PR #27 review
+            blocker 2b: a marker that lands AFTER codex exited naturally
+            but BEFORE process_pr writes calendar/state must still short-
+            circuit the calendar/state writes; otherwise the stale review
+            gets committed and the waiting --force then writes a duplicate
+            for the fresh sha)
+
+        In both cases we unlink the marker so the next leader's stale-cleanup
+        has less to do (and so a marker doesn't survive into a future leader's
+        generation as a phantom signal). Exits when stop_cancel_watcher fires
+        (the main thread already finished post-codex housekeeping).
+        """
         while True:
             try:
                 marker_exists = cancel_marker.exists()
             except OSError:
                 marker_exists = False
             if marker_exists:
-                # Only treat as a real cancel if proc is still running. If
-                # codex already exited naturally, the marker just means a new
-                # --force is waiting for our lock — we clear it so the new
-                # leader doesn't see its own past signal as an order to cancel
-                # ITSELF.
+                cancel_observed.set()
+                try:
+                    cancel_marker.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 if proc is not None and proc.poll() is None:
-                    cancel_observed.set()
-                    try:
-                        cancel_marker.unlink(missing_ok=True)
-                    except OSError:
-                        pass
                     _kill_proc_group(proc)
-                else:
-                    try:
-                        cancel_marker.unlink(missing_ok=True)
-                    except OSError:
-                        pass
                 return
             if stop_cancel_watcher.wait(CANCEL_POLL_SEC):
                 return
@@ -828,6 +863,21 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                     f.write('{"type":"_killed_by_watcher","reason":"timeout"}\n')
                     break
             proc.wait()
+            # Belt-and-suspenders for PR #27 review blocker 2b: a marker
+            # landing in the narrow window between the watcher's last poll
+            # and our about-to-fire stop signal would otherwise be missed
+            # and we'd commit stale calendar/state. Do one synchronous
+            # marker check here so a late marker still flips cancelled=True.
+            if not cancel_observed.is_set():
+                try:
+                    if cancel_marker.exists():
+                        cancel_observed.set()
+                        try:
+                            cancel_marker.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
             if cancel_observed.is_set():
                 cancelled = True
                 f.write('{"type":"_killed_by_watcher","reason":"cancelled_new_commit"}\n')
@@ -1238,6 +1288,11 @@ def _run_force(args, now: datetime) -> int:
         to cancel.
     """
     pr_url = args.force
+    # Capture pre_lock_ns BEFORE the acquire so any marker written by a
+    # concurrent --force AFTER our flock attempt has mtime > pre_lock_ns
+    # and is preserved by clear_stale_cancel_marker (see its docstring for
+    # the race this guards against).
+    pre_lock_ns = time.time_ns()
     lock_fd = acquire_pr_lock_nb(pr_url)
     cancelled_prior = False
     if lock_fd is None:
@@ -1253,26 +1308,28 @@ def _run_force(args, now: datetime) -> int:
             open_url=pr_url,
             group=f"pr-watcher:{pr_url}",
         )
-        lock_fd = signal_cancel_and_wait_for_lock(pr_url)
-        if lock_fd is None:
+        result = signal_cancel_and_wait_for_lock(pr_url)
+        if result is None:
             print(
                 f"  forced: {pr_url}  → cancel signal sent but lock not released "
                 f"within {CANCEL_WAIT_LOCK_TIMEOUT_SEC:.0f}s; bailing — next tick will retry"
             )
             return 1
+        # The helper captures its own pre_lock_ns just before the acquire
+        # that won — use THAT one (not our top-of-function timestamp) so the
+        # mtime gate is anchored to the moment we actually got the lock,
+        # not seconds earlier when we first tried.
+        lock_fd, pre_lock_ns = result
         cancelled_prior = True
 
-    # We now own the per-PR lock. Drop any leftover cancel marker BEFORE
-    # entering process_pr / run_codex. This covers two cases:
-    #   - "no leader" path: leftover marker from a previous crash/abort.
-    #   - "cancelled prior" path: the old leader's watcher usually unlinks
-    #     the marker after killing codex, but if the old leader short-circuited
-    #     before run_codex (e.g. already_reviewed) the marker would persist.
-    # From here on, any marker that appears is a fresh cancel signal aimed at
-    # this run, and run_codex's watcher must react to it — NOT delete it as
-    # stale. See clear_stale_cancel_marker docstring for the race we're
-    # avoiding.
-    clear_stale_cancel_marker(pr_url)
+    # We now own the per-PR lock. Drop any leftover cancel marker whose
+    # mtime predates pre_lock_ns (those are stale — left behind by a
+    # crashed prior leader or written for a previous generation that already
+    # finished). Markers with mtime > pre_lock_ns are fresh cancel signals
+    # from a NEW --force that fired its touch() after our flock won; we
+    # MUST preserve them so run_codex's watcher reacts. See
+    # clear_stale_cancel_marker docstring for the race this prevents.
+    clear_stale_cancel_marker(pr_url, before_ns=pre_lock_ns)
 
     try:
         pr = _gh_view_force_pr(pr_url)
@@ -1405,15 +1462,18 @@ def main() -> int:
         # duplicate review for a sha the leader already covered.
         pr_fd: int | None = None
         if not args.dry_run:
+            # Capture BEFORE the acquire so any marker written by a
+            # concurrent --force after our flock attempt is preserved (its
+            # mtime will be > pre_lock_ns). See clear_stale_cancel_marker.
+            pre_lock_ns = time.time_ns()
             pr_fd = acquire_pr_lock_nb(pr.url)
             if pr_fd is None:
                 print(f"    busy (another process holds the lock)  {pr.url}")
                 continue
-            # We own the per-PR lock now. Drop any leftover cancel marker
-            # before doing any work; from here on, any marker that appears
-            # is a fresh cancel signal aimed at this run (see
-            # clear_stale_cancel_marker docstring).
-            clear_stale_cancel_marker(pr.url)
+            # We own the per-PR lock now. Drop any cancel marker whose mtime
+            # predates pre_lock_ns; preserve any fresher one as a real cancel
+            # signal for this run.
+            clear_stale_cancel_marker(pr.url, before_ns=pre_lock_ns)
             # Refresh in-memory state for this PR from disk: a concurrent
             # --force on this PR may have just updated last_commented_sha,
             # and our top-of-main load_state() snapshot would be stale.
