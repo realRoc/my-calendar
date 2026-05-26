@@ -65,13 +65,11 @@ echo "  → installing launcher + url parser + config helper + prompt into $RESO
 cp "$LAUNCHER" "$RESOURCES/launch_fix.sh"
 chmod +x "$RESOURCES/launch_fix.sh"
 cp "$URL_PARSER" "$RESOURCES/parse_fix_url.py"
-# launch_fix.sh reads `mycalfix_config.py claude-flag` to decide whether to add
-# `--dangerously-skip-permissions`. Missing this file → the helper call fails
-# → launch_fix.sh's fail-safe defaults to interactive (empty flag, requires
-# per-tool approval). That's the safe direction, but it also means users who
-# explicitly opted into yolo via `mycalfix_interactive_claude: false` would
-# silently get interactive instead. Either way, the helper MUST be bundled
-# alongside launch_fix.sh so the config knob behaves as configured.
+# launch_fix.sh shells out to `mycalfix_config.py claude-flag` to obtain the
+# claude flag string (always `--dangerously-skip-permissions` under current
+# policy). The bundled helper must be present; if it isn't, launch_fix.sh's
+# fail-safe falls back to a hard-coded yolo literal, but missing it at install
+# time still indicates a packaging regression we want to fail loudly on.
 cp "$CONFIG_HELPER" "$RESOURCES/mycalfix_config.py"
 cp "$PROMPT" "$RESOURCES/fix_prompt.md"
 
@@ -93,11 +91,11 @@ if [[ "$smoke_out" == *URL_ERROR=* ]]; then
 fi
 
 # Smoke-test the bundled config helper exactly the way launch_fix.sh calls it.
-# Use a clean HOME so the user's real ~/.config/my-calendar/config.json doesn't
-# influence the assertion. Default contract: `claude-flag` prints the empty
-# string (interactive — claude asks for approval on every tool call). If the
-# helper isn't bundled or emits the yolo flag by default, launch_fix.sh would
-# silently upgrade every click to no-approval execution. Catch it at install.
+# Use a clean HOME so any user config file doesn't influence the assertion.
+# Current policy: `claude-flag` always prints `--dangerously-skip-permissions`
+# (yolo) regardless of config. If the bundled helper diverges from this
+# contract (e.g. someone reinstates the old interactive-default knob), the
+# user's clicks would silently change behavior — catch that here.
 echo "  → smoke-testing bundled config helper"
 CONFIG_TMP_HOME=$(mktemp -d)
 if ! cfg_out=$(HOME="$CONFIG_TMP_HOME" python3 "$RESOURCES/mycalfix_config.py" claude-flag 2>&1); then
@@ -106,9 +104,10 @@ if ! cfg_out=$(HOME="$CONFIG_TMP_HOME" python3 "$RESOURCES/mycalfix_config.py" c
   exit 3
 fi
 rm -rf "$CONFIG_TMP_HOME"
-if [[ -n "$(printf '%s' "$cfg_out" | tr -d '[:space:]')" ]]; then
+trimmed_cfg_out=$(printf '%s' "$cfg_out" | tr -d '[:space:]')
+if [[ "$trimmed_cfg_out" != "--dangerously-skip-permissions" ]]; then
   echo "✗ bundled mycalfix_config.py emitted unexpected claude-flag: $cfg_out" >&2
-  echo "  (expected empty string under a clean HOME — interactive is the safe default)" >&2
+  echo "  (expected '--dangerously-skip-permissions' — MyCalFix is yolo-only)" >&2
   exit 3
 fi
 

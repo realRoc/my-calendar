@@ -44,22 +44,27 @@ PROMPT_FILE="$HERE/fix_prompt.md"
 MYCALFIX_CONFIG="$HERE/mycalfix_config.py"
 mkdir -p "$LOG_DIR"
 
-# Read claude CLI flag from ~/.config/my-calendar/config.json. Default is
-# empty (interactive: each tool call asks for approval); set
-# `mycalfix_interactive_claude: false` to opt into
-# `--dangerously-skip-permissions` (yolo) in the disposable worktree.
+# MyCalFix policy: always launch claude with `--dangerously-skip-permissions`
+# (yolo). The previous `mycalfix_interactive_claude` config knob has been
+# removed at the user's request — interactive mode is no longer offered.
 #
-# Fail-CLOSED: if the helper is missing or crashes, fall back to interactive
-# (empty flag). A partial install or a broken helper must NOT silently
-# upgrade the click to no-approval tool execution — codex flagged the
-# previous fail-open behaviour as a blocker on PR #22.
+# We still shell out to mycalfix_config.py so the bundled-helper smoke test
+# in install_app.sh stays meaningful (a broken bundle would surface here),
+# but if the helper crashes for any reason we fall back to the hard-coded
+# yolo literal so a partial install doesn't accidentally downgrade the flag.
+HARDCODED_CLAUDE_FLAG="--dangerously-skip-permissions"
 if ! CLAUDE_FLAG=$(python3 "$MYCALFIX_CONFIG" claude-flag 2>>"$LOG_FILE"); then
-  CLAUDE_FLAG=""
-  echo "  warn: mycalfix_config.py failed; failing CLOSED to interactive (CLAUDE_FLAG empty)" >> "$LOG_FILE"
+  CLAUDE_FLAG="$HARDCODED_CLAUDE_FLAG"
+  echo "  warn: mycalfix_config.py failed; using hard-coded $HARDCODED_CLAUDE_FLAG" >> "$LOG_FILE"
 fi
 # Trim trailing newline from the python output.
 CLAUDE_FLAG="${CLAUDE_FLAG%$'\n'}"
-echo "  CLAUDE_FLAG: ${CLAUDE_FLAG:-<interactive (empty)>}" >> "$LOG_FILE"
+# Defensive: if the helper somehow returns an empty string, force yolo too —
+# the only supported mode is yolo.
+if [[ -z "$CLAUDE_FLAG" ]]; then
+  CLAUDE_FLAG="$HARDCODED_CLAUDE_FLAG"
+fi
+echo "  CLAUDE_FLAG: $CLAUDE_FLAG" >> "$LOG_FILE"
 
 # osascript helpers for the .app's own UI. These display dialogs owned by
 # osascript itself — no AppleEvent sent to other apps, so no Automation TCC
@@ -216,10 +221,11 @@ worktree_root = shlex.quote(os.environ["WORKTREE_ROOT"])
 local_branch = shlex.quote(os.environ["LOCAL_BRANCH"])
 refspec = shlex.quote("+refs/heads/{0}:refs/remotes/origin/{0}".format(os.environ["BRANCH"]))
 origin_ref = shlex.quote("origin/" + os.environ["BRANCH"])
-# CLAUDE_FLAG is one of two fixed literals: "--dangerously-skip-permissions"
-# or "" (interactive mode). Splice unquoted so the empty string yields no
-# argument (NOT `claude '' <prompt>`, which would feed claude an empty prompt
-# arg). The two possible values have no shell metacharacters.
+# CLAUDE_FLAG is always "--dangerously-skip-permissions" (yolo) per
+# MyCalFix policy. The empty-string branch is kept as a defensive
+# fallback in case a future regression hands us no flag — we still need
+# to emit a valid `claude <prompt>` invocation rather than `claude  <prompt>`.
+# Both possible values have no shell metacharacters, so splice unquoted.
 claude_flag = os.environ["CLAUDE_FLAG"]
 claude_invocation = (
     "claude " + claude_flag + " " + prompt if claude_flag else "claude " + prompt

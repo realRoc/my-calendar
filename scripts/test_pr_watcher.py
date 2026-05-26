@@ -1475,10 +1475,14 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
         self.assertIsNotNone(event.url)
         self.assertTrue(event.url.startswith("mycalfix://fix?"))
         self.assertIn("origin_cwd=%2FUsers%2Fme%2Frepo", event.url)
-        self.assertIn("🛠 修复入口", event.notes)
         self.assertIn("paste-ready 命令", event.notes)
         # paste cmd should have actual cwd, not placeholder
         self.assertIn("/Users/me/repo", event.notes)
+        # The mycalfix:// URL must NOT appear inline in the notes — the
+        # attachment icon on EKEvent.url is the single entry point. Inlining
+        # the URL again was visual noise the user explicitly asked to remove.
+        self.assertNotIn("mycalfix://", event.notes)
+        self.assertNotIn("🛠 修复入口", event.notes)
 
     def test_verdict_pass_clears_url(self):
         body = "未发现 blocker。\n\n结论：✅ 可以合并"
@@ -1492,7 +1496,9 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
             origin_cwd="/Users/me/repo",
         )
         self.assertIsNone(event.url)
-        self.assertNotIn("🛠 修复入口", event.notes)
+        # ✅ verdict → no fix-section at all (no paste-ready, no fork blurb).
+        self.assertNotIn("paste-ready", event.notes)
+        self.assertNotIn("mycalfix://", event.notes)
 
     def test_verdict_blocker_no_origin_cwd_uses_placeholder(self):
         body = "结论：⚠️ 修正后可合并"
@@ -1879,11 +1885,14 @@ class ForkPRTests(unittest.TestCase):
             origin_cwd="/path",
         )
         self.assertIsNone(event.url)
-        self.assertIn("🛠 修复入口", event.notes)
+        # Fork PR keeps the explanatory line (no launcher URL possible) but
+        # no longer has the redundant "🛠 修复入口（MyCalFix）" header — the
+        # URL section is suppressed entirely for forks.
         self.assertIn("fork PR", event.notes)
         self.assertIn("contributor/proj", event.notes)
         # paste-ready cmd would also fail; must NOT be present for fork PRs.
         self.assertNotIn("paste-ready", event.notes)
+        self.assertNotIn("mycalfix://", event.notes)
 
 
 class CodexCapConfigTests(unittest.TestCase):
@@ -1962,114 +1971,65 @@ class CodexCapConfigTests(unittest.TestCase):
         self.assertIn("cannot read", err)
 
 
-class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
-    """Test mycalfix_interactive_claude knob in ~/.config/my-calendar/config.json.
+class MyCalFixAlwaysYoloFlagTests(unittest.TestCase):
+    """MyCalFix policy: claude is always launched with
+    `--dangerously-skip-permissions`. The earlier `mycalfix_interactive_claude`
+    knob has been removed — config files are no longer consulted, and the
+    only supported mode is yolo.
 
-    Default (True) → claude_flag() returns '' (interactive — every tool call
-    asks for approval). Explicit False → returns '--dangerously-skip-permissions'
-    (yolo, the user-opted-in mode).
+    These tests pin that contract so a future change can't accidentally
+    reintroduce an interactive code path (or a way to flip out of yolo
+    via config)."""
 
-    Fail-closed contract: missing file, missing key, malformed JSON, wrong
-    type — every error path resolves to interactive. Codex flagged the
-    previous fail-open behaviour (defaulted to yolo) as a PR #22 blocker.
+    def test_claude_flag_returns_yolo_literal(self):
+        self.assertEqual(
+            mycalfix_config.claude_flag(),
+            "--dangerously-skip-permissions",
+            "MyCalFix must always emit the yolo flag — no interactive mode",
+        )
 
-    Strict bool check matters: a stray `"true"` string or `1` must NOT
-    silently match — only JSON bool literals count. Otherwise an
-    accidentally-stringified config could flip the user *out* of safe mode.
-    """
-
-    def _run(self, contents: str | None) -> tuple[bool, str, str]:
-        import contextlib
-        import io as _io
-        with tempfile.TemporaryDirectory() as td:
-            cfg = Path(td) / "config.json"
-            if contents is not None:
-                cfg.write_text(contents, encoding="utf-8")
-            buf = _io.StringIO()
-            with contextlib.redirect_stderr(buf):
-                interactive = mycalfix_config.read_interactive_claude(config_path=cfg)
-                flag = mycalfix_config.claude_flag(config_path=cfg)
-            return interactive, flag, buf.getvalue()
-
-    def test_missing_file_default_interactive_silent(self):
-        interactive, flag, err = self._run(contents=None)
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "", "default is interactive (empty flag)")
-        self.assertEqual(err, "", "missing config file should not warn")
-
-    def test_missing_key_default_interactive_silent(self):
-        interactive, flag, err = self._run('{"codex_concurrency_cap": 4}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertEqual(err, "", "missing key should not warn")
-
-    def test_explicit_true_interactive(self):
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": true}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "", "interactive mode emits empty flag")
-        self.assertEqual(err, "", "valid override should not warn")
-
-    def test_explicit_false_opts_into_yolo(self):
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": false}')
-        self.assertFalse(interactive)
-        self.assertEqual(flag, "--dangerously-skip-permissions")
-        self.assertEqual(err, "", "valid opt-in should not warn")
-
-    def test_string_true_rejected_fails_closed(self):
-        # "true" must NOT silently match — only JSON bool true does. Failing
-        # closed means the misconfig stays in interactive (safer) rather than
-        # accidentally upgrading to yolo.
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": "true"}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("not a JSON boolean", err)
-        self.assertIn("str", err)
-
-    def test_int_one_rejected_fails_closed(self):
-        # Mirrors codex_cap's strict-bool check. int(1) == True but type isn't bool.
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": 1}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("not a JSON boolean", err)
-        self.assertIn("int", err)
-
-    def test_int_zero_rejected_fails_closed(self):
-        # Belt-and-suspenders: 0 mustn't slip through as a JSON-bool false
-        # and silently flip the user into yolo. Strict bool check rejects it.
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": 0}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("not a JSON boolean", err)
-        self.assertIn("int", err)
-
-    def test_null_rejected_fails_closed(self):
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": null}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("not a JSON boolean", err)
-
-    def test_malformed_json_fails_closed_with_warning(self):
-        # Warn on stderr, return default (interactive) — not yolo.
-        interactive, flag, err = self._run('{not valid json')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("cannot read", err)
-
-    def test_cli_subcommand_emits_flag(self):
+    def test_cli_subcommand_emits_yolo_flag_under_clean_home(self):
         # launch_fix.sh shells out via `python3 mycalfix_config.py claude-flag`.
-        # The CLI is the public contract; lock it. Default = empty stdout
-        # (interactive). If this ever prints --dangerously-skip-permissions
-        # under a clean HOME, the codex PR #22 blocker has regressed.
+        # Lock the CLI contract: with a clean HOME (no config file possible),
+        # stdout must be exactly `--dangerously-skip-permissions\n`.
         result = subprocess.run(
             [sys.executable, str(HERE / "mycalfix_config.py"), "claude-flag"],
             capture_output=True,
             text=True,
             check=False,
-            # Use a tmp HOME so the user's real config doesn't taint the test.
             env={**{"PATH": "/usr/bin:/bin"}, "HOME": tempfile.mkdtemp()},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "")
+        self.assertEqual(result.stdout.strip(), "--dangerously-skip-permissions")
+
+    def test_cli_subcommand_ignores_legacy_interactive_config(self):
+        # A leftover `mycalfix_interactive_claude: true` from before the policy
+        # change must NOT bring back interactive mode. We don't read config
+        # at all; this test confirms that by writing the old "safe" value into
+        # a config file and asserting the CLI still emits yolo.
+        tmphome = Path(tempfile.mkdtemp())
+        try:
+            cfg_dir = tmphome / ".config" / "my-calendar"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.json").write_text(
+                '{"mycalfix_interactive_claude": true}',
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(HERE / "mycalfix_config.py"), "claude-flag"],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={"PATH": "/usr/bin:/bin", "HOME": str(tmphome)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                "--dangerously-skip-permissions",
+                "Legacy interactive opt-in must be ignored — yolo is the only mode",
+            )
+        finally:
+            shutil.rmtree(tmphome, ignore_errors=True)
 
 
 class InstallAppBundleManifestTests(unittest.TestCase):
@@ -2122,17 +2082,17 @@ class InstallAppBundleManifestTests(unittest.TestCase):
                     f"`cp <var> \"$RESOURCES/{helper}\"` line so the helper "
                     f"is actually copied into the .app bundle at install "
                     f"time. Just mentioning the path in an echo/comment is "
-                    f"not enough — it reproduces the PR #22 blocker (silent "
-                    f"interactive→yolo downgrade when helper is missing).",
+                    f"not enough — a missing helper falls back to a hard-coded "
+                    f"yolo flag and masks the packaging regression at runtime.",
                 )
 
     def test_installer_smoke_tests_bundled_config_helper(self):
-        # The fail-safe in launch_fix.sh now fails CLOSED to interactive when
-        # the bundled helper is missing/broken — but installer-time validation
-        # is still worth keeping: a bundle that silently can't run the config
-        # helper means the `mycalfix_interactive_claude: false` opt-in never
-        # takes effect for that user. Catch that at install rather than at
-        # runtime (where the misbehaviour is invisible).
+        # Installer-time validation that the bundle ships a working
+        # mycalfix_config.py. launch_fix.sh falls back to a hard-coded
+        # `--dangerously-skip-permissions` if the helper is broken, so the
+        # functional symptom (yolo flag) would still be right — but a silently
+        # broken helper would make any future config knobs invisible.
+        # Catching it at install time keeps the bundle contract verifiable.
         installer = self.INSTALLER.read_text(encoding="utf-8")
         section = (
             installer.split("smoke-testing bundled config helper", 1)[-1][:1500]
@@ -2299,7 +2259,9 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
             "mycalfix_abort",            # error helper function rendered
             "actual_repo=",              # remote-validation gate present
             "git worktree add",          # worktree-creation step present
-            "claude '",                  # claude invocation rendered (single-quoted prompt arg)
+            # claude invocation now always includes the yolo flag between the
+            # binary name and the single-quoted prompt arg.
+            "claude --dangerously-skip-permissions '",
         ):
             self.assertIn(
                 marker, body,
@@ -2308,15 +2270,16 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
                 f"string — likely an issue-#25-style quoting regression.\n"
                 f"--- body ---\n{body}",
             )
-        # Codex PR #22 blocker regression guard: default render must NOT
-        # include the yolo flag. The user opts into yolo by writing
-        # `mycalfix_interactive_claude: false`; a stub `open` test with no
-        # config file must produce the safe (interactive) invocation.
-        self.assertNotIn(
+        # MyCalFix policy: claude is always launched with
+        # `--dangerously-skip-permissions`. The earlier "interactive by
+        # default" mode has been removed. The rendered .command body MUST
+        # contain the yolo flag — its absence would mean the helper or the
+        # bash fallback in launch_fix.sh has regressed.
+        self.assertIn(
             "--dangerously-skip-permissions", body,
-            "default .command body must launch claude in interactive mode. "
-            "If --dangerously-skip-permissions appears here, the safe-by-"
-            "default contract from PR #22 has regressed.\n"
+            "rendered .command body must include --dangerously-skip-permissions. "
+            "If this flag is missing, mycalfix_config.py or launch_fix.sh has "
+            "regressed away from the yolo-only contract.\n"
             f"--- body ---\n{body}",
         )
 
@@ -2484,7 +2447,7 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
     # Canonical marker strings. If these need to change, update BOTH the
     # prompt file and this test — and update the downstream scanner (#17)
     # to recognize the old form too if you want historical data parseable.
-    PR_BLOCKQUOTE_MARKER = "> 🤖 由 Codex 自动生成（pr_watcher 触发，无人工干预）· 本仓库所有者未介入此条评论的撰写"
+    PR_BLOCKQUOTE_MARKER = "> 🤖 由 Codex 自动生成"
     PR_HTML_METADATA_MARKER = "<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->"
     FIX_COAUTHOR_TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
 

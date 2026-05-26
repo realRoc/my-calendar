@@ -1161,7 +1161,7 @@ def _build_paste_ready_fix_command(
     prompt = (
         f"针对 {comment_ref} 这条 codex review 反馈做修复。"
         f"只改 review 明确点名的位置；跑项目自检；commit + push 同分支（不要 --force）。"
-        f"diff 超 200 行就 abort。"
+        f"diff 超 1000 行就 abort。"
     )
     return (
         f"cd {cwd} && "
@@ -1196,11 +1196,15 @@ def build_event(
         body_section.append("（未抓到评论内容）")
 
     # ── fix 入口（仅 ⚠️ / ❌；✅ 不需要修复） ──
-    # URL goes on EKEvent.url (Calendar.app surfaces as a clickable link); the
-    # paste-ready command is also dumped into notes as a degradation path for
-    # when MyCalFix.app isn't installed. Fork PRs are explicitly skipped — the
-    # launcher's `git fetch origin <branch>` would fail on a head branch that
-    # lives in someone else's fork.
+    # The mycalfix:// URL goes on EKEvent.url — Calendar.app surfaces it as a
+    # clickable attachment icon, which is the single discoverable entry point.
+    # We deliberately do NOT repeat the URL as text in the body (the user
+    # called out the URL appearing multiple times as visual noise). The body
+    # keeps only the paste-ready degradation command (for users without
+    # MyCalFix.app), the origin_cwd-unknown advisory, and the fork-PR
+    # explanation. Fork PRs never get a launcher URL — the launcher's
+    # `git fetch origin <branch>` would fail on a head branch that lives in
+    # someone else's fork.
     fix_url: str | None = None
     fix_section: list[str] = []
     if verdict in ("⚠️", "❌"):
@@ -1208,28 +1212,22 @@ def build_event(
         fix_section = [
             "",
             "─" * 40,
-            "🛠 修复入口（MyCalFix）",
         ]
         if fork:
             fix_section.append(
-                f"链接：（fork PR，head 在 {pr.head_repo or '未知 fork'}，"
-                f"暂不支持自动修复入口；请到对应 fork 本地手动 checkout）"
+                f"fork PR（head 在 {pr.head_repo or '未知 fork'}），"
+                f"暂不支持自动修复入口；请到对应 fork 本地手动 checkout。"
             )
         else:
             fix_url = _build_fix_url(pr=pr, comment_url=comment_url, origin_cwd=origin_cwd)
             paste_cmd = _build_paste_ready_fix_command(
                 pr=pr, comment_url=comment_url, origin_cwd=origin_cwd,
             )
-            if fix_url:
-                fix_section.append(f"链接：{fix_url}")
-            else:
-                fix_section.append("链接：（缺 head_branch 或 comment_url，未能构造 mycalfix URL）")
-            fix_section.append("")
             if not origin_cwd:
                 fix_section.append("⚠️  origin_cwd 未知（本次走的 launchd 兜底路径，没有 hook 喂数据）。")
-                fix_section.append("    .app 触发时会弹目录选择器；下次本地 push 同 PR 会自动落 origin_cwd。")
+                fix_section.append("    MyCalFix 触发时会弹目录选择器；下次本地 push 同 PR 会自动落 origin_cwd。")
                 fix_section.append("")
-            fix_section.append("paste-ready 命令（无 .app 时降级用）：")
+            fix_section.append("paste-ready 命令（无 MyCalFix.app 时降级用）：")
             fix_section.append(paste_cmd)
 
     # ── metadata 折到最后 ──

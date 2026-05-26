@@ -65,7 +65,7 @@ gh api -H "Accept: application/vnd.github+json" \
 
 ## 硬约束（违反任何一条就 abort，输出 "ABORTED: <原因>"，不要 commit）
 
-1. **diff 超过 200 行** → abort。让人工先看一眼。如果 review 反馈确实需要这么大改动，写一个 plan 文件 `PHASE3_FIX_PLAN.md` 让人决定
+1. **diff 超过 1000 行** → abort。让人工先看一眼。如果 review 反馈确实需要这么大改动，写一个 plan 文件 `PHASE3_FIX_PLAN.md` 让人决定
 2. **`git status` 在你开始前不干净** → abort（worktree 是 launcher 刚 `git worktree add` 出来的，理论上 100% 干净；如果不干净说明 worktree 创建有问题或被外力改过）
 3. **改了 review 没点名的文件**（除非是 import / 测试 fixture 这类附带）→ 在最终回复里逐文件解释为什么动了它；超过 3 个未点名文件 → abort
 4. **跑测试时项目本来就是红的**（不是你引入的）→ 不 abort，但在 commit message body 里标注"pre-existing test failure in <file>"
