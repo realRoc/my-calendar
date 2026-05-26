@@ -3,7 +3,7 @@
 #
 # Two jobs:
 #   1. com.<user>.calendar.daily       — every day at 06:00 (节日扫描)
-#   2. com.<user>.calendar.pr-watcher  — every 2 min while awake (PR 监控)
+#   2. com.<user>.calendar.pr-watcher  — every 10 min while awake (PR 监控)
 #
 # Re-running is safe: each job is unloaded first if already present.
 
