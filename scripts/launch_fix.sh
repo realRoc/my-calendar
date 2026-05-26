@@ -41,30 +41,26 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 LOG_DIR="$HOME/Library/Logs/MyCalFix"
 LOG_FILE="$LOG_DIR/launch_fix.log"
 PROMPT_FILE="$HERE/fix_prompt.md"
-MYCALFIX_CONFIG="$HERE/mycalfix_config.py"
 mkdir -p "$LOG_DIR"
 
-# MyCalFix policy: always launch claude with `--dangerously-skip-permissions`
-# (yolo). The previous `mycalfix_interactive_claude` config knob has been
-# removed at the user's request — interactive mode is no longer offered.
-#
-# We still shell out to mycalfix_config.py so the bundled-helper smoke test
-# in install_app.sh stays meaningful (a broken bundle would surface here),
-# but if the helper crashes for any reason we fall back to the hard-coded
-# yolo literal so a partial install doesn't accidentally downgrade the flag.
-HARDCODED_CLAUDE_FLAG="--dangerously-skip-permissions"
-if ! CLAUDE_FLAG=$(python3 "$MYCALFIX_CONFIG" claude-flag 2>>"$LOG_FILE"); then
-  CLAUDE_FLAG="$HARDCODED_CLAUDE_FLAG"
-  echo "  warn: mycalfix_config.py failed; using hard-coded $HARDCODED_CLAUDE_FLAG" >> "$LOG_FILE"
-fi
-# Trim trailing newline from the python output.
-CLAUDE_FLAG="${CLAUDE_FLAG%$'\n'}"
-# Defensive: if the helper somehow returns an empty string, force yolo too —
-# the only supported mode is yolo.
-if [[ -z "$CLAUDE_FLAG" ]]; then
-  CLAUDE_FLAG="$HARDCODED_CLAUDE_FLAG"
-fi
-echo "  CLAUDE_FLAG: $CLAUDE_FLAG" >> "$LOG_FILE"
+# MyCalFix policy (post-PR #30 codex pushback):
+#   - Mode is chosen per click via an osascript dialog (option C). The dialog
+#     defaults to Interactive — the safe option. Yolo is a button the user
+#     has to deliberately click for that one session. No persisted "always
+#     yolo" config exists; un-disableable-default was the property codex
+#     flagged.
+#   - The MYCALFIX_MODE env var bypasses the dialog. Accepted values:
+#       yolo         → splice --dangerously-skip-permissions
+#       interactive  → empty claude flag (each tool call asks for Approve)
+#       cancel       → abort the launch immediately
+#     Set by tests, by users scripting the launcher from a terminal, or by
+#     users who genuinely want a sticky preference. Unset → dialog fires.
+#   - The comment body is read from a pre-fetched local cache file rather
+#     than fetched live with `gh api` (option E). See cache_comment_body()
+#     in pr_watcher.py and the {comment_body_path} substitution in
+#     fix_prompt.md. Reduces one prompt-injection surface: claude no longer
+#     makes an outbound network call at session start that could be coaxed
+#     to a different URL by injected instructions.
 
 # osascript helpers for the .app's own UI. These display dialogs owned by
 # osascript itself — no AppleEvent sent to other apps, so no Automation TCC
@@ -83,6 +79,30 @@ on run argv
     try
         set picked to choose folder with prompt ("MyCalFix: 选择 " & (item 1 of argv) & " 的本地 checkout 目录")
         return POSIX path of picked
+    on error
+        return ""
+    end try
+end run
+APPLESCRIPT
+}
+
+# Per-click consent dialog: ask Yolo / Interactive / Cancel. Default button is
+# Interactive (Enter key chooses it). Output is the literal button label, or
+# empty string on Cancel / osascript error / no UI available — caller treats
+# empty as "abort". This is option C from the PR #30 codex review pushback:
+# yolo is not a default the user can forget about, every click is a fresh
+# decision.
+prompt_for_mode() {
+  osascript - "$1" 2>>"$LOG_FILE" <<'APPLESCRIPT' || echo ""
+on run argv
+    try
+        set pr_url to (item 1 of argv)
+        set msg to "MyCalFix 将启动 Claude Code 修复：" & return & pr_url & return & return & ¬
+            "⚠️ Yolo (--dangerously-skip-permissions): claude 无需逐次审批就能读 / 改本地文件、跑命令、curl。fix prompt 会读 review 评论体 (pr_watcher 已预取到本地缓存)，yolo 下任何注入指令都会直接执行。" & return & return & ¬
+            "✅ Interactive: 每个工具调用都弹审批，慢但能挡注入。" & return & return & ¬
+            "选 Cancel 不启动 claude。"
+        set choice to button returned of (display dialog msg buttons {"Cancel", "Yolo", "Interactive"} default button "Interactive" with icon caution with title "MyCalFix")
+        return choice
     on error
         return ""
     end try
@@ -155,6 +175,81 @@ if [[ ! -f "$PROMPT_FILE" ]]; then
   exit 5
 fi
 
+# ─── option E: resolve pre-fetched comment body path ────────────────────────
+# pr_watcher.cache_comment_body() drops the review body at
+# ~/.cache/my-calendar/fix-comments/<comment_id>.md before this launcher is
+# ever triggered (same machine, same user). We hand the path to claude via
+# the {comment_body_path} prompt substitution; fix_prompt.md tells claude to
+# read it with the Read tool. Approve dialogs in Interactive mode now show
+# the specific file claude is reading, not an opaque `gh api` shell command
+# that injection could redirect to another repo's comment.
+#
+# Cache miss (older event written before this feature, or cache evicted) →
+# empty path; fix_prompt.md has a documented gh-api fallback so old events
+# still work, but the prompt-injection-resistant path is gone for that one.
+comment_id=$(printf '%s' "$comment" | sed -E -n 's|.*#issuecomment-([0-9]+).*|\1|p')
+COMMENT_BODY_PATH=""
+if [[ -n "$comment_id" ]]; then
+  candidate="$HOME/.cache/my-calendar/fix-comments/${comment_id}.md"
+  if [[ -f "$candidate" ]]; then
+    COMMENT_BODY_PATH="$candidate"
+  fi
+fi
+echo "  comment_body_path: ${COMMENT_BODY_PATH:-<no cache; fix_prompt.md will use gh api fallback>}" >> "$LOG_FILE"
+
+# ─── option C: per-click mode dialog ────────────────────────────────────────
+# MYCALFIX_MODE env var bypasses the dialog (tests, scripted launches, users
+# who really want a sticky preference exported in their shell). Unset → dialog.
+case "${MYCALFIX_MODE:-}" in
+  yolo)
+    chosen_mode="yolo"
+    echo "  mode: yolo (forced via MYCALFIX_MODE=yolo)" >> "$LOG_FILE"
+    ;;
+  interactive)
+    chosen_mode="interactive"
+    echo "  mode: interactive (forced via MYCALFIX_MODE=interactive)" >> "$LOG_FILE"
+    ;;
+  cancel)
+    echo "  mode: cancel (forced via MYCALFIX_MODE=cancel); not launching" >> "$LOG_FILE"
+    exit 4
+    ;;
+  "")
+    dialog_choice=$(prompt_for_mode "$pr")
+    dialog_choice="${dialog_choice%$'\n'}"
+    case "$dialog_choice" in
+      Yolo)
+        chosen_mode="yolo"
+        echo "  mode: yolo (chosen via dialog)" >> "$LOG_FILE"
+        ;;
+      Interactive)
+        chosen_mode="interactive"
+        echo "  mode: interactive (chosen via dialog)" >> "$LOG_FILE"
+        ;;
+      ""|Cancel)
+        echo "  mode dialog cancelled or osascript failed; not launching" >> "$LOG_FILE"
+        exit 4
+        ;;
+      *)
+        echo "  unexpected mode dialog return: $dialog_choice; not launching" >> "$LOG_FILE"
+        exit 4
+        ;;
+    esac
+    ;;
+  *)
+    msg="MyCalFix: 未知 MYCALFIX_MODE 值: ${MYCALFIX_MODE}. 接受 yolo|interactive|cancel"
+    echo "$msg" >> "$LOG_FILE"
+    show_alert "$msg"
+    exit 4
+    ;;
+esac
+
+if [[ "$chosen_mode" == "yolo" ]]; then
+  CLAUDE_FLAG="--dangerously-skip-permissions"
+else
+  CLAUDE_FLAG=""
+fi
+echo "  CLAUDE_FLAG: ${CLAUDE_FLAG:-<empty, interactive>}" >> "$LOG_FILE"
+
 # Compute worktree path + temporary local branch name now (in this process)
 # so we can render them into the prompt before passing it to claude. claude
 # needs the literal path/branch to print the cleanup command at the end and
@@ -173,10 +268,11 @@ local_branch="mycalfix/${branch}-${ts}"
 rendered_prompt=$(
   COMMENT_URL="$comment" PR_URL="$pr" BRANCH="$branch" \
   WORKTREE_DIR="$worktree_dir" ORIGIN_CWD="$origin_cwd" LOCAL_BRANCH="$local_branch" \
+  COMMENT_BODY_PATH="$COMMENT_BODY_PATH" \
   python3 -c '
 import os, sys
 text = sys.stdin.read()
-for key in ("COMMENT_URL", "PR_URL", "BRANCH", "WORKTREE_DIR", "ORIGIN_CWD", "LOCAL_BRANCH"):
+for key in ("COMMENT_URL", "PR_URL", "BRANCH", "WORKTREE_DIR", "ORIGIN_CWD", "LOCAL_BRANCH", "COMMENT_BODY_PATH"):
     text = text.replace("{" + key.lower() + "}", os.environ[key])
 sys.stdout.write(text)
 ' < "$PROMPT_FILE"
@@ -221,11 +317,14 @@ worktree_root = shlex.quote(os.environ["WORKTREE_ROOT"])
 local_branch = shlex.quote(os.environ["LOCAL_BRANCH"])
 refspec = shlex.quote("+refs/heads/{0}:refs/remotes/origin/{0}".format(os.environ["BRANCH"]))
 origin_ref = shlex.quote("origin/" + os.environ["BRANCH"])
-# CLAUDE_FLAG is always "--dangerously-skip-permissions" (yolo) per
-# MyCalFix policy. The empty-string branch is kept as a defensive
-# fallback in case a future regression hands us no flag — we still need
-# to emit a valid `claude <prompt>` invocation rather than `claude  <prompt>`.
-# Both possible values have no shell metacharacters, so splice unquoted.
+# CLAUDE_FLAG is one of two fixed literals chosen per click by the user:
+#   "--dangerously-skip-permissions"  (Yolo button / MYCALFIX_MODE=yolo)
+#   ""                                 (Interactive button / MYCALFIX_MODE=interactive)
+# Both possible values have no shell metacharacters, so we splice them in
+# unquoted. The empty-string branch emits `claude <prompt>` (interactive —
+# each tool call asks for Approve); the non-empty branch emits
+# `claude --dangerously-skip-permissions <prompt>`. We must NOT emit
+# `claude '' <prompt>` (that would feed claude an empty positional arg).
 claude_flag = os.environ["CLAUDE_FLAG"]
 claude_invocation = (
     "claude " + claude_flag + " " + prompt if claude_flag else "claude " + prompt

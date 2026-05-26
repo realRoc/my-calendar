@@ -59,6 +59,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -86,6 +87,7 @@ LOG_DIR = HERE / "pr_logs"
 SCRATCH_BASE = Path("/tmp/codex-pr-runs")
 LOCK_DIR = HERE / "locks"                     # per-PR flock files + cancel markers + state lock
 STATE_LOCK_PATH = LOCK_DIR / "state.lock"     # brief flock around state read/merge/write
+COMMENT_BODY_CACHE_DIR = Path.home() / ".cache" / "my-calendar" / "fix-comments"  # see cache_comment_body()
 CODEX_SLOT_POLL_SEC = 2.0                     # how often to retry when all slots are full
 CODEX_SLOT_TIMEOUT_SEC = 30 * 60              # max time to wait for a slot before bailing
 CANCEL_POLL_SEC = 0.5                         # how often the leader checks for the cancel marker
@@ -671,6 +673,51 @@ def _parse_iso_utc(s: str) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.astimezone()
     return dt.astimezone(timezone.utc)
+
+
+_ISSUECOMMENT_RE = re.compile(r"#issuecomment-(\d+)")
+
+
+def cache_comment_body(comment_url: str | None, comment_body: str | None) -> Path | None:
+    """Pre-fetch the codex review comment body to a local file so the fix
+    launcher hands claude a path instead of having claude run `gh api`.
+
+    Why this exists (issue raised on PR #30):
+    fix_prompt.md step 1 used to have claude run `gh api .../comments/<id>
+    --jq .body` at the start of every fix session. Under prompt injection
+    (the body of a different comment, the PR diff, etc.), claude could be
+    coaxed into fetching a DIFFERENT URL than intended — e.g. an attacker-
+    controlled comment on a different repo carrying further instructions.
+    By caching the body here at review-completion time (pr_watcher trusts
+    the codex pipeline that produced it), the fix prompt can tell claude to
+    read a specific local file. In interactive mode the Approve dialog now
+    shows the exact file being read, not an opaque shell command. The
+    dynamic-fetch attack surface is gone.
+
+    Cache key is the numeric issue-comment id parsed from the html_url
+    (`...#issuecomment-<id>`). Same id is used by launch_fix.sh to look the
+    file back up. Returns the written Path on success, None otherwise (no
+    URL / no body / unparseable URL / write failure). The launcher falls
+    back to gh api when None — old calendar events still work.
+    """
+    if not comment_url or not comment_body:
+        return None
+    m = _ISSUECOMMENT_RE.search(comment_url)
+    if not m:
+        return None
+    cid = m.group(1)
+    try:
+        COMMENT_BODY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"      warn: cannot create comment-body cache dir: {e}", flush=True)
+        return None
+    path = COMMENT_BODY_CACHE_DIR / f"{cid}.md"
+    try:
+        path.write_text(comment_body, encoding="utf-8")
+    except OSError as e:
+        print(f"      warn: failed to cache comment body to {path}: {e}", flush=True)
+        return None
+    return path
 
 
 def fetch_latest_comment(repo: str, number: int) -> tuple[str | None, str | None]:
@@ -1316,6 +1363,12 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     comment_url, comment_body = fetch_latest_comment(pr.repo, pr.number)
     body_preview = (comment_body or "")[:80].replace("\n", " ")
     print(f"      comment_url={comment_url}  body={len(comment_body or '')}B  preview={body_preview!r}", flush=True)
+
+    # Cache the body to disk so launch_fix.sh can hand claude a local path
+    # instead of having claude do `gh api` (prompt-injection mitigation E).
+    # Best-effort: a failure here is non-fatal — fix_prompt.md keeps a
+    # gh-api fallback for old events / cache misses.
+    cache_comment_body(comment_url, comment_body)
 
     # origin_cwd may have been recorded by --force on this run (hook path) or
     # left over from a prior hook run; resolve once and pass it both into the

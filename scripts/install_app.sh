@@ -12,7 +12,6 @@ ROOT=$(cd "$HERE/.." && pwd)
 SRC_APPLESCRIPT="$ROOT/app/MyCalFix/main.applescript"
 LAUNCHER="$HERE/launch_fix.sh"
 URL_PARSER="$HERE/parse_fix_url.py"
-CONFIG_HELPER="$HERE/mycalfix_config.py"
 PROMPT="$HERE/fix_prompt.md"
 
 APP_DIR="$HOME/Applications"
@@ -36,10 +35,6 @@ if [[ ! -f "$URL_PARSER" ]]; then
   echo "✗ url parser not found: $URL_PARSER" >&2
   exit 1
 fi
-if [[ ! -f "$CONFIG_HELPER" ]]; then
-  echo "✗ config helper not found: $CONFIG_HELPER" >&2
-  exit 1
-fi
 if [[ ! -f "$PROMPT" ]]; then
   echo "✗ fix prompt not found: $PROMPT" >&2
   exit 1
@@ -61,16 +56,10 @@ osacompile -o "$APP_PATH" "$SRC_APPLESCRIPT"
 # matters because the repo may live under a TCC-protected folder (~/Desktop,
 # ~/Documents, ~/Downloads) — reading scripts/launch_fix.sh from there would
 # EPERM. Files inside the .app bundle are not TCC-gated for the .app itself.
-echo "  → installing launcher + url parser + config helper + prompt into $RESOURCES"
+echo "  → installing launcher + url parser + prompt into $RESOURCES"
 cp "$LAUNCHER" "$RESOURCES/launch_fix.sh"
 chmod +x "$RESOURCES/launch_fix.sh"
 cp "$URL_PARSER" "$RESOURCES/parse_fix_url.py"
-# launch_fix.sh shells out to `mycalfix_config.py claude-flag` to obtain the
-# claude flag string (always `--dangerously-skip-permissions` under current
-# policy). The bundled helper must be present; if it isn't, launch_fix.sh's
-# fail-safe falls back to a hard-coded yolo literal, but missing it at install
-# time still indicates a packaging regression we want to fail loudly on.
-cp "$CONFIG_HELPER" "$RESOURCES/mycalfix_config.py"
 cp "$PROMPT" "$RESOURCES/fix_prompt.md"
 
 # Verify the bundled parser is actually runnable end-to-end. Catches a missing
@@ -87,27 +76,6 @@ fi
 if [[ "$smoke_out" == *URL_ERROR=* ]]; then
   echo "✗ bundled parser rejected a known-good URL — regression?" >&2
   echo "$smoke_out" >&2
-  exit 3
-fi
-
-# Smoke-test the bundled config helper exactly the way launch_fix.sh calls it.
-# Use a clean HOME so any user config file doesn't influence the assertion.
-# Current policy: `claude-flag` always prints `--dangerously-skip-permissions`
-# (yolo) regardless of config. If the bundled helper diverges from this
-# contract (e.g. someone reinstates the old interactive-default knob), the
-# user's clicks would silently change behavior — catch that here.
-echo "  → smoke-testing bundled config helper"
-CONFIG_TMP_HOME=$(mktemp -d)
-if ! cfg_out=$(HOME="$CONFIG_TMP_HOME" python3 "$RESOURCES/mycalfix_config.py" claude-flag 2>&1); then
-  echo "✗ bundled mycalfix_config.py failed to run: $cfg_out" >&2
-  rm -rf "$CONFIG_TMP_HOME"
-  exit 3
-fi
-rm -rf "$CONFIG_TMP_HOME"
-trimmed_cfg_out=$(printf '%s' "$cfg_out" | tr -d '[:space:]')
-if [[ "$trimmed_cfg_out" != "--dangerously-skip-permissions" ]]; then
-  echo "✗ bundled mycalfix_config.py emitted unexpected claude-flag: $cfg_out" >&2
-  echo "  (expected '--dangerously-skip-permissions' — MyCalFix is yolo-only)" >&2
   exit 3
 fi
 
@@ -178,7 +146,6 @@ echo "   bundle:    $BUNDLE_ID"
 echo "   scheme:    $URL_SCHEME://"
 echo "   launcher:  $RESOURCES/launch_fix.sh  (bundled)"
 echo "   parser:    $RESOURCES/parse_fix_url.py  (bundled)"
-echo "   config:    $RESOURCES/mycalfix_config.py  (bundled)"
 echo "   prompt:    $RESOURCES/fix_prompt.md  (bundled)"
 echo
 echo "smoke test:"
