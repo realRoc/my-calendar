@@ -54,7 +54,7 @@ my-calendar/
 │   ├── calendar_sync.py            # EventKit 写入苹果日历（支持多日历名）
 │   ├── daily_check.py              # 节日入口：解析+查历史+写日历（launchd 每天 06:00）
 │   ├── state.json                  # 节日已创建事件 ID 索引
-│   ├── pr_watcher.py               # PR 监控入口：扫 open PR → codex review → 写日历（launchd 每 2 min）
+│   ├── pr_watcher.py               # PR 监控入口：扫 open PR → codex review → 写日历（launchd 每 10 min）
 │   ├── pr_prompt.md                # codex review 用的 prompt 模板（含 {pr_link} 占位）
 │   ├── pr_state.json               # 每个 PR 的 head_sha / thread_id / comment_url / origin_cwd
 │   ├── pr_calendar_state.json      # "PR 监控" 日历的事件 ID 索引
@@ -258,9 +258,9 @@ ls history/*/*__mothers-day__mom.md
 - 找到 PR + 验证 `base == default` → `pr_watcher.py --force <pr-url>`
 - hook 本身立刻返回 0，不阻塞 push
 
-**兜底通道 — launchd 30 min 轮询**
+**兜底通道 — launchd 10 min 轮询**
 
-- `com.<user>.calendar.pr-watcher`，`StartInterval=1800`
+- `com.<user>.calendar.pr-watcher`，`StartInterval=600`
 - 抓本地 hook 漏掉的事件：网页创建的 PR、异机 push、bot 自动 commit、push 时网络抖动导致 hook 失败等
 - 休眠不唤醒 Mac
 - 每次 tick 单次最长 25 分钟，超时杀掉 codex
@@ -270,10 +270,10 @@ ls history/*/*__mothers-day__mom.md
 | 触发源 | hook 抓到？ | launchd 兜底？ |
 |---|---|---|
 | 本机 `git push` | ✅ 立即 | — |
-| 本机 `gh pr create`（无新 push） | ⚠️ 只有同时 push 才行 | ✅ ≤30min |
-| GitHub 网页 UI 创建/编辑 PR | ❌ | ✅ ≤30min |
-| 其他机器 push | ❌ | ✅ ≤30min |
-| PR bot 自动 commit | ❌ | ✅ ≤30min |
+| 本机 `gh pr create`（无新 push） | ⚠️ 只有同时 push 才行 | ✅ ≤10min |
+| GitHub 网页 UI 创建/编辑 PR | ❌ | ✅ ≤10min |
+| 其他机器 push | ❌ | ✅ ≤10min |
+| PR bot 自动 commit | ❌ | ✅ ≤10min |
 
 ### 单次 tick 流程
 
@@ -307,7 +307,7 @@ ls history/*/*__mothers-day__mom.md
 要点：
 - 同一 PR 串行（cancel + restart 保持这个语义）；不同 PR 之间继续并行
 - N 次快速 push 不会堆 N 个 review；最终只会留下 1 个 review，对应最后一个 sha
-- launchd 兜底 tick 路径遇到 in-flight review 时仍然 **skip**，不参与 cancel（设计取舍：兜底每 2 分钟跑一次，没必要打断当前 review；下一轮自然 re-check）
+- launchd 兜底 tick 路径遇到 in-flight review 时仍然 **skip**，不参与 cancel（设计取舍：兜底每 10 分钟跑一次，没必要打断当前 review；下一轮自然 re-check）
 - 通知用同一 `group="pr-watcher:<pr_url>"`，terminal-notifier 会把同组旧 banner 替换成最新一条，多次 cancel/restart 不会刷屏
 - **不要**再加"写 cancel marker"的新代码路径而绕过 `signal_cancel_and_wait_for_lock`：persist 锁约定要求 marker writer 必须在 persist 锁里 `touch()`，绕过会让 PR #27 修复失效
 

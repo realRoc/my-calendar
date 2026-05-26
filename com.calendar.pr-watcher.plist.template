@@ -15,11 +15,11 @@
     <string>__INSTALL_DIR__</string>
 
     <!-- Fallback safety net. Primary trigger is the global git pre-push hook;
-         this 30-min poll exists only to catch PRs created via GitHub web UI or
+         this 10-min poll exists only to catch PRs created via GitHub web UI or
          pushed from another machine. launchd does NOT wake the Mac for
          StartInterval, so this is genuinely zero-cost while asleep. -->
     <key>StartInterval</key>
-    <integer>1800</integer>
+    <integer>600</integer>
 
     <!-- Fire once at login so a stale state gets reconciled on boot. -->
     <key>RunAtLoad</key>
