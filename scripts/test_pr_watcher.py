@@ -25,7 +25,6 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import pr_watcher  # noqa: E402
-import mycalfix_config  # noqa: E402
 
 
 class ForceOriginCwdTests(unittest.TestCase):
@@ -1475,10 +1474,14 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
         self.assertIsNotNone(event.url)
         self.assertTrue(event.url.startswith("mycalfix://fix?"))
         self.assertIn("origin_cwd=%2FUsers%2Fme%2Frepo", event.url)
-        self.assertIn("🛠 修复入口", event.notes)
         self.assertIn("paste-ready 命令", event.notes)
         # paste cmd should have actual cwd, not placeholder
         self.assertIn("/Users/me/repo", event.notes)
+        # The mycalfix:// URL must NOT appear inline in the notes — the
+        # attachment icon on EKEvent.url is the single entry point. Inlining
+        # the URL again was visual noise the user explicitly asked to remove.
+        self.assertNotIn("mycalfix://", event.notes)
+        self.assertNotIn("🛠 修复入口", event.notes)
 
     def test_verdict_pass_clears_url(self):
         body = "未发现 blocker。\n\n结论：✅ 可以合并"
@@ -1492,7 +1495,9 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
             origin_cwd="/Users/me/repo",
         )
         self.assertIsNone(event.url)
-        self.assertNotIn("🛠 修复入口", event.notes)
+        # ✅ verdict → no fix-section at all (no paste-ready, no fork blurb).
+        self.assertNotIn("paste-ready", event.notes)
+        self.assertNotIn("mycalfix://", event.notes)
 
     def test_verdict_blocker_no_origin_cwd_uses_placeholder(self):
         body = "结论：⚠️ 修正后可合并"
@@ -1879,11 +1884,14 @@ class ForkPRTests(unittest.TestCase):
             origin_cwd="/path",
         )
         self.assertIsNone(event.url)
-        self.assertIn("🛠 修复入口", event.notes)
+        # Fork PR keeps the explanatory line (no launcher URL possible) but
+        # no longer has the redundant "🛠 修复入口（MyCalFix）" header — the
+        # URL section is suppressed entirely for forks.
         self.assertIn("fork PR", event.notes)
         self.assertIn("contributor/proj", event.notes)
         # paste-ready cmd would also fail; must NOT be present for fork PRs.
         self.assertNotIn("paste-ready", event.notes)
+        self.assertNotIn("mycalfix://", event.notes)
 
 
 class CodexCapConfigTests(unittest.TestCase):
@@ -1962,129 +1970,18 @@ class CodexCapConfigTests(unittest.TestCase):
         self.assertIn("cannot read", err)
 
 
-class MyCalFixInteractiveClaudeConfigTests(unittest.TestCase):
-    """Test mycalfix_interactive_claude knob in ~/.config/my-calendar/config.json.
-
-    Default (True) → claude_flag() returns '' (interactive — every tool call
-    asks for approval). Explicit False → returns '--dangerously-skip-permissions'
-    (yolo, the user-opted-in mode).
-
-    Fail-closed contract: missing file, missing key, malformed JSON, wrong
-    type — every error path resolves to interactive. Codex flagged the
-    previous fail-open behaviour (defaulted to yolo) as a PR #22 blocker.
-
-    Strict bool check matters: a stray `"true"` string or `1` must NOT
-    silently match — only JSON bool literals count. Otherwise an
-    accidentally-stringified config could flip the user *out* of safe mode.
-    """
-
-    def _run(self, contents: str | None) -> tuple[bool, str, str]:
-        import contextlib
-        import io as _io
-        with tempfile.TemporaryDirectory() as td:
-            cfg = Path(td) / "config.json"
-            if contents is not None:
-                cfg.write_text(contents, encoding="utf-8")
-            buf = _io.StringIO()
-            with contextlib.redirect_stderr(buf):
-                interactive = mycalfix_config.read_interactive_claude(config_path=cfg)
-                flag = mycalfix_config.claude_flag(config_path=cfg)
-            return interactive, flag, buf.getvalue()
-
-    def test_missing_file_default_interactive_silent(self):
-        interactive, flag, err = self._run(contents=None)
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "", "default is interactive (empty flag)")
-        self.assertEqual(err, "", "missing config file should not warn")
-
-    def test_missing_key_default_interactive_silent(self):
-        interactive, flag, err = self._run('{"codex_concurrency_cap": 4}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertEqual(err, "", "missing key should not warn")
-
-    def test_explicit_true_interactive(self):
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": true}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "", "interactive mode emits empty flag")
-        self.assertEqual(err, "", "valid override should not warn")
-
-    def test_explicit_false_opts_into_yolo(self):
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": false}')
-        self.assertFalse(interactive)
-        self.assertEqual(flag, "--dangerously-skip-permissions")
-        self.assertEqual(err, "", "valid opt-in should not warn")
-
-    def test_string_true_rejected_fails_closed(self):
-        # "true" must NOT silently match — only JSON bool true does. Failing
-        # closed means the misconfig stays in interactive (safer) rather than
-        # accidentally upgrading to yolo.
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": "true"}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("not a JSON boolean", err)
-        self.assertIn("str", err)
-
-    def test_int_one_rejected_fails_closed(self):
-        # Mirrors codex_cap's strict-bool check. int(1) == True but type isn't bool.
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": 1}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("not a JSON boolean", err)
-        self.assertIn("int", err)
-
-    def test_int_zero_rejected_fails_closed(self):
-        # Belt-and-suspenders: 0 mustn't slip through as a JSON-bool false
-        # and silently flip the user into yolo. Strict bool check rejects it.
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": 0}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("not a JSON boolean", err)
-        self.assertIn("int", err)
-
-    def test_null_rejected_fails_closed(self):
-        interactive, flag, err = self._run('{"mycalfix_interactive_claude": null}')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("not a JSON boolean", err)
-
-    def test_malformed_json_fails_closed_with_warning(self):
-        # Warn on stderr, return default (interactive) — not yolo.
-        interactive, flag, err = self._run('{not valid json')
-        self.assertTrue(interactive)
-        self.assertEqual(flag, "")
-        self.assertIn("cannot read", err)
-
-    def test_cli_subcommand_emits_flag(self):
-        # launch_fix.sh shells out via `python3 mycalfix_config.py claude-flag`.
-        # The CLI is the public contract; lock it. Default = empty stdout
-        # (interactive). If this ever prints --dangerously-skip-permissions
-        # under a clean HOME, the codex PR #22 blocker has regressed.
-        result = subprocess.run(
-            [sys.executable, str(HERE / "mycalfix_config.py"), "claude-flag"],
-            capture_output=True,
-            text=True,
-            check=False,
-            # Use a tmp HOME so the user's real config doesn't taint the test.
-            env={**{"PATH": "/usr/bin:/bin"}, "HOME": tempfile.mkdtemp()},
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "")
-
-
 class InstallAppBundleManifestTests(unittest.TestCase):
-    """Regression for PR #22 blocker: launch_fix.sh references runtime helpers
-    via `$HERE/<helper>` after .app install, but install_app.sh used to only
-    bundle launch_fix.sh + parse_fix_url.py + fix_prompt.md. mycalfix_config.py
-    was missing → `python3 .../mycalfix_config.py claude-flag` failed → the
-    fail-safe in launch_fix.sh fell through to `--dangerously-skip-permissions`
-    even when the user opted into interactive mode via config.json.
+    """install_app.sh must bundle every runtime helper that launch_fix.sh
+    expects to find next to itself (resolved via `$HERE/<name>` inside the
+    .app's Contents/Resources/). A missing helper would silently fall
+    through to whatever fallback launch_fix.sh has — that is exactly the
+    drift PR #22 originally surfaced with mycalfix_config.py.
 
-    These tests are static: they read install_app.sh and assert that every
-    runtime helper that launch_fix.sh expects in its directory is also
-    copy-installed and smoke-tested by the installer. They don't actually run
-    `bash install_app.sh` (which would touch ~/Applications, lsregister, and
-    tccutil)."""
+    These tests are static: they read install_app.sh and assert each
+    helper has a literal `cp <var> "$RESOURCES/<helper>"` line, and the
+    reverse — every `$HERE/<helper>` reference in launch_fix.sh appears
+    in the bundle manifest. They don't actually run `bash install_app.sh`
+    (which would touch ~/Applications, lsregister, and tccutil)."""
 
     INSTALLER = HERE / "install_app.sh"
     LAUNCHER = HERE / "launch_fix.sh"
@@ -2095,7 +1992,6 @@ class InstallAppBundleManifestTests(unittest.TestCase):
     BUNDLED_RUNTIME_HELPERS = (
         "launch_fix.sh",
         "parse_fix_url.py",
-        "mycalfix_config.py",
         "fix_prompt.md",
     )
 
@@ -2122,35 +2018,30 @@ class InstallAppBundleManifestTests(unittest.TestCase):
                     f"`cp <var> \"$RESOURCES/{helper}\"` line so the helper "
                     f"is actually copied into the .app bundle at install "
                     f"time. Just mentioning the path in an echo/comment is "
-                    f"not enough — it reproduces the PR #22 blocker (silent "
-                    f"interactive→yolo downgrade when helper is missing).",
+                    f"not enough — a missing helper falls back to a hard-coded "
+                    f"yolo flag and masks the packaging regression at runtime.",
                 )
 
-    def test_installer_smoke_tests_bundled_config_helper(self):
-        # The fail-safe in launch_fix.sh now fails CLOSED to interactive when
-        # the bundled helper is missing/broken — but installer-time validation
-        # is still worth keeping: a bundle that silently can't run the config
-        # helper means the `mycalfix_interactive_claude: false` opt-in never
-        # takes effect for that user. Catch that at install rather than at
-        # runtime (where the misbehaviour is invisible).
+    def test_installer_does_not_reference_deleted_config_helper(self):
+        # mycalfix_config.py was deleted when MyCalFix moved to a per-click
+        # dialog (option C from PR #30 codex pushback). Belt-and-suspenders
+        # so a future revert of either side surfaces here.
         installer = self.INSTALLER.read_text(encoding="utf-8")
-        section = (
-            installer.split("smoke-testing bundled config helper", 1)[-1][:1500]
-            if "smoke-testing bundled config helper" in installer
-            else ""
+        self.assertNotIn(
+            "mycalfix_config.py", installer,
+            "install_app.sh still references the deleted mycalfix_config.py. "
+            "Either restore the helper file or remove this reference."
         )
-        self.assertIn(
-            "mycalfix_config.py", section,
-            "install_app.sh must smoke-test the bundled mycalfix_config.py "
-            "(invoke `claude-flag` from a clean HOME) so a copy regression "
-            "fails the install rather than silently shipping a bundle whose "
-            "config helper can't be invoked at click-time.",
+        launcher = self.LAUNCHER.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "mycalfix_config.py", launcher,
+            "launch_fix.sh still references the deleted mycalfix_config.py. "
+            "Either restore the helper file or remove this reference."
         )
-        self.assertIn(
-            "claude-flag", section,
-            "smoke-test must call the public `claude-flag` CLI subcommand "
-            "(that's what launch_fix.sh shells out to) rather than just "
-            "importing the module — only the CLI path is the real contract.",
+        self.assertFalse(
+            (HERE / "mycalfix_config.py").exists(),
+            "mycalfix_config.py exists on disk; either delete it again or "
+            "update this test + the bundle manifest."
         )
 
     def test_launcher_references_match_bundled_manifest(self):
@@ -2212,10 +2103,14 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
         "&origin_cwd=%2Ftmp"
     )
 
-    def _run_launcher_with_stubbed_open(self):
+    def _run_launcher_with_stubbed_open(self, mycalfix_mode: str = "yolo"):
         """Run launch_fix.sh with a fake `open` on PATH that records the
         .command file path instead of launching Terminal. Returns
-        (returncode, stdout, stderr, captured_command_path_or_None)."""
+        (returncode, stdout, stderr, captured_command_path_or_None).
+
+        `mycalfix_mode` sets the MYCALFIX_MODE env var so we skip the
+        interactive osascript dialog. Tests can pass "yolo", "interactive",
+        or "cancel" to drive each branch of the per-click consent (option C)."""
         tmphome = Path(tempfile.mkdtemp(prefix="mycalfix-smoke-home-"))
         try:
             stub_dir = tmphome / "bin"
@@ -2233,6 +2128,7 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
             env = os.environ.copy()
             env["HOME"] = str(tmphome)
             env["PATH"] = f"{stub_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["MYCALFIX_MODE"] = mycalfix_mode
             result = subprocess.run(
                 ["bash", str(self.LAUNCHER), self.SMOKE_URL],
                 env=env,
@@ -2286,20 +2182,22 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
             f"--- .command body ---\n{body}",
         )
 
-    def test_command_file_contains_renderer_output(self):
+    def test_command_file_contains_renderer_output_yolo_mode(self):
         # Belt-and-suspenders: even if launch_fix.sh exits 0 and bash -n
         # passes, the python heredoc might silently emit an empty/partial
         # cmd (e.g. command substitution swallowed an error). Marker
         # assertions catch that — these strings only appear if the python
         # source ran to completion and printed the full Terminal recipe.
-        _, cmd_path = self._run_launcher_with_stubbed_open()
+        _, cmd_path = self._run_launcher_with_stubbed_open(mycalfix_mode="yolo")
         self.assertIsNotNone(cmd_path)
         body = cmd_path.read_text(encoding="utf-8")
         for marker in (
             "mycalfix_abort",            # error helper function rendered
             "actual_repo=",              # remote-validation gate present
             "git worktree add",          # worktree-creation step present
-            "claude '",                  # claude invocation rendered (single-quoted prompt arg)
+            # MYCALFIX_MODE=yolo → claude invocation gets the yolo flag
+            # between the binary name and the single-quoted prompt arg.
+            "claude --dangerously-skip-permissions '",
         ):
             self.assertIn(
                 marker, body,
@@ -2308,16 +2206,56 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
                 f"string — likely an issue-#25-style quoting regression.\n"
                 f"--- body ---\n{body}",
             )
-        # Codex PR #22 blocker regression guard: default render must NOT
-        # include the yolo flag. The user opts into yolo by writing
-        # `mycalfix_interactive_claude: false`; a stub `open` test with no
-        # config file must produce the safe (interactive) invocation.
+
+    def test_command_file_omits_yolo_flag_in_interactive_mode(self):
+        # Option C contract: MYCALFIX_MODE=interactive must produce a plain
+        # `claude '<prompt>'` invocation — NO `--dangerously-skip-permissions`.
+        # If this flag leaks into the interactive code path, the user thought
+        # they were getting Approve dialogs but the session would silently
+        # skip them.
+        _, cmd_path = self._run_launcher_with_stubbed_open(mycalfix_mode="interactive")
+        self.assertIsNotNone(
+            cmd_path,
+            "stub `open` was never invoked — launch_fix.sh aborted before "
+            "reaching `open -a Terminal` in interactive mode."
+        )
+        body = cmd_path.read_text(encoding="utf-8")
         self.assertNotIn(
             "--dangerously-skip-permissions", body,
-            "default .command body must launch claude in interactive mode. "
-            "If --dangerously-skip-permissions appears here, the safe-by-"
-            "default contract from PR #22 has regressed.\n"
+            "rendered .command body MUST NOT contain "
+            "--dangerously-skip-permissions when MYCALFIX_MODE=interactive. "
+            "If the flag appears here, mode handoff is broken and a user who "
+            "picked Interactive on the consent dialog would silently get yolo.\n"
             f"--- body ---\n{body}",
+        )
+        self.assertIn(
+            "claude '", body,
+            "interactive-mode body must invoke `claude` directly followed by "
+            "the single-quoted prompt arg — no flag between them."
+        )
+
+    def test_launcher_silently_no_ops_when_mycalfix_mode_cancel(self):
+        # Option C consent contract + codex blocker on PR #30
+        # (issuecomment-4539728569). When the user picks Cancel, the launcher
+        # must (a) NOT proceed to write a .command file or invoke `open` AND
+        # (b) exit 0 — main.applescript wraps the launcher in `do shell
+        # script`, which raises on ANY non-zero exit and surfaces a
+        # "MyCalFix 启动失败" alert. Cancel is a normal user choice, not a
+        # failure; the alert would be a surprise after the user intentionally
+        # hit Cancel. Hence the cancel path must exit 0 (silent no-op).
+        result, cmd_path = self._run_launcher_with_stubbed_open(mycalfix_mode="cancel")
+        self.assertEqual(
+            result.returncode, 0,
+            "launch_fix.sh must exit 0 when MYCALFIX_MODE=cancel — non-zero "
+            "would trigger main.applescript's `MyCalFix 启动失败` alert and "
+            "spook the user who just deliberately clicked Cancel. "
+            "See codex review on PR #30 (issuecomment-4539728569).\n"
+            f"--- stderr ---\n{result.stderr}"
+        )
+        self.assertIsNone(
+            cmd_path,
+            "Cancel must abort before `open -a Terminal` runs — no Terminal "
+            "window should appear. Stub `open` should never have been invoked."
         )
 
 
@@ -2484,7 +2422,7 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
     # Canonical marker strings. If these need to change, update BOTH the
     # prompt file and this test — and update the downstream scanner (#17)
     # to recognize the old form too if you want historical data parseable.
-    PR_BLOCKQUOTE_MARKER = "> 🤖 由 Codex 自动生成（pr_watcher 触发，无人工干预）· 本仓库所有者未介入此条评论的撰写"
+    PR_BLOCKQUOTE_MARKER = "> 🤖 由 Codex 自动生成"
     PR_HTML_METADATA_MARKER = "<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->"
     FIX_COAUTHOR_TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
 
@@ -3099,6 +3037,215 @@ class ClearStaleCancelMarkerStatUnlinkRaceTests(unittest.TestCase):
                     "have been unlinked by the now-unblocked worker",
                 )
                 t.join(timeout=2)
+
+
+class AppLauncherConsentExitContractTests(unittest.TestCase):
+    """Codex blocker on PR #30 (issuecomment-4539728569):
+    main.applescript wraps launch_fix.sh in `do shell script`, which raises on
+    ANY non-zero exit and surfaces a "MyCalFix 启动失败" alert. Cancel is a
+    normal user choice — getting an error popup after deliberately hitting
+    Cancel is the failure mode codex flagged. The fix: every consent-declined
+    path in launch_fix.sh must `exit 0` (silent no-op). Non-zero exits are
+    reserved for genuine launcher failures (parse error, missing file, can't
+    open Terminal) where the AppleScript alert IS the right user signal.
+
+    These tests lock both ends of the contract: the AppleScript trigger
+    (non-zero → alert) and the launcher exit policy (consent → exit 0).
+    """
+
+    LAUNCHER = HERE / "launch_fix.sh"
+    APPLESCRIPT = HERE.parent / "app" / "MyCalFix" / "main.applescript"
+
+    def test_applescript_uses_do_shell_script_with_error_alert(self):
+        # The "do shell script" call is the mechanism that turns a non-zero
+        # exit from launch_fix.sh into a Mac alert. If the AppleScript ever
+        # stops using `do shell script` (or stops alerting on error), the
+        # exit-code policy below becomes moot — we'd want to revisit then.
+        body = self.APPLESCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "do shell script", body,
+            "main.applescript no longer uses `do shell script` — the "
+            "launcher exit-code contract (consent paths must exit 0) may "
+            "need revisiting. See codex review on PR #30 issuecomment-4539728569.",
+        )
+        self.assertIn(
+            "on error", body,
+            "main.applescript must have an `on error` handler to catch the "
+            "non-zero exits that `do shell script` raises. Without it the "
+            ".app would silently swallow real launcher failures."
+        )
+        self.assertIn(
+            "MyCalFix 启动失败", body,
+            "The error path's alert text is the user-visible symptom of the "
+            "codex blocker. Lock the exact string so refactors don't lose the "
+            "context that explains why consent paths must exit 0."
+        )
+
+    def test_all_consent_declined_paths_exit_zero(self):
+        # Static reading of launch_fix.sh: every `exit N` line that follows a
+        # log line containing "cancelled" / "silent no-op" / "未知 MYCALFIX_MODE"
+        # / "picker cancelled" — i.e. paths where the user (or their config)
+        # declined to proceed — must be exit 0. If a future edit reintroduces
+        # `exit 4` here, the .app's "MyCalFix 启动失败" alert comes back and
+        # the PR #30 codex blocker regresses.
+        body = self.LAUNCHER.read_text(encoding="utf-8")
+        consent_markers = (
+            "picker cancelled",
+            "mode: cancel (forced via MYCALFIX_MODE=cancel)",
+            "mode dialog cancelled or osascript failed",
+            "unexpected mode dialog return:",
+            "未知 MYCALFIX_MODE 值",
+        )
+        lines = body.splitlines()
+        for marker in consent_markers:
+            with self.subTest(marker=marker):
+                marker_idx = next(
+                    (i for i, ln in enumerate(lines) if marker in ln),
+                    None,
+                )
+                self.assertIsNotNone(
+                    marker_idx,
+                    f"consent-declined marker {marker!r} not found in "
+                    "launch_fix.sh — either the marker text changed or the "
+                    "branch was removed. Update this test to match.",
+                )
+                # The exit statement should be within ~6 lines after the
+                # marker (allowing for show_alert + comment + blank line).
+                window = lines[marker_idx:marker_idx + 8]
+                exit_lines = [ln for ln in window if "exit " in ln and "echo" not in ln]
+                self.assertTrue(
+                    exit_lines,
+                    f"no `exit N` found within 8 lines after marker "
+                    f"{marker!r} — branch structure changed unexpectedly.",
+                )
+                for exit_line in exit_lines:
+                    self.assertIn(
+                        "exit 0", exit_line,
+                        f"consent-declined path with marker {marker!r} "
+                        f"has a non-zero exit: {exit_line.strip()!r}. "
+                        f"This regresses the PR #30 codex blocker — every "
+                        f"user-cancel path must exit 0 so the .app's "
+                        f"`do shell script` doesn't fire `MyCalFix 启动失败`.",
+                    )
+
+    def test_e2e_launcher_cancel_paths_all_exit_zero(self):
+        # End-to-end: drive launch_fix.sh with each cancel-shaped
+        # MYCALFIX_MODE value and assert exit 0. This complements the static
+        # check above by exercising the actual code path. The interactive /
+        # yolo modes are already covered by the per-mode renderer tests.
+        for mode in ("cancel",):
+            with self.subTest(mode=mode):
+                render = LaunchFixCommandFileRenderTests()
+                result, cmd_path = render._run_launcher_with_stubbed_open(
+                    mycalfix_mode=mode,
+                )
+                self.assertEqual(
+                    result.returncode, 0,
+                    f"MYCALFIX_MODE={mode} must yield exit 0. Got "
+                    f"{result.returncode}.\nstderr: {result.stderr}\n"
+                    "See codex review on PR #30 issuecomment-4539728569."
+                )
+                self.assertIsNone(
+                    cmd_path,
+                    f"MYCALFIX_MODE={mode} must not reach `open -a Terminal`."
+                )
+
+
+class CacheCommentBodyTests(unittest.TestCase):
+    """Option E: pr_watcher.cache_comment_body() must write the body to a
+    deterministic local path keyed by the GitHub issue-comment id, so
+    launch_fix.sh can hand claude a file path instead of an opaque
+    `gh api` shell command (prompt-injection mitigation)."""
+
+    def test_writes_body_keyed_by_comment_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "fix-comments"
+            with mock.patch.object(pr_watcher, "COMMENT_BODY_CACHE_DIR", cache_dir):
+                path = pr_watcher.cache_comment_body(
+                    "https://github.com/realRoc/my-calendar/pull/30#issuecomment-4539592797",
+                    "结论：⚠️ 修正后可合并\n\n## Blocker\n- foo",
+                )
+            self.assertIsNotNone(path)
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.name, "4539592797.md")
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "结论：⚠️ 修正后可合并\n\n## Blocker\n- foo",
+            )
+
+    def test_returns_none_when_url_lacks_issuecomment_fragment(self):
+        # Bare PR URL (no comment id) — launch_fix.sh's lookup uses the
+        # same regex, so caching to a derived path makes no sense.
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "fix-comments"
+            with mock.patch.object(pr_watcher, "COMMENT_BODY_CACHE_DIR", cache_dir):
+                self.assertIsNone(pr_watcher.cache_comment_body(
+                    "https://github.com/realRoc/my-calendar/pull/30",
+                    "body content",
+                ))
+
+    def test_returns_none_when_body_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "fix-comments"
+            with mock.patch.object(pr_watcher, "COMMENT_BODY_CACHE_DIR", cache_dir):
+                self.assertIsNone(pr_watcher.cache_comment_body(
+                    "https://github.com/foo/bar/pull/1#issuecomment-123",
+                    None,
+                ))
+                self.assertIsNone(pr_watcher.cache_comment_body(
+                    "https://github.com/foo/bar/pull/1#issuecomment-123",
+                    "",
+                ))
+
+    def test_returns_none_when_url_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "fix-comments"
+            with mock.patch.object(pr_watcher, "COMMENT_BODY_CACHE_DIR", cache_dir):
+                self.assertIsNone(pr_watcher.cache_comment_body(None, "body"))
+                self.assertIsNone(pr_watcher.cache_comment_body("", "body"))
+
+
+class FixPromptUsesLocalCommentBodyTests(unittest.TestCase):
+    """fix_prompt.md must use the {comment_body_path} placeholder (option E
+    contract). launch_fix.sh renders this placeholder before passing the
+    prompt to claude; if the placeholder disappears, the launcher's path
+    resolution is dead code and claude has no way to know about the cache."""
+
+    FIX_PROMPT = HERE / "fix_prompt.md"
+
+    def test_prompt_references_comment_body_path_placeholder(self):
+        body = self.FIX_PROMPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "{comment_body_path}", body,
+            "fix_prompt.md must reference {comment_body_path} — that's how "
+            "launch_fix.sh hands the pre-fetched cache file to claude. "
+            "Without it, the cache write in pr_watcher is wasted work."
+        )
+
+    def test_prompt_instructs_read_tool_before_gh_api(self):
+        # Order matters: claude should try the local file first; the gh api
+        # block is a documented fallback. If the order flipped, claude would
+        # make the network call every time and the injection-resistance
+        # benefit of option E would vanish.
+        body = self.FIX_PROMPT.read_text(encoding="utf-8")
+        local_idx = body.find("{comment_body_path}")
+        gh_api_idx = body.find("gh api")
+        self.assertGreaterEqual(local_idx, 0)
+        self.assertGreaterEqual(gh_api_idx, 0)
+        self.assertLess(
+            local_idx, gh_api_idx,
+            "fix_prompt.md must mention the local cache path BEFORE the "
+            "gh api fallback so claude reaches for the local file first."
+        )
+
+    def test_prompt_keeps_gh_api_fallback(self):
+        # Old calendar events (written before pr_watcher.cache_comment_body
+        # existed) carry no cache file. claude must still have a way to read
+        # the body, otherwise those events become broken — keep the gh api
+        # block as a documented fallback.
+        body = self.FIX_PROMPT.read_text(encoding="utf-8")
+        self.assertIn("gh api", body)
+        self.assertIn("/issues/comments/", body)
 
 
 if __name__ == "__main__":

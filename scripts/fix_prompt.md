@@ -14,10 +14,17 @@
 
 ## 第一步：读完整反馈
 
-用下面这段命令把评论的完整 body 抓下来读一遍。注意：`{comment_url}` 一般形如
-`https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`，必须把 `owner/repo` 和
-`comment_id` 分两次解析，**不能**直接对整条 URL 做单次 sed 替换——`#issuecomment-...`
-fragment 会污染 API endpoint，导致 `gh api` 报 404。
+**优先走本地缓存**：`pr_watcher` 在写日历事件之前已经把这条 codex review 的完整 body 预取到本地文件，路径已经渲染好了：
+
+```
+{comment_body_path}
+```
+
+用 **Read 工具**直接读那条路径——不要走网络。这样做有两个好处：
+1. 在 Interactive 模式下，弹出的 Approve 对话框会显示具体被读的文件名（不是一条不透明的 `gh api` shell 命令），用户能一眼看出 claude 想读什么。
+2. 内容在 `pr_watcher` 完成 review 时就被冻结了——即便上面的 GitHub 评论后来被人编辑加了 prompt-injection payload，你这次会话看到的还是当时审过的那份。
+
+**只有当 `{comment_body_path}` 是空字符串、文件不存在或读不到时**，才走下面的 `gh api` 兜底：
 
 ```bash
 url='{comment_url}'
@@ -26,6 +33,8 @@ comment_id=$(printf '%s' "$url" | sed -E 's|.*issuecomment-([0-9]+).*|\1|')
 gh api -H "Accept: application/vnd.github+json" \
   "repos/$owner_repo/issues/comments/$comment_id" --jq '.body'
 ```
+
+注意：`{comment_url}` 一般形如 `https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`，必须把 `owner/repo` 和 `comment_id` **分两次** 解析，**不能**直接对整条 URL 做单次 sed 替换——`#issuecomment-...` fragment 会污染 API endpoint，导致 `gh api` 报 404。
 
 重点看：
 
@@ -65,7 +74,7 @@ gh api -H "Accept: application/vnd.github+json" \
 
 ## 硬约束（违反任何一条就 abort，输出 "ABORTED: <原因>"，不要 commit）
 
-1. **diff 超过 200 行** → abort。让人工先看一眼。如果 review 反馈确实需要这么大改动，写一个 plan 文件 `PHASE3_FIX_PLAN.md` 让人决定
+1. **diff 超过 1000 行** → abort。让人工先看一眼。如果 review 反馈确实需要这么大改动，写一个 plan 文件 `PHASE3_FIX_PLAN.md` 让人决定
 2. **`git status` 在你开始前不干净** → abort（worktree 是 launcher 刚 `git worktree add` 出来的，理论上 100% 干净；如果不干净说明 worktree 创建有问题或被外力改过）
 3. **改了 review 没点名的文件**（除非是 import / 测试 fixture 这类附带）→ 在最终回复里逐文件解释为什么动了它；超过 3 个未点名文件 → abort
 4. **跑测试时项目本来就是红的**（不是你引入的）→ 不 abort，但在 commit message body 里标注"pre-existing test failure in <file>"

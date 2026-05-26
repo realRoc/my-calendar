@@ -368,14 +368,14 @@ git -C <repo-path> config core.hooksPath .git/hooks
 | key | 默认 | 说明 |
 |---|---|---|
 | `codex_concurrency_cap` | `10` | 全机器同时跑 codex 的最大数量。pr_watcher 用 `locks/codex-slot-{1..N}.lock` 实现 N 个 slot 的信号量；想给小机器/紧预算降并发就把这个数调小（如 `4`）。**调大也不会被拦**，但 codex 同时执行数、CPU/网络和 LLM 调用成本会随之线性上升——自行评估机器和预算能承受。**严格 JSON integer** 校验：`2.5` / `"4"` / `true` / 负数 / 0 都会落回默认 10 + 一行 stderr 警告，不会崩 |
-| `mycalfix_interactive_claude` | `true` | MyCalFix 起 claude 修复会话时的模式开关。**默认 true** → 用 `claude <prompt>`，每个工具调用都需要 Approve/Deny。理由：fix prompt 含 PR diff / review 评论（不可信内容），worktree 不是真沙箱（claude 仍可读 `~/.ssh`、`~/.config` 或改写 worktree 外文件），yolo 模式把"点日历链接"升级成无审批本机工具执行——这是 PR #22 codex review 标的 blocker。设 `false` 显式 opt-in `claude --dangerously-skip-permissions <prompt>`（yolo）：会话仍在 disposable worktree 里跑，但不再弹审批，与 pr_watcher 调 codex 时的 yolo 模式对齐。**严格 JSON boolean** 校验且 **fail-closed**：`"true"` / `1` / `0` / `null` / malformed JSON 等任何非 bool 值都会落回默认 true（交互）+ 一行 stderr 警告——错误路径绝不会静默升级到 yolo |
+
+> ⚠️ 已移除：`mycalfix_interactive_claude`。MyCalFix 现在用 osascript 对话框 per-click 选 mode，不再读 config 文件。写在 config.json 里也会被忽略。想跳过对话框（脚本化用途 / sticky preference）请 `export MYCALFIX_MODE=yolo|interactive|cancel` 给 launcher 进程。
 
 示例 `config.json`：
 
 ```json
 {
-  "codex_concurrency_cap": 4,
-  "mycalfix_interactive_claude": false
+  "codex_concurrency_cap": 4
 }
 ```
 
@@ -407,7 +407,7 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 | 产物 | 标记位置 | 规范文本 |
 |---|---|---|
-| codex 通过 pr_watcher 发的 PR review 评论 | 评论 body **第一行** | <pre>> 🤖 由 Codex 自动生成（pr_watcher 触发，无人工干预）· 本仓库所有者未介入此条评论的撰写<br>&lt;!-- ai-coauthor: codex; agent: pr_watcher; mode: automated --&gt;</pre> |
+| codex 通过 pr_watcher 发的 PR review 评论 | 评论 body **第一行** | <pre>> 🤖 由 Codex 自动生成<br>&lt;!-- ai-coauthor: codex; agent: pr_watcher; mode: automated --&gt;</pre> |
 | claude 通过 MyCalFix 起的修复 commit | commit message body | `Co-Authored-By: Claude <noreply@anthropic.com>`（Claude Code 默认自动加，fix_prompt.md 强制保留） |
 | 手敲的、纯人类 PR / 评论 | 无标记 | — |
 
@@ -499,12 +499,12 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
 
 | 路径 | 作用 |
 |---|---|
-| `scripts/fix_prompt.md` | 修复 prompt 模板（含 `{pr_url}` / `{comment_url}` / `{branch}` 占位）。硬约束包括：diff >200 行 abort、只改 review 点名的地方、跑项目自检、commit + push 同分支不要 --force |
-| `scripts/mycalfix_config.py` | MyCalFix 用户 config 读取器。`claude-flag` 子命令被 `launch_fix.sh` 调用，读 `~/.config/my-calendar/config.json` 决定要不要给 claude 加 `--dangerously-skip-permissions`。严格 JSON bool 校验，**fail-closed**：校验失败 / 文件缺失 / JSON 损坏一律落回 interactive 默认（空 flag），绝不会静默升级到 yolo |
-| `scripts/launch_fix.sh` | URL handler 本体（repo 里的"源"；install 时被复制进 .app）。所有 URL 都会落到 `~/Library/Logs/MyCalFix/launch_fix.log` 方便排错 |
+| `scripts/fix_prompt.md` | 修复 prompt 模板（含 `{pr_url}` / `{comment_url}` / `{branch}` / `{comment_body_path}` 占位）。第一步优先读 `{comment_body_path}` 指向的本地缓存文件（pr_watcher 预取，无网络），缓存缺失再退到 `gh api` 兜底。硬约束包括：diff >1000 行 abort、只改 review 点名的地方、跑项目自检、commit + push 同分支不要 --force |
+| `scripts/launch_fix.sh` | URL handler 本体（repo 里的"源"；install 时被复制进 .app）。每次点击弹 osascript 对话框选 **Yolo / Interactive / Cancel**，默认按钮 Interactive。`MYCALFIX_MODE=yolo\|interactive\|cancel` env var 可跳过对话框（测试 / 脚本化场景用）。所有 URL 都会落到 `~/Library/Logs/MyCalFix/launch_fix.log` 方便排错 |
 | `app/MyCalFix/main.applescript` | AppleScript 源（自包含；运行时用 `path to me` 找 `Contents/Resources/launch_fix.sh`） |
-| `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ 把 `launch_fix.sh` / `parse_fix_url.py` / `mycalfix_config.py` / `fix_prompt.md` 全复制进 `Contents/Resources/`（少一个就 abort）+ 安装时 smoke-test bundled parser + config helper（HOME 清空跑 `claude-flag` 必须输出空字符串，即 interactive 默认；否则视为 bundle 残缺 fail install）+ `xattr -dr com.apple.quarantine` + `lsregister -f` + `tccutil reset All <bundle-id>`（清旧 TCC 决定） |
-| `~/Applications/MyCalFix.app` | 部署后的 .app；`com.wuyupeng.mycalfix` bundle id，注册 `mycalfix:` scheme；`Contents/Resources/` 内含 bundled `launch_fix.sh` + `parse_fix_url.py` + `mycalfix_config.py` + `fix_prompt.md` |
+| `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ 把 `launch_fix.sh` / `parse_fix_url.py` / `fix_prompt.md` 复制进 `Contents/Resources/`（少一个就 abort）+ 安装时 smoke-test bundled parser + `xattr -dr com.apple.quarantine` + `lsregister -f` + `tccutil reset All <bundle-id>`（清旧 TCC 决定） |
+| `~/Applications/MyCalFix.app` | 部署后的 .app；`com.wuyupeng.mycalfix` bundle id，注册 `mycalfix:` scheme；`Contents/Resources/` 内含 bundled `launch_fix.sh` + `parse_fix_url.py` + `fix_prompt.md` |
+| `~/.cache/my-calendar/fix-comments/<comment_id>.md` | pr_watcher 预取的 codex review comment body（option E）。launch_fix.sh 把这个路径作为 `{comment_body_path}` 喂给 fix_prompt.md，claude 用 Read 工具读它而不是 `gh api` 跑网络拉一遍。Approve 对话框因此能显示具体被读的文件名，且 comment 后续被编辑也不会污染本次会话 |
 | `~/Library/Logs/MyCalFix/launch_fix.log` | 每次 URL 触发的解析参数 + Terminal 启动状况 |
 
 ### 手动入口
@@ -550,8 +550,12 @@ launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 com
 - `_build_fix_url`：有 origin_cwd / 无 origin_cwd / 缺 head_branch / 缺 comment_url 四种情形
 - `build_event`：verdict 是 ❌/⚠️ 时 URL 设置 + paste-ready 命令含 origin_cwd；verdict 是 ✅ 时 URL=None 且无修复入口区块；origin_cwd 缺失时 paste 命令带 `<填入本地 repo 路径>` 占位
 - `ParseFixUrlTests`：URL 解析器拒绝 wrong scheme / wrong action / non-github pr / repo mismatch / 控制字符等
-- `MyCalFixInteractiveClaudeConfigTests`：默认 interactive（safe-by-default）/ 显式 `false` 切到 yolo / 严格 bool 校验 fail-closed 拒绝 `"true"` `1` `0` `null` 一律回 interactive / malformed JSON 也 fail-closed 回 interactive / `python3 mycalfix_config.py claude-flag` CLI 子命令在干净 HOME 下输出空字符串
-- `InstallAppBundleManifestTests`：PR #22 blocker 回归——静态读 `install_app.sh` 校验 `launch_fix.sh` 引用的每个 `$HERE/<helper>`（`parse_fix_url.py` / `mycalfix_config.py` / `fix_prompt.md`）都在 bundle 复制清单里；同时校验 installer 装完会 smoke-test bundled `mycalfix_config.py claude-flag`。漏打包 helper（或反过来给 launch_fix.sh 加新 helper 不更新 manifest）这条测试会挂
+- `CacheCommentBodyTests`：option E 契约——`cache_comment_body()` 把 codex review body 写到 `~/.cache/my-calendar/fix-comments/<comment_id>.md`，URL 缺 `#issuecomment-<id>` fragment / body 为空 / URL 为空都返回 None
+- `FixPromptUsesLocalCommentBodyTests`：fix_prompt.md 必须含 `{comment_body_path}` 占位符，且本地路径段要排在 `gh api` 兜底段之前（确保 claude 优先读本地），同时仍保留 gh api 兜底（老日历事件无缓存时仍能跑）
+- `LaunchFixCommandFileRenderTests.test_command_file_contains_renderer_output_yolo_mode`：`MYCALFIX_MODE=yolo` 时渲染出的 .command body 必须含 `claude --dangerously-skip-permissions '...'`
+- `LaunchFixCommandFileRenderTests.test_command_file_omits_yolo_flag_in_interactive_mode`：`MYCALFIX_MODE=interactive` 时 .command body **必须不含** `--dangerously-skip-permissions`——这是 option C 的契约
+- `LaunchFixCommandFileRenderTests.test_launcher_aborts_when_mycalfix_mode_cancel`：`MYCALFIX_MODE=cancel` 时 launcher 退出非零且不会调到 `open -a Terminal`
+- `InstallAppBundleManifestTests`：静态读 `install_app.sh` 校验 `launch_fix.sh` 引用的每个 `$HERE/<helper>`（`parse_fix_url.py` / `fix_prompt.md`）都在 bundle 复制清单里；同时校验 `mycalfix_config.py` 已经从 launcher、installer 与磁盘上**全部**删除（防止哪一侧偷偷加回来）
 
 `launch_fix.sh` 末段的 `.command` 文件生成 + `open -a Terminal` 没有自动测试（依赖 macOS LaunchServices），靠手动 smoke：`bash scripts/launch_fix.sh 'mycalfix://...'` 直接跑（无 .app 也可），看 `~/Library/Logs/MyCalFix/launch_fix.log` 末尾打印的 `.command` 文件路径是否被 Terminal 读到（文件在 Terminal 启动时被 `rm -f $0` 自删）。
 
@@ -559,13 +563,17 @@ launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 com
 
 - **走 .app + URL scheme，不走 Shortcuts**：URL 稳定可版本化、可塞进 repo、不依赖 Shortcuts.app；缺点是要 osacompile 编译，installer 略复杂
 - **走 `claude "<prompt>"` 交互模式，不走 `claude -p`**：`-p` 在某些环境会吃 `ANTHROPIC_API_KEY` 而不是订阅；交互式确认走订阅
-- **默认 interactive（safe-by-default），yolo 必须显式 opt-in**：codex PR #22 review 把"默认 `--dangerously-skip-permissions`"标成 blocker——fix prompt 含 PR diff 和 review 评论（不可信内容），`git worktree` 只隔离 git checkout 不限制 Claude Code 读 `~/.ssh` / `~/.config` 或改写 worktree 外文件，`fix_prompt.md` 的约束不是安全边界；这样会把"点一次日历链接"升级成无审批本机工具执行。**默认行为**：launcher 跑 `claude <prompt>`，每个工具调用都弹审批，用户能逐步看到 claude 想干什么。**显式 opt-in 到 yolo**：在 `~/.config/my-calendar/config.json` 写 `mycalfix_interactive_claude: false`——只有完全理解 yolo 模式下 prompt injection 仍是唯一防线、且只在自己 repo 上点 mycalfix 链接的人才该开。**Fail-closed**：launcher 的 helper 调用失败、config 文件不可读、JSON 损坏、值类型不对，每条错误路径都回落到 interactive（空 flag）+ 一行 stderr 警告——绝不会因为"安全阀坏了"而静默升级到 yolo。**辅助安全前提**（即使在 yolo opt-in 下也成立）：(a) worktree 一次性隔离在 `~/.cache/my-calendar/worktrees/`，改坏一删就回去；(b) `.command` 在 fetch/worktree-add 之前已经校验 `git remote get-url origin` 与 URL 的 repo 一致，push 推不到错的 remote；(c) `fix_prompt.md` 硬约束 diff >200 行 abort、只改 review 点名处、不 --force push
+- **MyCalFix 模式：per-click 对话框 + 预取 comment body（PR #30 codex review pushback 后的最终方案）**。短暂存在过"强制 yolo"版本（PR #30 头一版）被 codex 指出是 blocker：点一次日历链接 = 不可信 PR 内容驱动的无审批本机工具执行 / secret 读取 / 网络外传。这版方案两条同时上：
+   - **C：per-click 对话框**。每次点击 mycalfix:// 链接，launch_fix.sh 用 osascript `display dialog` 弹一个 `Cancel / Yolo / Interactive` 三按钮窗，默认按钮 = Interactive（按回车选它）。yolo 不再是"可被遗忘的默认"，是用户主动按下的按钮。`MYCALFIX_MODE` env var 跳过对话框（脚本 / 测试 / 用户自己 export sticky preference 用）：`yolo` / `interactive` / `cancel` 三个值，未知值 / 空值都让对话框接管。osascript 失败 / 用户点 Cancel 都 abort，**不写 .command 文件、不调 `open -a Terminal`**。
+   - **E：预取 codex review comment body 到本地缓存**。pr_watcher 在写完日历事件之前调 `cache_comment_body()`，把 codex 的整段 review body 写到 `~/.cache/my-calendar/fix-comments/<comment_id>.md`。launch_fix.sh 把这个路径作为 `{comment_body_path}` 渲染进 fix_prompt.md，claude 用 Read 工具读它而不是 `gh api` 跑网络拉一遍。两个效果：(a) Interactive 模式的 Approve 对话框会显示具体被读的文件名，用户能看出 claude 想读什么，而不是看到一条 prompt 注入可以重定向的 `gh api ...` shell 命令；(b) comment 内容在 review 完成时被冻结到磁盘——上面的 GitHub 评论后来被人编辑加了 prompt-injection payload 也污染不到这次会话。缓存缺失时（老日历事件 / 缓存被清）fix_prompt.md 有 `gh api` 兜底，老 URL 仍能用。
+   - **剩余的风险，必须承认**：Yolo 按钮还在，被点了就还是无审批执行。`git worktree` 只隔离 git checkout 不限制 Claude Code 读 `~/.ssh` / `~/.config` 或改写 worktree 外文件，`fix_prompt.md` 的约束不是安全边界。option C 的设计选择：让 yolo 是**显式 per-session 决定**而不是默认值，把"你是否真的想给这次会话无审批"这个问题摆到每次点击的 critical path 上。
+   - **辅助工程边界（任何模式都成立）**：(a) worktree 一次性隔离在 `~/.cache/my-calendar/worktrees/`，改坏一删就回去；(b) `.command` 在 fetch/worktree-add 之前已经校验 `git remote get-url origin` 与 URL 的 repo 一致，push 推不到错的 remote；(c) `fix_prompt.md` 硬约束 diff >1000 行 abort、只改 review 点名处、不 --force push。
 - **不自动跑修复**：只写日历、塞 URL，由人决定要不要点。修复也是普通的 claude 会话，受用户监督
 - **默认 Terminal 不侦测 iTerm2**：减少配置面；用户用 iTerm2 想接管，改 launch_fix.sh 末尾的 `open -a Terminal` 为 `open -a iTerm` 即可（记得改完重装 .app）
 - **用 `.command` 文件 + `open -a Terminal`，不用 `osascript do script Terminal`**：osascript do script 走 AppleEvents (Automation TCC)，未签名 osacompile 应用经常被静默拒绝 -1743 errAEEventNotPermitted，连授权对话框都不弹。`.command` 是 LaunchServices 文档打开，没有 TCC 门槛，第一次点链接就能用。.command 文件首行 `rm -f $0` 自删避免堆积
 - **`launch_fix.sh` 不做 `git rev-parse` 校验 origin_cwd**：launcher 跑在 .app 的 TCC 沙箱里，`git -C ~/Desktop/<repo>` 会 EPERM（即使 Info.plist 声明了 `NSDesktopFolderUsageDescription`，一旦 TCC 库记下 deny 就不再弹框，重装 .app 也不清）。校验会把每次点击都打去 picker，违背"URL 里给的路径应该被用上"的语义。URL 来源是本地 pre-push hook，攻击面≈0，直接信任。路径错了在 Terminal 里 `git -C <wrong> fetch` 失败，用户能看到
 - **install_app.sh 末尾 `tccutil reset All <bundle-id>`**：清掉旧 TCC 决定，避免老版本 .app 留下的 deny 状态污染新版。tccutil 没有记录可清时返回非零，无视即可
-- **launcher + parser + config helper + prompt 都打包进 .app bundle（`Contents/Resources/`）**：早期版本是 `__LAUNCHER_PATH__` 占位 + 指向 repo 内绝对路径，但若 repo 在 `~/Desktop` / `~/Documents` / `~/Downloads` 这类 macOS TCC 受保护目录下，.app 跑 bundled launcher 会直接 `EPERM (126)`（Info.plist 里也没声明 `NSDesktopFolderUsageDescription`，弹不出权限对话框）。把脚本和 prompt 搬进 bundle 内部后，.app 读自己 bundle 里的资源不受 TCC 管，问题彻底消失。代价是改任意一个源文件都要 `bash scripts/install_app.sh` 重装一次（installer 重新复制）。**bundle 清单与 launch_fix.sh 的 `$HERE/...` 依赖必须保持一致**——任何 helper 漏打包都会让 launch_fix.sh 的 fail-safe 落回默认。fail-closed 后的失败模式：`mycalfix_config.py` 漏打包 → `claude-flag` 失败 → launcher 回 interactive（用户即使在 config 里写了 `mycalfix_interactive_claude: false` 也拿不到 yolo，但行为是安全方向，不像之前会静默升级到 yolo 绕过审批）。`install_app.sh` 装完会跑 bundled parser + bundled config helper 的 smoke 测试（HOME 清空跑 `claude-flag` 必须输出空字符串，否则 fail install），`scripts/test_pr_watcher.py::InstallAppBundleManifestTests` 在 CI/单测层面用 regex 静态校验 `install_app.sh` 里每个 helper 都有对应的 `cp <var> "$RESOURCES/<helper>"` 行（PR #22 codex 建议：旧的 `assertIn` 只看路径字符串，会被"删 cp 留 echo"骗过）
+- **launcher + parser + prompt 都打包进 .app bundle（`Contents/Resources/`）**：早期版本是 `__LAUNCHER_PATH__` 占位 + 指向 repo 内绝对路径，但若 repo 在 `~/Desktop` / `~/Documents` / `~/Downloads` 这类 macOS TCC 受保护目录下，.app 跑 bundled launcher 会直接 `EPERM (126)`（Info.plist 里也没声明 `NSDesktopFolderUsageDescription`，弹不出权限对话框）。把脚本和 prompt 搬进 bundle 内部后，.app 读自己 bundle 里的资源不受 TCC 管，问题彻底消失。代价是改任意一个源文件都要 `bash scripts/install_app.sh` 重装一次（installer 重新复制）。**bundle 清单与 launch_fix.sh 的 `$HERE/...` 依赖必须保持一致**——任何 helper 漏打包都会让 launch_fix.sh 启动时 abort。`install_app.sh` 装完会跑 bundled parser 的 smoke 测试，`scripts/test_pr_watcher.py::InstallAppBundleManifestTests` 在 CI/单测层面用 regex 静态校验 `install_app.sh` 里每个 helper 都有对应的 `cp <var> "$RESOURCES/<helper>"` 行；同时锁住"`mycalfix_config.py` 已经被删除"这条约定，防止某次回滚悄悄把它装回去（旧版本里它强制 yolo，会绕过 per-click 对话框）
 - **log 写 `~/Library/Logs/MyCalFix/`，不写 repo `logs/`**：同一原因——bundled launcher 是 .app 的子进程，写 Desktop 下 `logs/` 也会 EPERM。`~/Library/Logs/` 是 Apple 文档化的应用日志位置，不受 TCC 管
 - **`LSUIElement=true`**：MyCalFix 是一次性 URL handler，不该出现在 Dock / 应用切换器里
-- **prompt 里硬约束 "diff >200 行 abort"**：safeguard，防止 claude 被 prompt injection 或误解 review 拐去做大重构
+- **prompt 里硬约束 "diff >1000 行 abort"**：safeguard，防止 claude 被 prompt injection 或误解 review 拐去做大重构

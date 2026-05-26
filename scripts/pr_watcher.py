@@ -59,6 +59,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -86,6 +87,7 @@ LOG_DIR = HERE / "pr_logs"
 SCRATCH_BASE = Path("/tmp/codex-pr-runs")
 LOCK_DIR = HERE / "locks"                     # per-PR flock files + cancel markers + state lock
 STATE_LOCK_PATH = LOCK_DIR / "state.lock"     # brief flock around state read/merge/write
+COMMENT_BODY_CACHE_DIR = Path.home() / ".cache" / "my-calendar" / "fix-comments"  # see cache_comment_body()
 CODEX_SLOT_POLL_SEC = 2.0                     # how often to retry when all slots are full
 CODEX_SLOT_TIMEOUT_SEC = 30 * 60              # max time to wait for a slot before bailing
 CANCEL_POLL_SEC = 0.5                         # how often the leader checks for the cancel marker
@@ -673,6 +675,51 @@ def _parse_iso_utc(s: str) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+_ISSUECOMMENT_RE = re.compile(r"#issuecomment-(\d+)")
+
+
+def cache_comment_body(comment_url: str | None, comment_body: str | None) -> Path | None:
+    """Pre-fetch the codex review comment body to a local file so the fix
+    launcher hands claude a path instead of having claude run `gh api`.
+
+    Why this exists (issue raised on PR #30):
+    fix_prompt.md step 1 used to have claude run `gh api .../comments/<id>
+    --jq .body` at the start of every fix session. Under prompt injection
+    (the body of a different comment, the PR diff, etc.), claude could be
+    coaxed into fetching a DIFFERENT URL than intended — e.g. an attacker-
+    controlled comment on a different repo carrying further instructions.
+    By caching the body here at review-completion time (pr_watcher trusts
+    the codex pipeline that produced it), the fix prompt can tell claude to
+    read a specific local file. In interactive mode the Approve dialog now
+    shows the exact file being read, not an opaque shell command. The
+    dynamic-fetch attack surface is gone.
+
+    Cache key is the numeric issue-comment id parsed from the html_url
+    (`...#issuecomment-<id>`). Same id is used by launch_fix.sh to look the
+    file back up. Returns the written Path on success, None otherwise (no
+    URL / no body / unparseable URL / write failure). The launcher falls
+    back to gh api when None — old calendar events still work.
+    """
+    if not comment_url or not comment_body:
+        return None
+    m = _ISSUECOMMENT_RE.search(comment_url)
+    if not m:
+        return None
+    cid = m.group(1)
+    try:
+        COMMENT_BODY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"      warn: cannot create comment-body cache dir: {e}", flush=True)
+        return None
+    path = COMMENT_BODY_CACHE_DIR / f"{cid}.md"
+    try:
+        path.write_text(comment_body, encoding="utf-8")
+    except OSError as e:
+        print(f"      warn: failed to cache comment body to {path}: {e}", flush=True)
+        return None
+    return path
+
+
 def fetch_latest_comment(repo: str, number: int) -> tuple[str | None, str | None]:
     """Return (html_url, body) of the most recent comment by the current user on the PR."""
     try:
@@ -1161,7 +1208,7 @@ def _build_paste_ready_fix_command(
     prompt = (
         f"针对 {comment_ref} 这条 codex review 反馈做修复。"
         f"只改 review 明确点名的位置；跑项目自检；commit + push 同分支（不要 --force）。"
-        f"diff 超 200 行就 abort。"
+        f"diff 超 1000 行就 abort。"
     )
     return (
         f"cd {cwd} && "
@@ -1196,11 +1243,15 @@ def build_event(
         body_section.append("（未抓到评论内容）")
 
     # ── fix 入口（仅 ⚠️ / ❌；✅ 不需要修复） ──
-    # URL goes on EKEvent.url (Calendar.app surfaces as a clickable link); the
-    # paste-ready command is also dumped into notes as a degradation path for
-    # when MyCalFix.app isn't installed. Fork PRs are explicitly skipped — the
-    # launcher's `git fetch origin <branch>` would fail on a head branch that
-    # lives in someone else's fork.
+    # The mycalfix:// URL goes on EKEvent.url — Calendar.app surfaces it as a
+    # clickable attachment icon, which is the single discoverable entry point.
+    # We deliberately do NOT repeat the URL as text in the body (the user
+    # called out the URL appearing multiple times as visual noise). The body
+    # keeps only the paste-ready degradation command (for users without
+    # MyCalFix.app), the origin_cwd-unknown advisory, and the fork-PR
+    # explanation. Fork PRs never get a launcher URL — the launcher's
+    # `git fetch origin <branch>` would fail on a head branch that lives in
+    # someone else's fork.
     fix_url: str | None = None
     fix_section: list[str] = []
     if verdict in ("⚠️", "❌"):
@@ -1208,28 +1259,22 @@ def build_event(
         fix_section = [
             "",
             "─" * 40,
-            "🛠 修复入口（MyCalFix）",
         ]
         if fork:
             fix_section.append(
-                f"链接：（fork PR，head 在 {pr.head_repo or '未知 fork'}，"
-                f"暂不支持自动修复入口；请到对应 fork 本地手动 checkout）"
+                f"fork PR（head 在 {pr.head_repo or '未知 fork'}），"
+                f"暂不支持自动修复入口；请到对应 fork 本地手动 checkout。"
             )
         else:
             fix_url = _build_fix_url(pr=pr, comment_url=comment_url, origin_cwd=origin_cwd)
             paste_cmd = _build_paste_ready_fix_command(
                 pr=pr, comment_url=comment_url, origin_cwd=origin_cwd,
             )
-            if fix_url:
-                fix_section.append(f"链接：{fix_url}")
-            else:
-                fix_section.append("链接：（缺 head_branch 或 comment_url，未能构造 mycalfix URL）")
-            fix_section.append("")
             if not origin_cwd:
                 fix_section.append("⚠️  origin_cwd 未知（本次走的 launchd 兜底路径，没有 hook 喂数据）。")
-                fix_section.append("    .app 触发时会弹目录选择器；下次本地 push 同 PR 会自动落 origin_cwd。")
+                fix_section.append("    MyCalFix 触发时会弹目录选择器；下次本地 push 同 PR 会自动落 origin_cwd。")
                 fix_section.append("")
-            fix_section.append("paste-ready 命令（无 .app 时降级用）：")
+            fix_section.append("paste-ready 命令（无 MyCalFix.app 时降级用）：")
             fix_section.append(paste_cmd)
 
     # ── metadata 折到最后 ──
@@ -1318,6 +1363,12 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     comment_url, comment_body = fetch_latest_comment(pr.repo, pr.number)
     body_preview = (comment_body or "")[:80].replace("\n", " ")
     print(f"      comment_url={comment_url}  body={len(comment_body or '')}B  preview={body_preview!r}", flush=True)
+
+    # Cache the body to disk so launch_fix.sh can hand claude a local path
+    # instead of having claude do `gh api` (prompt-injection mitigation E).
+    # Best-effort: a failure here is non-fatal — fix_prompt.md keeps a
+    # gh-api fallback for old events / cache misses.
+    cache_comment_body(comment_url, comment_body)
 
     # origin_cwd may have been recorded by --force on this run (hook path) or
     # left over from a prior hook run; resolve once and pass it both into the

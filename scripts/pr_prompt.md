@@ -16,7 +16,7 @@
    - **评论 body 的第一行必须是下面这段 AI 共著标记（原样照抄，包括 HTML 注释）**——下游的"人类活跃度"统计依赖这两行识别 AI 自动产物，不允许省略、改写、翻译或挪到末尾：
 
      ```
-     > 🤖 由 Codex 自动生成（pr_watcher 触发，无人工干预）· 本仓库所有者未介入此条评论的撰写
+     > 🤖 由 Codex 自动生成
      <!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->
      ```
 
