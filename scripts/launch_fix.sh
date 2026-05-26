@@ -162,8 +162,13 @@ if [[ -z "$origin_cwd" ]]; then
   chosen=$(prompt_for_folder "$repo")
   chosen="${chosen%$'\n'}"
   if [[ -z "$chosen" ]]; then
-    echo "  picker cancelled" >> "$LOG_FILE"
-    exit 4
+    # User-declined path: exit 0 (silent no-op). main.applescript wraps this
+    # launcher in `do shell script`, which raises on ANY non-zero exit and
+    # surfaces a "MyCalFix 启动失败" alert. Cancel is a normal user choice,
+    # not a failure — we must not spook the user with an error popup after
+    # they intentionally hit Cancel. See codex review on PR #30 issuecomment-4539728569.
+    echo "  picker cancelled (silent no-op)" >> "$LOG_FILE"
+    exit 0
   fi
   origin_cwd="$chosen"
 fi
@@ -200,6 +205,17 @@ echo "  comment_body_path: ${COMMENT_BODY_PATH:-<no cache; fix_prompt.md will us
 # ─── option C: per-click mode dialog ────────────────────────────────────────
 # MYCALFIX_MODE env var bypasses the dialog (tests, scripted launches, users
 # who really want a sticky preference exported in their shell). Unset → dialog.
+#
+# Exit-code contract for the consent paths below: every "user declined" /
+# "config said don't proceed" branch must `exit 0` (silent no-op). The .app
+# entrypoint (main.applescript) wraps this launcher in `do shell script`,
+# which raises on ANY non-zero exit and surfaces a "MyCalFix 启动失败" alert.
+# Cancel is a normal user choice, not a failure — codex review flagged the
+# original `exit 4` here as a blocker on PR #30 (issuecomment-4539728569).
+# Non-zero exits are reserved for genuine launcher failures (parse error,
+# missing prompt file, Terminal won't open) where the AppleScript alert IS
+# the correct user feedback. show_alert paths in this consent block already
+# explain the issue themselves, so exit 0 avoids stacking a second alert.
 case "${MYCALFIX_MODE:-}" in
   yolo)
     chosen_mode="yolo"
@@ -210,8 +226,8 @@ case "${MYCALFIX_MODE:-}" in
     echo "  mode: interactive (forced via MYCALFIX_MODE=interactive)" >> "$LOG_FILE"
     ;;
   cancel)
-    echo "  mode: cancel (forced via MYCALFIX_MODE=cancel); not launching" >> "$LOG_FILE"
-    exit 4
+    echo "  mode: cancel (forced via MYCALFIX_MODE=cancel); silent no-op" >> "$LOG_FILE"
+    exit 0
     ;;
   "")
     dialog_choice=$(prompt_for_mode "$pr")
@@ -226,20 +242,22 @@ case "${MYCALFIX_MODE:-}" in
         echo "  mode: interactive (chosen via dialog)" >> "$LOG_FILE"
         ;;
       ""|Cancel)
-        echo "  mode dialog cancelled or osascript failed; not launching" >> "$LOG_FILE"
-        exit 4
+        echo "  mode dialog cancelled or osascript failed; silent no-op" >> "$LOG_FILE"
+        exit 0
         ;;
       *)
-        echo "  unexpected mode dialog return: $dialog_choice; not launching" >> "$LOG_FILE"
-        exit 4
+        echo "  unexpected mode dialog return: $dialog_choice; silent no-op" >> "$LOG_FILE"
+        exit 0
         ;;
     esac
     ;;
   *)
     msg="MyCalFix: 未知 MYCALFIX_MODE 值: ${MYCALFIX_MODE}. 接受 yolo|interactive|cancel"
     echo "$msg" >> "$LOG_FILE"
+    # show_alert already informs the user about the bad config value. Exit 0
+    # to suppress main.applescript's redundant "MyCalFix 启动失败" alert.
     show_alert "$msg"
-    exit 4
+    exit 0
     ;;
 esac
 

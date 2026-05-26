@@ -2234,16 +2234,23 @@ class LaunchFixCommandFileRenderTests(unittest.TestCase):
             "the single-quoted prompt arg — no flag between them."
         )
 
-    def test_launcher_aborts_when_mycalfix_mode_cancel(self):
-        # Option C consent dialog → Cancel button maps to MYCALFIX_MODE=cancel.
-        # The launcher must NOT proceed to write a .command file or invoke
-        # `open` — that's the whole point of consent.
+    def test_launcher_silently_no_ops_when_mycalfix_mode_cancel(self):
+        # Option C consent contract + codex blocker on PR #30
+        # (issuecomment-4539728569). When the user picks Cancel, the launcher
+        # must (a) NOT proceed to write a .command file or invoke `open` AND
+        # (b) exit 0 — main.applescript wraps the launcher in `do shell
+        # script`, which raises on ANY non-zero exit and surfaces a
+        # "MyCalFix 启动失败" alert. Cancel is a normal user choice, not a
+        # failure; the alert would be a surprise after the user intentionally
+        # hit Cancel. Hence the cancel path must exit 0 (silent no-op).
         result, cmd_path = self._run_launcher_with_stubbed_open(mycalfix_mode="cancel")
-        self.assertNotEqual(
+        self.assertEqual(
             result.returncode, 0,
-            "launch_fix.sh should exit non-zero when the user cancels the "
-            "consent dialog (MYCALFIX_MODE=cancel), to communicate 'no work "
-            "was done' to the .app caller."
+            "launch_fix.sh must exit 0 when MYCALFIX_MODE=cancel — non-zero "
+            "would trigger main.applescript's `MyCalFix 启动失败` alert and "
+            "spook the user who just deliberately clicked Cancel. "
+            "See codex review on PR #30 (issuecomment-4539728569).\n"
+            f"--- stderr ---\n{result.stderr}"
         )
         self.assertIsNone(
             cmd_path,
@@ -3030,6 +3037,118 @@ class ClearStaleCancelMarkerStatUnlinkRaceTests(unittest.TestCase):
                     "have been unlinked by the now-unblocked worker",
                 )
                 t.join(timeout=2)
+
+
+class AppLauncherConsentExitContractTests(unittest.TestCase):
+    """Codex blocker on PR #30 (issuecomment-4539728569):
+    main.applescript wraps launch_fix.sh in `do shell script`, which raises on
+    ANY non-zero exit and surfaces a "MyCalFix 启动失败" alert. Cancel is a
+    normal user choice — getting an error popup after deliberately hitting
+    Cancel is the failure mode codex flagged. The fix: every consent-declined
+    path in launch_fix.sh must `exit 0` (silent no-op). Non-zero exits are
+    reserved for genuine launcher failures (parse error, missing file, can't
+    open Terminal) where the AppleScript alert IS the right user signal.
+
+    These tests lock both ends of the contract: the AppleScript trigger
+    (non-zero → alert) and the launcher exit policy (consent → exit 0).
+    """
+
+    LAUNCHER = HERE / "launch_fix.sh"
+    APPLESCRIPT = HERE.parent / "app" / "MyCalFix" / "main.applescript"
+
+    def test_applescript_uses_do_shell_script_with_error_alert(self):
+        # The "do shell script" call is the mechanism that turns a non-zero
+        # exit from launch_fix.sh into a Mac alert. If the AppleScript ever
+        # stops using `do shell script` (or stops alerting on error), the
+        # exit-code policy below becomes moot — we'd want to revisit then.
+        body = self.APPLESCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "do shell script", body,
+            "main.applescript no longer uses `do shell script` — the "
+            "launcher exit-code contract (consent paths must exit 0) may "
+            "need revisiting. See codex review on PR #30 issuecomment-4539728569.",
+        )
+        self.assertIn(
+            "on error", body,
+            "main.applescript must have an `on error` handler to catch the "
+            "non-zero exits that `do shell script` raises. Without it the "
+            ".app would silently swallow real launcher failures."
+        )
+        self.assertIn(
+            "MyCalFix 启动失败", body,
+            "The error path's alert text is the user-visible symptom of the "
+            "codex blocker. Lock the exact string so refactors don't lose the "
+            "context that explains why consent paths must exit 0."
+        )
+
+    def test_all_consent_declined_paths_exit_zero(self):
+        # Static reading of launch_fix.sh: every `exit N` line that follows a
+        # log line containing "cancelled" / "silent no-op" / "未知 MYCALFIX_MODE"
+        # / "picker cancelled" — i.e. paths where the user (or their config)
+        # declined to proceed — must be exit 0. If a future edit reintroduces
+        # `exit 4` here, the .app's "MyCalFix 启动失败" alert comes back and
+        # the PR #30 codex blocker regresses.
+        body = self.LAUNCHER.read_text(encoding="utf-8")
+        consent_markers = (
+            "picker cancelled",
+            "mode: cancel (forced via MYCALFIX_MODE=cancel)",
+            "mode dialog cancelled or osascript failed",
+            "unexpected mode dialog return:",
+            "未知 MYCALFIX_MODE 值",
+        )
+        lines = body.splitlines()
+        for marker in consent_markers:
+            with self.subTest(marker=marker):
+                marker_idx = next(
+                    (i for i, ln in enumerate(lines) if marker in ln),
+                    None,
+                )
+                self.assertIsNotNone(
+                    marker_idx,
+                    f"consent-declined marker {marker!r} not found in "
+                    "launch_fix.sh — either the marker text changed or the "
+                    "branch was removed. Update this test to match.",
+                )
+                # The exit statement should be within ~6 lines after the
+                # marker (allowing for show_alert + comment + blank line).
+                window = lines[marker_idx:marker_idx + 8]
+                exit_lines = [ln for ln in window if "exit " in ln and "echo" not in ln]
+                self.assertTrue(
+                    exit_lines,
+                    f"no `exit N` found within 8 lines after marker "
+                    f"{marker!r} — branch structure changed unexpectedly.",
+                )
+                for exit_line in exit_lines:
+                    self.assertIn(
+                        "exit 0", exit_line,
+                        f"consent-declined path with marker {marker!r} "
+                        f"has a non-zero exit: {exit_line.strip()!r}. "
+                        f"This regresses the PR #30 codex blocker — every "
+                        f"user-cancel path must exit 0 so the .app's "
+                        f"`do shell script` doesn't fire `MyCalFix 启动失败`.",
+                    )
+
+    def test_e2e_launcher_cancel_paths_all_exit_zero(self):
+        # End-to-end: drive launch_fix.sh with each cancel-shaped
+        # MYCALFIX_MODE value and assert exit 0. This complements the static
+        # check above by exercising the actual code path. The interactive /
+        # yolo modes are already covered by the per-mode renderer tests.
+        for mode in ("cancel",):
+            with self.subTest(mode=mode):
+                render = LaunchFixCommandFileRenderTests()
+                result, cmd_path = render._run_launcher_with_stubbed_open(
+                    mycalfix_mode=mode,
+                )
+                self.assertEqual(
+                    result.returncode, 0,
+                    f"MYCALFIX_MODE={mode} must yield exit 0. Got "
+                    f"{result.returncode}.\nstderr: {result.stderr}\n"
+                    "See codex review on PR #30 issuecomment-4539728569."
+                )
+                self.assertIsNone(
+                    cmd_path,
+                    f"MYCALFIX_MODE={mode} must not reach `open -a Terminal`."
+                )
 
 
 class CacheCommentBodyTests(unittest.TestCase):
