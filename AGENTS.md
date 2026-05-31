@@ -1,8 +1,16 @@
 # my-calendar
 
-本地节日提醒系统。每天扫描未来 7 天的节日（中国法定 + 西方常见 + 自定义），把"提醒事件"写入苹果日历，事件描述里附上你过去在同一节日做过什么、对方反馈如何，方便你做今年的决策。
+一套围绕 **Claude Code / codex 等 AI agent 的本地软件协作工作流**，借苹果日历当"通知总线"落地。核心是三条 AI workflow：
 
-所有数据都是本地文件——没有数据库、没有云端、没有账号。
+1. **PR 自动 review（pr_watcher）** — 每次 `git push` 触发 `codex` 给该 PR 做跨 org 代码评审，自动发到 PR comment，并往日历写一条带 `codex resume <id>` 的事件。
+2. **一键 AI 修复（MyCalFix.app + `mycalfix://` URL scheme）** — review 给出 ⚠️/❌ 后，从日历事件直接一键起本地 `claude` 修复会话，自动 checkout / 建 worktree / 灌入 fix prompt。
+3. **AI 共著标记约定** — 所有"AI 生成、人类未介入"的 PR 评论 / commit 都带可机器识别的共著标记，便于下游 dashboard 区分 AI 与人类活跃度。
+
+这套工作流的方法论来自作者的另一个开源项目 **[git-hired](https://realroc.github.io/git-hired/)**（AI-native 软件协作 / issue-first 上手与 AI review）——my-calendar 是把那套"让 AI agent 深度参与日常软件协作"的思路落到一台本机 + 苹果日历上的实现。
+
+第二条功能线是项目最初的形态：**本地节日提醒系统**。每天扫描未来 7 天的节日（中国法定 + 西方常见 + 自定义），把"提醒事件"写入苹果日历，事件描述里附上你过去在同一节日做过什么、对方反馈如何，方便你做今年的决策。
+
+所有数据都是本地文件——没有数据库、不自建云端。节日提醒功能确实纯本地、不需要任何账号；但上面的 AI workflow（PR review / 一键修复）依赖 GitHub / Codex / Claude 账号，且会把 PR 内容发送给对应服务做评审与修复。
 
 ---
 

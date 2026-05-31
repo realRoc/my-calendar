@@ -1,76 +1,62 @@
 # my-calendar
 
-> A local-only macOS "second brain" calendar with two features:
->
-> 1. **Holiday & gift reminders** — Chinese legal + Western common holidays +
->    your custom dates, written into Apple Calendar with the gift history of
->    past years attached so you can decide what to do this year.
-> 2. **GitHub PR auto-review** — every `git push` you do triggers a `codex`
->    code review on the PR (cross-org), posts the review as a comment, and
->    drops a calendar event with the comment link + `codex resume <id>` so you
->    can pick up the session.
->
-> No cloud, no account, no UI — all data lives in local markdown files. Drive
-> it through [Claude Code](https://claude.com/claude-code) conversations or
-> the included scripts.
+> **A local-first workflow for collaborating with AI coding agents (Claude Code / codex), wired onto Apple Calendar as the notification bus.**
+> Push code → an AI reviews the PR → the verdict lands in your calendar → one click starts a local AI fix session. No self-hosted cloud, no UI — all state lives in local files. (The AI review/fix workflow does need GitHub, Codex, and Claude accounts, and sends your PR contents to those services; the holiday reminders are the part that's fully local, no account required.)
 
-> 一个完全本地的 macOS 日历"外脑"，干两件事：
->
-> 1. **节日提醒 & 送礼记录** — 中国法定节日 + 西方常见节日 + 自定义日期写入苹果日历，
->    历年送礼记录 / 对方反馈一并附在事件描述里，方便你今年做决策。
-> 2. **GitHub PR 自动 review** — 每次 `git push` 触发 `codex` 给该 PR 做代码评审，
->    自动发到 PR comment 里，并往苹果日历写一条事件：评论链接 + 可 resume 的 codex
->    session id。跨多个 organization 都能跑。
->
-> 全本地、无账号、无 UI——数据都是本地 markdown 文件。可以让 Claude Code 帮你录入，
-> 也可以手动调脚本。
+*Read this in [中文](./README.zh-CN.md).*
+
+The methodology behind these workflows comes from the author's other open-source project — **[git-hired](https://realroc.github.io/git-hired/)** (AI-native software collaboration: issue-first onboarding and AI review). **my-calendar** is what it looks like to land that "let AI agents take part in everyday software collaboration" idea onto a single Mac, using Apple Calendar as the surface that ties it together.
+
+![demo](./assets/demo.gif)
 
 ---
 
-## 特性
+## What it does (the AI workflow)
 
-### 节日提醒
+Three independent-but-composable workflows turn your local machine + Apple Calendar into an AI collaboration loop:
 
-- **节日识别**：固定公历日期（情人节）、农历（春节/端午/中秋/七夕）、第 N 个星期 X（母亲节/父亲节/感恩节）三种规则
-- **去重幂等**：每个事件有确定性 key + state.json 索引，重复运行只更新不新建
-- **懒补跑**：错过 lead_day 但节日还没过 → 当天补一发，notes 顶端标 ⚠️
-- **缺失追溯**：节日已过但你没记录 → 写入 MISSING.md，下次开 Claude 它会主动问你
-- **零云端、零账号**：所有数据都是本地 markdown + frontmatter，离线可用，可放进自己的 git
-- **不污染主日历**：写入专门的"节日提醒"日历，可单独显示/隐藏/删除
+### 1. Automatic PR review on every push (`pr_watcher`)
 
-### PR 自动 review
+- **Zero-latency trigger** — a global `git pre-push` hook fires a background worker within ~2–3s of any local `git push`.
+- **Cross-org** — one `gh` GraphQL call sweeps every open PR you authored, across all organizations.
+- **Default-branch only** — PRs whose base ≠ the repo's default branch are skipped (feature → feature never triggers).
+- **Idempotent** — keyed on `(pr_url, head_sha)`; the same commit is reviewed once. A force-push that rewrites the SHA re-triggers.
+- **`codex` does the review** and posts it as a PR comment; the watcher writes a calendar event into a dedicated **"PR 监控"** calendar with the comment link and a `codex resume <thread_id>` command so you can pick the session back up.
+- **Cancel + restart on new commit** — if a new commit lands mid-review, the in-flight review is cancelled and restarted against the latest SHA (no queue pile-up).
+- **Fallback channel** — a launchd poll every 10 min catches what the local hook misses (PRs created on the web, pushes from another machine, bot commits).
 
-- **触发零延迟**：全局 git pre-push hook，本地 push 后 2-3 秒内启动后台 review
-- **跨 org**：通过 `gh` CLI 一次性扫所有 organization 下你发起的 open PR
-- **只看默认分支**：自动剔除 base ≠ default branch 的 PR（feature → feature 的不触发）
-- **幂等**：以 `(pr_url, head_sha)` 为键，同一 commit 只评论一次；force-push 重写 SHA 后才会重审
-- **可 resume**：日历事件里附 `codex resume <thread_id>` 命令，需要二次交互直接接着上次的会话
-- **兜底通道**：launchd 每 30 min 一次轮询，抓本地 hook 漏掉的事件（网页创建/异机 push/bot 提交）
-- **隔离日历**：评论提醒写入独立的 **"PR 监控"** 日历，不和节日混在一起
+### 2. One-click AI fix from the calendar event (`MyCalFix.app` + `mycalfix://`)
 
-## 架构总览
+- When a review verdict is **⚠️ (fix-then-merge)** or **❌ (not yet)**, the calendar event carries a `mycalfix://fix?...` URL.
+- Click it → `MyCalFix.app` pops a per-click **Yolo / Interactive / Cancel** dialog → on confirm it opens Terminal, fetches the branch into an isolated `git worktree`, and starts an interactive `claude` session pre-loaded with a fix prompt.
+- The fix happens in a throwaway worktree (your main checkout's WIP is untouched); `claude` pushes the fix back to the same PR branch.
+- Hard guardrails in the prompt: abort if the diff is > 1000 lines, only touch what the review named, run the project's self-checks, no `--force` push. Yolo is an **explicit per-session choice**, never a silent default.
+
+![one-click AI fix](./assets/auto-fix.gif)
+
+### 3. AI co-author attribution convention
+
+Every artifact that is "AI-generated, no human in the loop" carries a machine-detectable marker, so a downstream dashboard can cleanly separate AI vs. human activity:
+
+| Artifact | Marker |
+|---|---|
+| codex PR review comment | first line: a `> 🤖 由 Codex 自动生成` blockquote + `<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->` HTML comment |
+| `claude` fix commit (via MyCalFix) | `Co-Authored-By: Claude <noreply@anthropic.com>` trailer in the commit body |
+| hand-typed human PR / comment | none |
+
+The blockquote is the human-visible signal; the HTML comment is the stable grep key for scanners. Prompt templates hard-enforce both, and `scripts/test_pr_watcher.py` locks the canonical strings so an edit that mangles them turns the tests red.
+
+---
+
+## Architecture (PR side)
 
 ```
-节日侧：
-┌──────────────┐  daily 06:00   ┌──────────────────┐  EventKit  ┌─────────────┐
-│   launchd    │ ──────────────▶│  daily_check.py  │ ─────────▶ │ Apple       │
-└──────────────┘                │  (Python)        │            │ Calendar    │
-                                │                  │ ◀───────── │ "节日提醒"   │
-                                └────┬─────────────┘            └─────────────┘
-                                     │
-                                     ▼
-                         ┌─────────────────────────────┐
-                         │  holidays/  people/         │
-                         │  history/   MISSING.md      │  ← all markdown
-                         └─────────────────────────────┘
-
-PR 侧：
 ┌─────────────────┐         ┌──────────────────────┐         ┌──────────────┐
 │  git push       │──fire──▶│  global pre-push     │──spawn─▶│ pr_local_    │
-│  (任意 repo)    │         │  hook (~/.config/…)  │         │ trigger.sh   │
+│  (any repo)     │         │  hook (~/.config/…)  │         │ trigger.sh   │
 └─────────────────┘         └──────────────────────┘         └──────┬───────┘
-                                                                    │ 找到 PR
-┌──────────────┐  30min     ┌──────────────────┐                    ▼
+                                                                    │ finds PR
+┌──────────────┐  10min     ┌──────────────────┐                    ▼
 │   launchd    │ ──fallback▶│  pr_watcher.py   │◀────── --force <pr-url>
 └──────────────┘            │  (Python)        │
                             └────┬─────────────┘
@@ -78,180 +64,155 @@ PR 侧：
                                  ▼
                             ┌──────────┐  posts comment  ┌──────────────┐
                             │  codex   │ ───────────────▶│  GitHub PR   │
-                            │  (yolo)  │                 └──────────────┘
-                            └────┬─────┘
-                                 │ thread_id / 评论 URL / 完整评论原文
+                            └────┬─────┘                 └──────────────┘
+                                 │ thread_id / comment URL / full body
                                  ▼
-                            ┌──────────────────────────┐  EventKit
-                            │  build calendar event    │ ─────────▶ "PR 监控" 日历
-                            └──────────────────────────┘
+                            ┌──────────────────────────┐  EventKit   ┌──────────────┐
+                            │  build calendar event    │ ──────────▶ │ "PR 监控"     │
+                            │  (mycalfix:// fix URL)    │             │  calendar    │
+                            └──────────────────────────┘             └──────────────┘
+                                 │ click fix URL
+                                 ▼
+                            MyCalFix.app → Terminal → git worktree → claude (fix session)
 ```
 
-详细 schema 与 Claude 工作约定见 [`AGENTS.md`](./AGENTS.md)（`CLAUDE.md` 是它的 symlink）。
+Full schema and the Claude working contract live in [`AGENTS.md`](./AGENTS.md) (`CLAUDE.md` is a symlink to it).
 
 ---
 
-## 安装（约 5 分钟）
+## Install (~5 min)
 
-### 0. 前置
+### Prerequisites
 
-- macOS（要用 EventKit）
+- macOS (for EventKit)
 - Python 3.10+
-- Claude Code CLI（[claude.com/claude-code](https://claude.com/claude-code)）
-- PR 监控功能额外需要：`gh` CLI（已 `gh auth login` 完成，scopes 至少含 `repo`）、`codex` CLI（[github.com/openai/codex](https://github.com/openai/codex)）
+- [Claude Code CLI](https://claude.com/claude-code)
+- For PR review: `gh` CLI (logged in, scopes include `repo`) and the [`codex` CLI](https://github.com/openai/codex)
 
-### 1. clone + 装依赖
+### Steps
 
 ```bash
 git clone https://github.com/realRoc/my-calendar.git
 cd my-calendar
-./scripts/setup.sh
+./scripts/setup.sh                               # creates .venv/ + installs deps
+
+.venv/bin/python scripts/calendar_sync.py        # first run triggers the macOS calendar-access prompt → "Allow"
+
+./scripts/install_launchd.sh                      # daily holiday scan + PR fallback poll
+
+# enable PR review
+./scripts/install_git_hook.sh                     # global pre-push hook
+.venv/bin/python scripts/pr_watcher.py --seed-only  # record current open PRs, never comment on the first pass
+
+# enable one-click fix
+bash scripts/install_app.sh                       # builds + installs MyCalFix.app, registers mycalfix:// scheme
 ```
 
-`setup.sh` 会创建 `.venv/` 并装 `pyobjc-framework-EventKit`、`lunardate`、`pyyaml`。
+After that, every local `git push` kicks off a background codex review (comment + calendar event) within a couple of seconds, without blocking the push.
 
-### 2. 首次跑触发日历授权
-
-```bash
-.venv/bin/python scripts/calendar_sync.py
-```
-
-第一次会弹 macOS 系统对话框问"是否允许 Terminal 访问日历"——选"好"。看到 `calendar OK: '节日提醒'` 即成功。
-
-> 误点了"不允许"：去 **系统设置 → 隐私与安全性 → 日历**，手动勾选 Terminal，然后重跑。
-
-### 3. 注册 launchd
-
-```bash
-./scripts/install_launchd.sh
-```
-
-会装两个 LaunchAgent：
-
-- `com.<user>.calendar.daily` — 每天 06:00 节日扫描
-- `com.<user>.calendar.pr-watcher` — 每 30 分钟一次 PR 兜底轮询
-
-如果你只想要节日功能，可以编辑脚本的 `JOBS` 数组移除 `pr-watcher`。
-
-### 4. 真跑一次，检查日历
-
-```bash
-.venv/bin/python scripts/daily_check.py
-```
-
-打开 macOS 日历 app，左侧应该多一个 **节日提醒** 日历。
-
-### 5. （可选）启用 PR 监控
-
-```bash
-./scripts/install_git_hook.sh                              # 装全局 pre-push hook
-.venv/bin/python scripts/pr_watcher.py --seed-only         # 把现有 open PR 写入 state，首轮不评论
-```
-
-之后每次本地 `git push`：hook 在 2-3 秒内异步起 codex review、发评论、写日历事件——不阻塞 push。
-
-> 如果某个 repo 已经有 `.git/hooks/pre-push`（CI 校验等），把它改名为 `.git/hooks/pre-push.local`，全局 hook 会先 exec 它再触发 watcher。某个 repo 不想被监控：`git -C <repo> config core.hooksPath .git/hooks` 关掉。
+> If a repo already has its own `.git/hooks/pre-push` (CI checks etc.), rename it to `.git/hooks/pre-push.local` — the global hook execs it first, then triggers the watcher. To opt a repo out entirely: `git -C <repo> config core.hooksPath .git/hooks`.
 
 ---
 
-## 日常使用
-
-### 通过 Claude Code 录入数据
-
-进入项目目录开会话即可。Claude 会读 `CLAUDE.md` → `AGENTS.md` → 按 skill 文档帮你写文件：
-
-| 你说 | Claude 调用的 skill |
-|---|---|
-| "加一个节日：奶奶生日是 7 月 12 号" | `add-holiday` |
-| "记一下妈妈喜欢剧场，对玫瑰过敏" | `add-person` |
-| "今天送了妈妈 580 块剧院票" | `record-history`（新建） |
-| "妈妈说那票她很喜欢" | `record-history`（补反馈） |
-
-### 手动调试
+## Debugging the AI workflow
 
 ```bash
-# 看接下来 14 天有什么节日，今天会不会触发
-.venv/bin/python scripts/daily_check.py --dry-run --days 14
-
-# 强制把窗口内所有节日都写进日历（忽略 lead_days）
-.venv/bin/python scripts/daily_check.py --force --days 30
-
-# 假装今天是别的日子（测试用）
-.venv/bin/python scripts/daily_check.py --dry-run --today 2026-09-25
-```
-
-### 查历史
-
-```bash
-ls history/*/*__mom.md                    # 给妈妈做过的所有事
-ls history/*/*__mothers-day__*.md         # 历年母亲节做过的事
-grep -l 'feedback: ""' history/*/*.md     # 还没收到反馈的所有送礼
-```
-
-### PR 监控调试
-
-```bash
-# 看候选 PR + 哪些会触发 codex（不真跑）
+# candidate PRs + which would trigger codex (no real run)
 .venv/bin/python scripts/pr_watcher.py --dry-run
 
-# 对指定 PR 强制跑一次（绕过 state 检查）
+# force a run on a specific PR (bypasses the state check)
 .venv/bin/python scripts/pr_watcher.py --force https://github.com/<owner>/<repo>/pull/<n>
 
-# 实时观察 hook 触发情况
+# watch the push-trigger chain live
 tail -f ~/.config/my-calendar/git-hooks/logs/trigger.log
 
-# launchd 兜底通道日志
+# launchd fallback channel
 tail -f logs/pr-watcher.log
+
+# how each mycalfix:// URL was parsed + launched
+tail -f ~/Library/Logs/MyCalFix/launch_fix.log
 ```
 
-更详细的设计取舍、错误恢复、prompt 自定义见 [`AGENTS.md`](./AGENTS.md) 的 **PR 监控（pr_watcher）** 一节。
+Concurrency cap, prompt customization, cancel-restart internals, and the security trade-offs of yolo mode are documented in the **PR 监控** and **PR review 修复入口** sections of [`AGENTS.md`](./AGENTS.md).
 
 ---
 
-## 已预填的节日
+# The original feature: holiday & gift reminders
 
-| ID | 中文名 | 类别 | 日期规则 |
-|---|---|---|---|
-| `new-year` | 元旦 | cn-legal | 公历 1-1 |
-| `spring-festival` | 春节 | cn-legal | 农历 1-1 |
-| `qingming` | 清明节 | cn-legal | 公历 4-5（节气近似） |
-| `labor-day` | 劳动节 | cn-legal | 公历 5-1 |
-| `dragon-boat` | 端午节 | cn-legal | 农历 5-5 |
-| `mid-autumn` | 中秋节 | cn-legal | 农历 8-15 |
-| `national-day` | 国庆节 | cn-legal | 公历 10-1 |
-| `valentines-day` | 情人节 | western | 公历 2-14 |
-| `mothers-day` | 母亲节 | western | 5月第二个周日 |
-| `fathers-day` | 父亲节 | western | 6月第三个周日 |
-| `qixi` | 七夕 | western | 农历 7-7 |
-| `thanksgiving` | 感恩节 | western | 11月第四个周四 |
-| `christmas` | 圣诞节 | western | 公历 12-25 |
+The project started life as a local holiday reminder, and that half still runs alongside the AI workflow.
 
-custom/ 目录留给你自己加（家人生日、纪念日、私人节日）。
+It scans the next 7 days of holidays (Chinese legal + Western common + your custom dates) and writes a reminder event into Apple Calendar, with the history of what you did for the same holiday in past years — and how the recipient reacted — attached to the event description, so you can decide what to do this year.
 
----
+### Holiday-side features
 
-## 卸载
+- **Date rules** — fixed Gregorian (Valentine's), lunar (Spring Festival / Dragon Boat / Mid-Autumn / Qixi), and nth-weekday (Mother's / Father's / Thanksgiving).
+- **Idempotent** — deterministic event key + `state.json` index; re-runs update, never duplicate.
+- **Lazy catch-up** — missed a lead day but the holiday hasn't passed → fire once today with a ⚠️ at the top of the notes.
+- **Missing-record tracking** — holiday passed but you logged nothing → written into `MISSING.md`; next time you open Claude it proactively asks you to fill it in.
+- **Local-only** — all data is local markdown + frontmatter; offline-capable; commit it to your own git.
+- **Doesn't pollute your main calendar** — writes to a dedicated **"节日提醒"** calendar you can show / hide / delete on its own.
+
+### Entering data via Claude Code
+
+Open a session in the project directory. Claude reads `CLAUDE.md` → `AGENTS.md` and writes the files for you per the skill docs:
+
+| You say | Skill |
+|---|---|
+| "Add a holiday: grandma's birthday is July 12" | `add-holiday` |
+| "Note that mom likes theater and is allergic to roses" | `add-person` |
+| "Gave mom a ¥580 theater ticket today" | `record-history` (create) |
+| "Mom said she loved the ticket" | `record-history` (add feedback) |
+
+### Manual holiday commands
 
 ```bash
-# 节日 launchd
-launchctl unload ~/Library/LaunchAgents/com.YOURNAME.calendar.daily.plist
-rm ~/Library/LaunchAgents/com.YOURNAME.calendar.daily.plist
+# what's coming in the next 14 days, will it trigger today
+.venv/bin/python scripts/daily_check.py --dry-run --days 14
 
-# PR 监控 launchd
-launchctl unload ~/Library/LaunchAgents/com.YOURNAME.calendar.pr-watcher.plist
-rm ~/Library/LaunchAgents/com.YOURNAME.calendar.pr-watcher.plist
+# force-write every holiday in the window (ignore lead_days)
+.venv/bin/python scripts/daily_check.py --force --days 30
 
-# 全局 git hook
-git config --global --unset core.hooksPath
-rm -rf ~/.config/my-calendar
+# query history
+ls history/*/*__mom.md                    # everything done for mom
+grep -l 'feedback: ""' history/*/*.md     # gifts with no feedback yet
 ```
 
-苹果日历里的 **"节日提醒"** 和 **"PR 监控"** 两个日历可以在日历 app 里手动右键删除（连同所有事件）。
+### Pre-filled holidays
+
+| ID | Name | Category | Date rule |
+|---|---|---|---|
+| `new-year` | 元旦 | cn-legal | Gregorian 1-1 |
+| `spring-festival` | 春节 | cn-legal | lunar 1-1 |
+| `qingming` | 清明节 | cn-legal | Gregorian ~4-5 |
+| `labor-day` | 劳动节 | cn-legal | Gregorian 5-1 |
+| `dragon-boat` | 端午节 | cn-legal | lunar 5-5 |
+| `mid-autumn` | 中秋节 | cn-legal | lunar 8-15 |
+| `national-day` | 国庆节 | cn-legal | Gregorian 10-1 |
+| `valentines-day` | 情人节 | western | Gregorian 2-14 |
+| `mothers-day` | 母亲节 | western | 2nd Sunday of May |
+| `fathers-day` | 父亲节 | western | 3rd Sunday of June |
+| `qixi` | 七夕 | western | lunar 7-7 |
+| `thanksgiving` | 感恩节 | western | 4th Thursday of Nov |
+| `christmas` | 圣诞节 | western | Gregorian 12-25 |
+
+`custom/` is yours to fill (birthdays, anniversaries, private holidays).
 
 ---
+
+## Uninstall
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.YOURNAME.calendar.daily.plist
+rm ~/Library/LaunchAgents/com.YOURNAME.calendar.daily.plist
+launchctl unload ~/Library/LaunchAgents/com.YOURNAME.calendar.pr-watcher.plist
+rm ~/Library/LaunchAgents/com.YOURNAME.calendar.pr-watcher.plist
+git config --global --unset core.hooksPath
+rm -rf ~/.config/my-calendar
+rm -rf ~/Applications/MyCalFix.app
+```
+
+The **"节日提醒"** and **"PR 监控"** calendars can be deleted by right-clicking them in Calendar.app (removes all their events too).
 
 ## License
 
-MIT — 见 [LICENSE](./LICENSE)。
-
-随便用、随便改、随便商用，保留版权声明就行。
+MIT — see [LICENSE](./LICENSE). Use, modify, and ship it freely; just keep the copyright notice.
