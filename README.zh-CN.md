@@ -5,7 +5,7 @@
 
 *Read this in [English](./README.md).*
 
-这套工作流的方法论来自作者的另一个开源项目 —— **[git-hired](https://realroc.github.io/git-hired/)**（AI-native 软件协作：issue-first 上手与 AI review）。**my-calendar** 是把那套"让 AI agent 深度参与日常软件协作"的思路，落到一台本机 + 苹果日历上的实现。
+这套工作流的方法论来自我的另一个开源项目 —— **[git-hired](https://realroc.github.io/git-hired/)**（AI-native 软件协作：issue-first 上手与 AI review）。**my-calendar** 是把那套"让 AI agent 深度参与日常软件协作"的思路，落到一台本机 + 苹果日历上的实现。
 
 ![demo](./assets/demo.gif)
 
