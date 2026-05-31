@@ -32,6 +32,8 @@
 - 修复跑在一次性 worktree 里（主 checkout 的 WIP 完全不受打扰）；`claude` 改完 push 回原 PR 分支。
 - prompt 里的硬约束：diff > 1000 行 abort、只改 review 点名处、跑项目自检、不 `--force` push。Yolo 是**显式的 per-session 选择**，永远不是静默默认。
 
+![一键 AI 修复](./assets/auto-fix.gif)
+
 ### 3. AI 共著标记约定
 
 所有"AI 生成、人类未介入"的产物都带可机器识别的标记，下游 dashboard 可以干净地区分 AI 与人类活跃度：

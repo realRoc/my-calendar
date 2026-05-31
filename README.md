@@ -32,6 +32,8 @@ Three independent-but-composable workflows turn your local machine + Apple Calen
 - The fix happens in a throwaway worktree (your main checkout's WIP is untouched); `claude` pushes the fix back to the same PR branch.
 - Hard guardrails in the prompt: abort if the diff is > 1000 lines, only touch what the review named, run the project's self-checks, no `--force` push. Yolo is an **explicit per-session choice**, never a silent default.
 
+![one-click AI fix](./assets/auto-fix.gif)
+
 ### 3. AI co-author attribution convention
 
 Every artifact that is "AI-generated, no human in the loop" carries a machine-detectable marker, so a downstream dashboard can cleanly separate AI vs. human activity:
