@@ -1,7 +1,7 @@
 # my-calendar
 
 > **A local-first workflow for collaborating with AI coding agents (Claude Code / codex), wired onto Apple Calendar as the notification bus.**
-> Push code → an AI reviews the PR → the verdict lands in your calendar → one click starts a local AI fix session. No cloud, no account, no UI — everything is local files.
+> Push code → an AI reviews the PR → the verdict lands in your calendar → one click starts a local AI fix session. No self-hosted cloud, no UI — all state lives in local files. (The AI review/fix workflow does need GitHub, Codex, and Claude accounts, and sends your PR contents to those services; the holiday reminders are the part that's fully local, no account required.)
 
 *Read this in [中文](./README.zh-CN.md).*
 

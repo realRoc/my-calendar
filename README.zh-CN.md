@@ -1,7 +1,7 @@
 # my-calendar
 
 > **一套面向 AI 编码 agent（Claude Code / codex）的本地协作工作流，借苹果日历当"通知总线"落地。**
-> 推代码 → AI 自动 review PR → 结论落进日历 → 一键起本地 AI 修复会话。全本地、无账号、无 UI——数据都是本地文件。
+> 推代码 → AI 自动 review PR → 结论落进日历 → 一键起本地 AI 修复会话。不自建云端、无 UI——状态都存本地文件。（AI review/fix 工作流需要 GitHub / Codex / Claude 账号，且会把 PR 内容发送给对应服务；节日提醒才是纯本地、不需要任何账号的那部分。）
 
 *Read this in [English](./README.md).*
 
