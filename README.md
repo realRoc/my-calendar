@@ -5,7 +5,7 @@
 
 *Read this in [中文](./README.zh-CN.md).*
 
-The methodology behind these workflows comes from the author's other open-source project — **[git-hired](https://realroc.github.io/git-hired/)** (AI-native software collaboration: issue-first onboarding and AI review). **my-calendar** is what it looks like to land that "let AI agents take part in everyday software collaboration" idea onto a single Mac, using Apple Calendar as the surface that ties it together.
+The methodology behind these workflows comes from my other open-source project — **[git-hired](https://realroc.github.io/git-hired/)** (AI-native software collaboration: issue-first onboarding and AI review). **my-calendar** is what it looks like to land that "let AI agents take part in everyday software collaboration" idea onto a single Mac, using Apple Calendar as the surface that ties it together.
 
 ![demo](./assets/demo.gif)
 
