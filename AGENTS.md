@@ -256,7 +256,7 @@ ls history/*/*__mothers-day__mom.md
 
 第二条独立功能：自动 review 自己跨 org 提交的 PR。
 
-### 触发模型（双通道）
+### 触发模型（三通道）
 
 **主通道 — 全局 git pre-push hook（即时）**
 
@@ -265,6 +265,13 @@ ls history/*/*__mothers-day__mom.md
 - 后台进程 8 次 × 7.5s ≈ 60s 内轮询 `gh pr list --head <branch>` 找 PR
 - 找到 PR + 验证 `base == default` → `pr_watcher.py --force <pr-url>`
 - hook 本身立刻返回 0，不阻塞 push
+
+**本地 PR 创建后 hook（即时）**
+
+- `~/.config/my-calendar/git-hooks/pr-created <pr-url> [origin-cwd]`
+- 给 `gh pr create` / gstack `/ship` 这类本地 PR 创建工具调用
+- 验证 `base == default`，按 `(pr_url, head_sha)` 做短窗口去重，再异步触发 `pr_watcher.py --force <pr-url>`
+- 解决 `/ship` 先 push、后创建 PR，PR 创建晚于 pre-push 轮询窗口导致漏 review 的场景
 
 **兜底通道 — launchd 10 min 轮询**
 
@@ -278,7 +285,7 @@ ls history/*/*__mothers-day__mom.md
 | 触发源 | hook 抓到？ | launchd 兜底？ |
 |---|---|---|
 | 本机 `git push` | ✅ 立即 | — |
-| 本机 `gh pr create`（无新 push） | ⚠️ 只有同时 push 才行 | ✅ ≤10min |
+| 本机 `gh pr create` / `/ship` | ✅ 调用 `pr-created` 时立即 | ✅ ≤10min |
 | GitHub 网页 UI 创建/编辑 PR | ❌ | ✅ ≤10min |
 | 其他机器 push | ❌ | ✅ ≤10min |
 | PR bot 自动 commit | ❌ | ✅ ≤10min |
@@ -326,9 +333,12 @@ ls history/*/*__mothers-day__mom.md
 | `scripts/pr_watcher.py` | 入口 |
 | `scripts/pr_prompt.md` | codex prompt 模板（含 `{pr_link}` 占位） |
 | `scripts/pr_local_trigger.sh` | hook 后台 worker：轮询找 PR → 调 pr_watcher --force |
+| `scripts/pr_created_trigger.sh` | PR 创建后入口：抽取 PR URL → 调 shared review trigger |
+| `scripts/pr_review_trigger.sh` | shared review trigger：base/default 校验 + same-PR/SHA 去重 + 异步 `pr_watcher --force` |
 | `scripts/install_git_hook.sh` | 一次性安装：设 global core.hooksPath |
 | `scripts/install_launchd.sh` | 安装两个 LaunchAgent（daily + pr-watcher 兜底） |
 | `~/.config/my-calendar/git-hooks/pre-push` | 全局 hook 本体（不在 repo 里，由 install_git_hook.sh 写入） |
+| `~/.config/my-calendar/git-hooks/pr-created` | 本地 PR 创建工具调用的全局 hook（由 install_git_hook.sh 写入） |
 | `~/.config/my-calendar/git-hooks/logs/trigger.log` | 每次 push 触发的轨迹日志 |
 | `scripts/pr_state.json` | 每个 PR 的 last_commented_sha / thread_id / comment_url |
 | `scripts/pr_calendar_state.json` | "PR 监控" 日历的 event_id 索引（与节日 state.json 隔离） |

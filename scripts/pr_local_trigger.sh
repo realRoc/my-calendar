@@ -25,8 +25,7 @@ ORIGIN_CWD="${3:-}"
 # broke any non-Desktop install — pre-push hook ran, but trigger never fired).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PYTHON="$ROOT/.venv/bin/python"
-WATCHER="$ROOT/scripts/pr_watcher.py"
+REVIEW_TRIGGER="$ROOT/scripts/pr_review_trigger.sh"
 LOG_DIR="$HOME/.config/my-calendar/git-hooks/logs"
 mkdir -p "$LOG_DIR"
 
@@ -146,23 +145,15 @@ for branch in "${BRANCHES[@]}"; do
         continue
     fi
 
-    # ── Trigger codex review via pr_watcher --force ──
-    # Pass --origin-cwd when the hook captured it, so the calendar event's
-    # "open a fix session" launcher knows which repo to drop into. Launchd
-    # tick path doesn't have this info and skips the flag entirely.
-    # Two explicit code paths instead of an "extra_args[@]" array — macOS
-    # bash 3.2 + `set -u` blows up on expanding an empty array.
-    log "  triggering pr_watcher --force $pr_url  (base=$base, origin_cwd=${ORIGIN_CWD:-<none>})"
-    if [[ -n "$ORIGIN_CWD" && -d "$ORIGIN_CWD" ]]; then
-        "$PYTHON" "$WATCHER" --force "$pr_url" --origin-cwd "$ORIGIN_CWD" \
-            >>"$LOG_DIR/trigger.log" 2>&1 \
-            && log "  → done" \
-            || log "  → pr_watcher exited non-zero"
+    # ── Trigger codex review via the shared debounced launcher ──
+    # The launcher passes --origin-cwd through to pr_watcher when available.
+    # It also dedupes same-PR/same-SHA triggers so a post-create hook and the
+    # pre-push poller do not cancel/restart each other for identical content.
+    if [[ -x "$REVIEW_TRIGGER" ]]; then
+        "$REVIEW_TRIGGER" --source pre-push "$pr_url" "$ORIGIN_CWD" \
+            || log "  → review trigger exited non-zero"
     else
-        "$PYTHON" "$WATCHER" --force "$pr_url" \
-            >>"$LOG_DIR/trigger.log" 2>&1 \
-            && log "  → done" \
-            || log "  → pr_watcher exited non-zero"
+        log "  review trigger not executable: $REVIEW_TRIGGER"
     fi
 done
 

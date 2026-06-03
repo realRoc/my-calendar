@@ -1,0 +1,34 @@
+#!/bin/bash
+# my-calendar global PR-created hook.
+#
+# This is not a native Git hook. It is a stable integration point for local
+# tools such as gstack /ship after they successfully create a GitHub PR.
+#
+# Args:
+#   $1 = PR URL or text containing a GitHub PR URL
+#   $2 = optional origin cwd
+
+set -u
+
+PR_INPUT="${1:-}"
+ORIGIN_CWD="${2:-}"
+LOG_DIR="$HOME/.config/my-calendar/git-hooks/logs"
+# The PR_CREATED_TRIGGER_SCRIPT path on the next line is rendered by
+# scripts/install_git_hook.sh at deploy time with the absolute path to
+# pr_created_trigger.sh inside the installer's checkout.
+PR_CREATED_TRIGGER_SCRIPT="__PR_CREATED_TRIGGER_SCRIPT__"
+mkdir -p "$LOG_DIR"
+
+if [[ -z "$PR_INPUT" ]]; then
+    echo "[my-calendar pr-created] WARNING: called without PR URL" >&2
+    exit 0
+fi
+
+if [[ -x "$PR_CREATED_TRIGGER_SCRIPT" ]]; then
+    ( "$PR_CREATED_TRIGGER_SCRIPT" "$PR_INPUT" "$ORIGIN_CWD" \
+        >>"$LOG_DIR/trigger.log" 2>&1 </dev/null &)
+else
+    echo "[my-calendar pr-created] WARNING: trigger script not found at $PR_CREATED_TRIGGER_SCRIPT" >&2
+fi
+
+exit 0
