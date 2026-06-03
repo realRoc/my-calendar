@@ -10,14 +10,15 @@ Single-pass flow:
   1. GraphQL: list all open PRs authored by @me across every org.
   2. Filter: keep only PRs whose base == repo default branch.
   3. Compare each PR's head_sha against scripts/pr_state.json.
-       - PR not in state → seed head_sha, DO NOT comment.
+       - PR not in state and created/head-committed/updated before watcher install → seed head_sha.
+       - PR not in state and created/head-committed/updated after watcher install → trigger codex review.
        - PR in state and head_sha unchanged → skip.
        - PR in state and head_sha changed → trigger codex review.
 
-  The launchd tick is deliberately conservative: it seeds first-seen PRs but
-  does not review them on first sight. Immediate reviews come from the two
-  local trigger channels (`pre-push` for new commits, `pr-created` for PR
-  creation). The tick is only a backstop for missed later commits / retries.
+  The launchd tick is conservative only for historical PRs that predate this
+  watcher installation. PRs created, updated, or carrying a latest head commit
+  after install are reviewed on first sight, so missed `pre-push` / `pr-created`
+  hooks still get a code review.
   4. For each triggered PR:
        0. Under the per-PR lock, persist a pending_review_sha BEFORE codex
           starts. The GitHub comment is the irreversible idempotency boundary:
@@ -77,7 +78,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
-from calendar_sync import ReminderEvent, upsert_events, PR_CALENDAR_NAME  # noqa: E402
+from calendar_sync import ReminderEvent, remove_event, upsert_events, PR_CALENDAR_NAME  # noqa: E402
 from log_setup import redirect_stdio_to_log  # noqa: E402
 
 STATE_PATH = HERE / "pr_state.json"           # PR-level state (head_sha, thread_id, …)
@@ -158,6 +159,7 @@ SEARCH_QUERY = "is:pr author:@me state:open archived:false"
 PENDING_REVIEW_RECOVERY_GRACE_SEC = 10 * 60  # Give GitHub comment listing one fallback tick to settle.
 PENDING_REVIEW_STALE_SEC = MAX_RUNTIME_PER_TICK_SEC + PENDING_REVIEW_RECOVERY_GRACE_SEC
 AI_COAUTHOR_METADATA_MARKER = "<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->"
+HEAD_SHA_METADATA_PREFIX = "<!-- pr-watcher-head-sha:"
 
 GRAPHQL_QUERY = """
 query($q: String!) {
@@ -170,6 +172,14 @@ query($q: String!) {
         title
         isDraft
         createdAt
+        updatedAt
+        commits(last: 1) {
+          nodes {
+            commit {
+              committedDate
+            }
+          }
+        }
         baseRefName
         headRefName
         headRefOid
@@ -487,6 +497,8 @@ class PRSnap:
     default_branch: str
     head_sha: str
     created_at: str = ""      # ISO-8601 UTC (e.g. "2026-05-20T03:56:40Z")
+    updated_at: str = ""      # ISO-8601 UTC; PR-level updatedAt from GitHub.
+    head_committed_at: str = ""  # ISO-8601 UTC; latest PR head commit time.
     head_branch: str = ""     # source branch (headRefName); needed by the
                               # "fix this PR" launcher to git checkout locally.
     head_repo: str = ""       # headRepository.nameWithOwner; differs from .repo
@@ -499,6 +511,10 @@ class AICommentLookup:
     status: str  # found | absent | failed
     comment_url: str | None = None
     comment_body: str | None = None
+
+
+def head_sha_metadata_marker(head_sha: str) -> str:
+    return f"{HEAD_SHA_METADATA_PREFIX} {head_sha} -->"
 
 
 def load_state() -> dict:
@@ -656,6 +672,9 @@ def fetch_open_prs() -> list[PRSnap]:
         repo = n.get("repository", {}) or {}
         default_ref = (repo.get("defaultBranchRef") or {}).get("name") or ""
         head_repo = (n.get("headRepository") or {}).get("nameWithOwner") or ""
+        commit_nodes = ((n.get("commits") or {}).get("nodes") or [])
+        latest_commit = (commit_nodes[-1] if commit_nodes else {}) or {}
+        head_committed_at = ((latest_commit.get("commit") or {}).get("committedDate") or "")
         out.append(PRSnap(
             url=n["url"],
             number=int(n["number"]),
@@ -666,6 +685,8 @@ def fetch_open_prs() -> list[PRSnap]:
             default_branch=default_ref,
             head_sha=n.get("headRefOid", ""),
             created_at=n.get("createdAt", "") or "",
+            updated_at=n.get("updatedAt", "") or "",
+            head_committed_at=head_committed_at,
             head_branch=n.get("headRefName", "") or "",
             head_repo=head_repo,
         ))
@@ -730,41 +751,20 @@ def cache_comment_body(comment_url: str | None, comment_body: str | None) -> Pat
     return path
 
 
-def fetch_latest_comment(repo: str, number: int) -> tuple[str | None, str | None]:
-    """Return (html_url, body) of the most recent comment by the current user on the PR."""
-    try:
-        me_proc = subprocess.run(
-            ["gh", "api", "user", "--jq", ".login"],
-            capture_output=True, text=True, check=True,
-        )
-        me = me_proc.stdout.strip()
-        proc = subprocess.run(
-            [
-                "gh", "api",
-                f"repos/{repo}/issues/{number}/comments",
-                "--jq",
-                f'[.[] | select(.user.login == "{me}")] | sort_by(.created_at) | .[-1]',
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        out = proc.stdout.strip()
-        if not out or out == "null":
-            return None, None
-        data = json.loads(out)
-        return data.get("html_url") or None, data.get("body") or None
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return None, None
-
-
 def fetch_latest_ai_comment_since(
     repo: str,
     number: int,
     since_iso: str | None,
+    *,
+    head_sha: str | None = None,
 ) -> AICommentLookup:
     """Return latest pr_watcher-authored AI comment at or after since_iso.
 
     Used to recover a pending review after the local process died between the
     irreversible GitHub comment side effect and local state finalization.
+    When head_sha is provided, the comment must carry this run's hidden SHA
+    marker too; time alone is not enough because GitHub issue-comment
+    created_at values have only second-level precision.
     """
     since_dt = _parse_iso_utc(since_iso or "")
     try:
@@ -807,6 +807,8 @@ def fetch_latest_ai_comment_since(
         body = c.get("body") or ""
         if AI_COAUTHOR_METADATA_MARKER not in body:
             continue
+        if head_sha and head_sha_metadata_marker(head_sha) not in body:
+            continue
         created_dt = _parse_iso_utc(c.get("created_at") or "")
         if since_dt is not None and created_dt is not None and created_dt < since_dt:
             continue
@@ -839,6 +841,45 @@ def _mark_review_pending(state: dict, pr: PRSnap, *, source: str, now: datetime)
         "pending_review_started_at": now.isoformat(timespec="seconds"),
         "pending_review_source": source,
     })
+
+
+def _remember_calendar_delete(state: dict, pr_url: str, event_key: str) -> None:
+    entry = state.setdefault("prs", {}).setdefault(pr_url, {})
+    keys = entry.get("pending_calendar_delete_keys")
+    if not isinstance(keys, list):
+        keys = []
+    if event_key not in keys:
+        keys.append(event_key)
+    entry["pending_calendar_delete_keys"] = keys
+
+
+def _retry_pending_calendar_deletes(state: dict, pr_url: str) -> bool:
+    entry = state.setdefault("prs", {}).setdefault(pr_url, {})
+    keys = entry.get("pending_calendar_delete_keys")
+    if not isinstance(keys, list) or not keys:
+        return False
+
+    changed = False
+    remaining: list[str] = []
+    for key in keys:
+        try:
+            removed = remove_event(key, CAL_STATE_PATH)
+        except Exception as e:
+            print(f"      warn: failed to retry calendar rollback {key}: {e}", flush=True)
+            removed = False
+        if removed:
+            changed = True
+        else:
+            remaining.append(key)
+
+    if remaining:
+        if remaining != keys:
+            entry["pending_calendar_delete_keys"] = remaining
+            changed = True
+    else:
+        entry.pop("pending_calendar_delete_keys", None)
+        changed = True
+    return changed
 
 
 def _pending_age_seconds(entry: dict, now: datetime) -> float | None:
@@ -908,6 +949,7 @@ def _same_sha_review_guard(pr: PRSnap, state: dict, now: datetime) -> tuple[str 
         pr.repo,
         pr.number,
         entry.get("pending_review_started_at"),
+        head_sha=pr.head_sha,
     )
     if lookup.status == "found" and lookup.comment_url:
         _complete_recovered_pending(
@@ -923,6 +965,28 @@ def _same_sha_review_guard(pr: PRSnap, state: dict, now: datetime) -> tuple[str 
 
     _clear_pending_review(entry)
     return None, True
+
+
+def _first_seen_pr_should_review(pr: PRSnap, state: dict) -> bool:
+    """Return True when a first-seen PR is new enough for fallback review.
+
+    The launchd fallback must not blast old open PRs the first time this
+    watcher is installed or state is rebuilt. But after installation, every PR
+    commit should eventually get a review even if the local immediate hooks
+    missed the PR creation/update. GitHub does not expose a PR-head push time
+    in this query, so use PR createdAt, latest head commit time, and PR updatedAt
+    versus state._meta installed_at as the line. updatedAt can review a touched
+    historical PR once, but it avoids missing an old commit that was pushed after
+    install.
+    """
+    installed_at = _parse_iso_utc((state.get("_meta") or {}).get("installed_at") or "")
+    created_at = _parse_iso_utc(pr.created_at or "")
+    head_committed_at = _parse_iso_utc(pr.head_committed_at or "")
+    updated_at = _parse_iso_utc(pr.updated_at or "")
+    candidate_times = [dt for dt in (created_at, head_committed_at, updated_at) if dt is not None]
+    if installed_at is None or not candidate_times:
+        return False
+    return max(candidate_times) >= installed_at
 
 
 # ─── codex ─────────────────────────────────────────────────────────────────────
@@ -1492,13 +1556,20 @@ def build_event(
 # ─── main flow ─────────────────────────────────────────────────────────────────
 
 
-def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
+def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0) -> str:
     """Return action string for logging."""
     prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
-    prompt = prompt_template.replace("{pr_link}", pr.url)
+    prompt = (
+        prompt_template
+        .replace("{pr_link}", pr.url)
+        .replace("{head_sha}", pr.head_sha)
+    )
 
     if dry_run:
         return f"would-trigger codex (prompt {len(prompt)}B)"
+
+    if _retry_pending_calendar_deletes(state, pr.url):
+        save_state(state, touched_prs={pr.url})
 
     print(f"    → codex exec on {pr.url}", flush=True)
     started_at = datetime.now().isoformat(timespec="seconds")
@@ -1539,7 +1610,102 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
         _refresh_dashboard(reason="cancelled")
         return f"cancelled (new commit during review, elapsed={fmt_duration(elapsed)})"
 
-    comment_url, comment_body = fetch_latest_comment(pr.repo, pr.number)
+    def restart_from_moved_head(current_pr: PRSnap, *, marker_type: str, dashboard_reason: str, source: str) -> str:
+        print(
+            f"      head moved during review: {pr.head_sha[:8]} → {current_pr.head_sha[:8]}; "
+            "dropping stale result",
+            flush=True,
+        )
+        try:
+            with result.jsonl_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "type": marker_type,
+                    "old_head_sha": pr.head_sha,
+                    "new_head_sha": current_pr.head_sha,
+                }, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        if restart_depth >= 3:
+            _clear_pending_review(state.setdefault("prs", {}).setdefault(pr.url, {}))
+            save_state(state, touched_prs={pr.url})
+            _refresh_dashboard(reason=dashboard_reason)
+            return (
+                f"stale result dropped; head kept moving "
+                f"{pr.head_sha[:8]}→{current_pr.head_sha[:8]}"
+            )
+        _mark_review_pending(state, current_pr, source=source, now=datetime.now())
+        save_state(state, touched_prs={pr.url})
+        notify(
+            title="🔁 PR review 重启",
+            subtitle=current_pr.repo,
+            message=f"#{current_pr.number} 检测到新 commit，基于最新版本重新 review",
+            open_url=current_pr.url,
+            group=notify_group,
+        )
+        _refresh_dashboard(reason=dashboard_reason)
+        return process_pr(current_pr, state, dry_run=False, restart_depth=restart_depth + 1)
+
+    try:
+        current_pr = _gh_view_force_pr(pr.url)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError) as e:
+        print(
+            f"      warn: cannot revalidate current PR head after codex exit: {e}; "
+            f"keeping pending sha={pr.head_sha[:8]}",
+            flush=True,
+        )
+        try:
+            with result.jsonl_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "type": "_head_revalidation_failed",
+                    "head_sha": pr.head_sha,
+                    "error": str(e),
+                }, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        _refresh_dashboard(reason="head-revalidation-failed")
+        return f"head revalidation failed (not finalized, elapsed={fmt_duration(elapsed)})"
+
+    if current_pr.head_sha and current_pr.head_sha != pr.head_sha:
+        return restart_from_moved_head(
+            current_pr,
+            marker_type="_head_moved_before_persist",
+            dashboard_reason="head-moved",
+            source="post-review-head-moved",
+        )
+
+    comment_lookup = fetch_latest_ai_comment_since(pr.repo, pr.number, started_at, head_sha=pr.head_sha)
+    if comment_lookup.status != "found" or not comment_lookup.comment_url:
+        print(
+            f"      warn: no AI-marked review comment found after this run "
+            f"(status={comment_lookup.status}); keeping pending sha={pr.head_sha[:8]}",
+            flush=True,
+        )
+        try:
+            with result.jsonl_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "type": "_review_comment_missing",
+                    "lookup_status": comment_lookup.status,
+                    "head_sha": pr.head_sha,
+                }, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        _refresh_dashboard(reason="comment-missing")
+        return f"review comment missing (status={comment_lookup.status}, elapsed={fmt_duration(elapsed)})"
+
+    comment_url = comment_lookup.comment_url
+    comment_body = comment_lookup.comment_body
     body_preview = (comment_body or "")[:80].replace("\n", " ")
     print(f"      comment_url={comment_url}  body={len(comment_body or '')}B  preview={body_preview!r}", flush=True)
 
@@ -1571,15 +1737,21 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
     # obsolete sha), violating issue #26's "新 commit 到达后旧 review 不落盘"
     # contract.
     #
-    # Fix: hold the per-PR persist lock across the marker re-check AND every
-    # irreversible write below. signal_cancel_and_wait_for_lock also grabs
-    # the same lock around its touch(), so the marker write is now totally
-    # ordered with this critical section — it either fully precedes the
-    # check (we see the marker, short-circuit) or fully follows the state
-    # mutation (the next --force restarts review on the fresh sha). The
-    # marker can no longer slip in between. See acquire_persist_lock for the
-    # full contract and acquisition-order argument.
+    # Fix: hold the per-PR persist lock across the marker re-check, head
+    # revalidation, local writes, and post-write revalidation/rollback. The
+    # marker writer uses the same lock, so marker writes are totally ordered
+    # with this section; remote head movement is caught by the pre/post write
+    # gh checks, and post-write movement rolls back local artifacts or records
+    # a retryable calendar cleanup key. See acquire_persist_lock for the full
+    # contract and acquisition-order argument.
     cancel_marker = _pr_cancel_path(pr.url)
+    cancelled_late = False
+    head_moved_late: PRSnap | None = None
+    head_revalidation_late_error: str | None = None
+    meta_path = result.jsonl_path.with_suffix(".meta.json")
+    event_written = False
+    state_entry_before_persist = dict((state.get("prs", {}).get(pr.url) or {}))
+    state_had_entry_before_persist = pr.url in state.get("prs", {})
     persist_fd = acquire_persist_lock(pr.url)
     try:
         if cancel_marker.exists():
@@ -1594,49 +1766,113 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
                 pass
             cancelled_late = True
         else:
-            cancelled_late = False
-            actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
-            cal_action = actions.get(event.key, "?")
-
-            # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
-            meta = {
-                "started_at": started_at,
-                "repo": pr.repo,
-                "pr_number": pr.number,
-                "pr_url": pr.url,
-                "pr_title": pr.title,
-                "head_sha": pr.head_sha,
-                "thread_id": result.thread_id,
-                "comment_url": comment_url,
-                "comment_body": comment_body or "",
-                "codex_exit": result.exit_code,
-                "jsonl_path": str(result.jsonl_path),
-                "origin_cwd": origin_cwd,
-            }
-            meta_path = result.jsonl_path.with_suffix(".meta.json")
             try:
-                meta_path.write_text(
-                    json.dumps(meta, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
+                current_pr = _gh_view_force_pr(pr.url)
+            except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError) as e:
+                head_revalidation_late_error = str(e)
+                print(
+                    f"      warn: cannot revalidate current PR head before persist: {e}; "
+                    f"keeping pending sha={pr.head_sha[:8]}",
+                    flush=True,
                 )
-            except OSError as e:
-                print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
+                try:
+                    with result.jsonl_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "type": "_head_revalidation_failed_before_persist",
+                            "head_sha": pr.head_sha,
+                            "error": str(e),
+                        }, ensure_ascii=False) + "\n")
+                except OSError:
+                    pass
+            else:
+                if current_pr.head_sha and current_pr.head_sha != pr.head_sha:
+                    head_moved_late = current_pr
+                else:
+                    actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
+                    cal_action = actions.get(event.key, "?")
+                    event_written = cal_action in {"created", "updated", "unchanged"}
 
-            entry = state["prs"].setdefault(pr.url, {})
-            entry.update({
-                "repo": pr.repo,
-                "number": pr.number,
-                "last_commented_sha": pr.head_sha,
-                "last_thread_id": result.thread_id,
-                "last_comment_url": comment_url,
-                "last_run_at": started_at,
-                "last_codex_exit": result.exit_code,
-                "last_jsonl": str(result.jsonl_path),
-            })
+                    # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
+                    meta = {
+                        "started_at": started_at,
+                        "repo": pr.repo,
+                        "pr_number": pr.number,
+                        "pr_url": pr.url,
+                        "pr_title": pr.title,
+                        "head_sha": pr.head_sha,
+                        "thread_id": result.thread_id,
+                        "comment_url": comment_url,
+                        "comment_body": comment_body or "",
+                        "codex_exit": result.exit_code,
+                        "jsonl_path": str(result.jsonl_path),
+                        "origin_cwd": origin_cwd,
+                    }
+                    try:
+                        meta_path.write_text(
+                            json.dumps(meta, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                    except OSError as e:
+                        print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
 
-            # 同时记录"我们见过这个 sha"，用于 first-run 兼容
-            entry["last_seen_sha"] = pr.head_sha
-            _clear_pending_review(entry)
+                    entry = state["prs"].setdefault(pr.url, {})
+                    entry.update({
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_commented_sha": pr.head_sha,
+                        "last_thread_id": result.thread_id,
+                        "last_comment_url": comment_url,
+                        "last_run_at": started_at,
+                        "last_codex_exit": result.exit_code,
+                        "last_jsonl": str(result.jsonl_path),
+                    })
+
+                    # 同时记录"我们见过这个 sha"，用于 first-run 兼容
+                    entry["last_seen_sha"] = pr.head_sha
+                    _clear_pending_review(entry)
+
+                    try:
+                        final_pr = _gh_view_force_pr(pr.url)
+                    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError) as e:
+                        head_revalidation_late_error = str(e)
+                        print(
+                            f"      warn: cannot revalidate current PR head after local persist: {e}; "
+                            f"rolling back sha={pr.head_sha[:8]}",
+                            flush=True,
+                        )
+                        try:
+                            with result.jsonl_path.open("a", encoding="utf-8") as f:
+                                f.write(json.dumps({
+                                    "type": "_head_revalidation_failed_after_local_persist",
+                                    "head_sha": pr.head_sha,
+                                    "error": str(e),
+                                }, ensure_ascii=False) + "\n")
+                        except OSError:
+                            pass
+                    else:
+                        if final_pr.head_sha and final_pr.head_sha != pr.head_sha:
+                            head_moved_late = final_pr
+
+                    if head_revalidation_late_error or head_moved_late is not None:
+                        calendar_delete_failed = False
+                        if event_written:
+                            try:
+                                removed = remove_event(event.key, CAL_STATE_PATH)
+                            except Exception as e:
+                                print(f"      warn: failed to roll back calendar event {event.key}: {e}", flush=True)
+                                removed = False
+                            if not removed:
+                                calendar_delete_failed = True
+                        try:
+                            meta_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        if state_had_entry_before_persist:
+                            state.setdefault("prs", {})[pr.url] = state_entry_before_persist
+                        else:
+                            state.setdefault("prs", {}).pop(pr.url, None)
+                        if calendar_delete_failed:
+                            _remember_calendar_delete(state, pr.url, event.key)
     finally:
         release_lock_fd(persist_fd)
 
@@ -1658,6 +1894,22 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
         _refresh_dashboard(reason="cancelled")
         return f"cancelled (new commit between codex exit and persist, elapsed={fmt_duration(elapsed)})"
 
+    if head_revalidation_late_error:
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        _refresh_dashboard(reason="head-revalidation-failed")
+        return f"head revalidation failed (not finalized, elapsed={fmt_duration(elapsed)})"
+
+    if head_moved_late is not None:
+        return restart_from_moved_head(
+            head_moved_late,
+            marker_type="_head_moved_inside_persist",
+            dashboard_reason="head-moved",
+            source="persist-head-moved",
+        )
+
     # Refresh now that the .meta.json sidecar exists: this swaps the
     # "running" row out of the dashboard and shows the finished review.
     _refresh_dashboard(reason="run-end")
@@ -1678,7 +1930,7 @@ def _gh_view_force_pr(pr_url: str) -> PRSnap:
     before invoking --force, so this is safe."""
     forced = subprocess.run(
         ["gh", "pr", "view", pr_url,
-         "--json", "url,number,title,isDraft,baseRefName,headRefName,headRefOid,createdAt,headRepository,headRepositoryOwner"],
+         "--json", "url,number,title,isDraft,baseRefName,headRefName,headRefOid,createdAt,updatedAt,headRepository,headRepositoryOwner"],
         capture_output=True, text=True, check=True,
     )
     data = json.loads(forced.stdout)
@@ -1696,6 +1948,7 @@ def _gh_view_force_pr(pr_url: str) -> PRSnap:
         default_branch=data.get("baseRefName", ""),
         head_sha=data.get("headRefOid", ""),
         created_at=data.get("createdAt", "") or "",
+        updated_at=data.get("updatedAt", "") or "",
         head_branch=data.get("headRefName", "") or "",
         head_repo=head_repo,
     )
@@ -1801,6 +2054,7 @@ def _run_force(args, now: datetime) -> int:
             else:
                 print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
 
+        cleanup_changed = _retry_pending_calendar_deletes(state, pr.url)
         prev = state.get("prs", {}).get(pr.url) or {}
         if prev.get("last_commented_sha") == pr.head_sha:
             print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
@@ -1822,7 +2076,7 @@ def _run_force(args, now: datetime) -> int:
         guard_action, guard_changed = _same_sha_review_guard(pr, state, force_now)
         if guard_action is not None:
             print(f"  forced: {pr.url}  → {guard_action}, skipping")
-            if guard_changed or new_origin_cwd:
+            if guard_changed or cleanup_changed or new_origin_cwd:
                 save_state(state, touched_prs={pr.url})
             return 0
 
@@ -1896,9 +2150,10 @@ def main() -> int:
     if args.force:
         return _run_force(args, now)
 
-    # First-ever run stamps installed_at for diagnostics/backward-compatible
-    # state shape. First-seen PRs are now always seeded silently; first reviews
-    # come from the immediate trigger channels.
+    # First-ever run stamps installed_at. Historical first-seen PRs still seed
+    # silently, but PRs created after this timestamp (or whose latest head
+    # commit is after this timestamp) are reviewed on first sight by the
+    # launchd fallback if the immediate hooks missed them.
     if not args.dry_run and "installed_at" not in state.get("_meta", {}):
         state.setdefault("_meta", {})["installed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         print(f"[pr-watcher] first run: stamped installed_at = {state['_meta']['installed_at']}")
@@ -1952,25 +2207,40 @@ def main() -> int:
         pr_state_changed = False
         try:
             prev = state["prs"].get(pr.url)
-            # Conservative fallback: the launchd tick only seeds first-seen PRs.
-            # Immediate first reviews belong to the local pre-push and
-            # pr-created channels. This avoids duplicate comments when GitHub's
-            # open-PR search lags behind merge/close and when an immediate
-            # review process died after posting a comment but before local state
-            # finalization.
+            # Conservative only for historical PRs: the fallback should not
+            # blast old open PRs on first install / rebuild, but post-install
+            # PRs still need review if the local pre-push / pr-created hooks
+            # missed the first trigger.
             if prev is None:
-                reason = "seed-only" if args.seed_only else "first-seen fallback"
-                print(f"    seed ({reason})  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
+                should_review_first_seen = (not args.seed_only) and _first_seen_pr_should_review(pr, state)
+                if not should_review_first_seen:
+                    reason = "seed-only" if args.seed_only else "historical first-seen fallback"
+                    print(
+                        f"    seed ({reason})  {pr.url}  sha={pr.head_sha[:8]}  "
+                        f"created={pr.created_at} head_commit={pr.head_committed_at} updated={pr.updated_at}"
+                    )
+                    if not args.dry_run:
+                        state["prs"][pr.url] = {
+                            "repo": pr.repo,
+                            "number": pr.number,
+                            "last_seen_sha": pr.head_sha,
+                            "last_commented_sha": None,
+                            "seeded_at": now.isoformat(timespec="seconds"),
+                            "seed_reason": reason,
+                        }
+                        pr_state_changed = True
+                    continue
+
+                print(
+                    f"    FIRST-SEEN REVIEW  {pr.url}  NEW → {pr.head_sha[:8]}  "
+                    f"created={pr.created_at} head_commit={pr.head_committed_at} updated={pr.updated_at}"
+                )
                 if not args.dry_run:
-                    state["prs"][pr.url] = {
-                        "repo": pr.repo,
-                        "number": pr.number,
-                        "last_seen_sha": pr.head_sha,
-                        "last_commented_sha": None,
-                        "seeded_at": now.isoformat(timespec="seconds"),
-                        "seed_reason": reason,
-                    }
+                    _mark_review_pending(state, pr, source="poll-first-seen", now=now)
                     pr_state_changed = True
+                    save_state(state, touched_prs={pr.url})
+                action = process_pr(pr, state, dry_run=args.dry_run)
+                print(f"      → {action}")
                 continue
 
             if args.seed_only:
@@ -1979,6 +2249,9 @@ def main() -> int:
                     state["prs"][pr.url]["last_seen_sha"] = pr.head_sha
                     pr_state_changed = True
                 continue
+
+            if not args.dry_run and _retry_pending_calendar_deletes(state, pr.url):
+                pr_state_changed = True
 
             retry_after_pending_clear = False
             if args.dry_run:
