@@ -369,5 +369,36 @@ class FilterStatePersistenceTests(unittest.TestCase):
         self.assertIn("tab === 'timeline'", html)
 
 
+class RenderRunningMarkdownTests(unittest.TestCase):
+    def test_empty_running_list_is_terminal_friendly(self):
+        out = dashboard.render_running_markdown([], datetime(2026, 5, 20, 13, 0, 0))
+        self.assertIn("## PR Review 运行中", out)
+        self.assertIn("当前没有正在运行的 Codex PR review", out)
+        self.assertNotIn("pr-dashboard.html", out)
+
+    def test_running_task_renders_expandable_clickable_component(self):
+        out = dashboard.render_running_markdown([{
+            "started_at": "2026-05-20T12:58:30",
+            "timestamp": "2026-05-20T12:58:30",
+            "repo": "realRoc/my-calendar",
+            "pr_number": 9,
+            "pr_url": "https://github.com/realRoc/my-calendar/pull/9",
+            "pr_title": "Live terminal board",
+            "head_sha": "deadbeefcafebabe",
+            "jsonl_path": "/tmp/run.jsonl",
+            "jsonl_size": 1536,
+            "last_active": "2026-05-20T12:59:50",
+        }], datetime(2026, 5, 20, 13, 0, 0))
+
+        self.assertIn("<details>", out)
+        self.assertIn("<summary>", out)
+        self.assertIn("[realRoc/my-calendar #9](https://github.com/realRoc/my-calendar/pull/9)", out)
+        self.assertIn("运行 `1m 30s`", out)
+        self.assertIn("最近活动 `10s`", out)
+        self.assertIn("Live terminal board", out)
+        self.assertIn("`deadbee", out)
+        self.assertIn("`1.5KB`", out)
+
+
 if __name__ == "__main__":
     unittest.main()

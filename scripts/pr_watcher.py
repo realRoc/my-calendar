@@ -766,7 +766,7 @@ def _refresh_dashboard(*, reason: str) -> None:
     picks up the new state on its next 5s auto-reload. Never break the caller."""
     try:
         subprocess.run(
-            [sys.executable, str(HERE / "dashboard.py")],
+            [sys.executable, str(HERE / "dashboard.py"), "--html"],
             timeout=15,
             check=False,
             stdout=subprocess.DEVNULL,

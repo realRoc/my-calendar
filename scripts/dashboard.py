@@ -1,22 +1,26 @@
-"""Generate a local HTML dashboard of all PR reviews.
+"""Show PR review activity or generate the legacy local HTML dashboard.
 
 Reads from pr_logs/ (no new storage):
 - *.meta.json  → canonical per-run record (sidecar written by pr_watcher.process_pr)
 - *.last.txt   → fallback comment body for runs without a sidecar (older history)
 - filename     → fallback timestamp / repo / PR number when no sidecar exists
 
-Writes a single self-contained HTML file to pr_logs/pr-dashboard.html.
-No server, no background process — re-run to refresh.
+Default output is a terminal-friendly running-task component: it lists only
+currently active Codex PR reviews as Markdown links/details so Codex.app can
+render it inline. The legacy HTML history board is still available with
+--html/--open. No server, no background process — re-run to refresh.
 
 Usage:
-  python scripts/dashboard.py              # generate the dashboard, print its path
-  python scripts/dashboard.py --open       # generate and open in default browser
+  python scripts/dashboard.py              # print running PR review tasks
+  python scripts/dashboard.py --html       # generate the legacy HTML dashboard
+  python scripts/dashboard.py --open       # generate and open the legacy HTML dashboard
   python scripts/dashboard.py --dry-run    # collect data, print stats, do not write file
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import subprocess
@@ -729,14 +733,118 @@ def render_html(reviews: list[dict], running: list[dict]) -> str:
             .replace("__GENERATED_AT__", generated_at))
 
 
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _duration_between(start: datetime | None, end: datetime) -> str:
+    if start is None:
+        return "unknown"
+    seconds = max(0, int((end - start).total_seconds()))
+    minutes, sec = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minute}m"
+    if minute:
+        return f"{minute}m {sec}s"
+    return f"{sec}s"
+
+
+def _since(value: str | None, now: datetime) -> str:
+    return _duration_between(_parse_dt(value), now)
+
+
+def _fmt_bytes(n: int | None) -> str:
+    n = int(n or 0)
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n / 1024 / 1024:.1f}MB"
+
+
+def _md(text: object) -> str:
+    """Escape text for Markdown-ish Codex output and HTML details blocks."""
+    s = "" if text is None else str(text)
+    return html.escape(s, quote=False)
+
+
+def render_running_markdown(running: list[dict], now: datetime) -> str:
+    """Render active PR reviews as a Codex-app-friendly terminal component.
+
+    Markdown links stay clickable, and <details> gives the app a native
+    expandable surface without requiring a separate HTML file or server.
+    """
+    generated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+    if not running:
+        return (
+            "## PR Review 运行中\n\n"
+            f"生成于 `{generated_at}`\n\n"
+            "当前没有正在运行的 Codex PR review。"
+        )
+
+    lines = [
+        "## PR Review 运行中",
+        "",
+        f"生成于 `{generated_at}` · `{len(running)}` 个任务",
+        "",
+    ]
+    for idx, rec in enumerate(running, start=1):
+        started = rec.get("timestamp") or rec.get("started_at")
+        started_dt = _parse_dt(started)
+        elapsed = _duration_between(started_dt, now)
+        active_ago = _since(rec.get("last_active"), now)
+        repo = rec.get("repo") or "unknown/repo"
+        pr_number = rec.get("pr_number") or "?"
+        title = rec.get("pr_title") or "(无标题)"
+        pr_url = rec.get("pr_url") or ""
+        sha = (rec.get("head_sha") or "")[:8]
+        jsonl_path = rec.get("jsonl_path") or ""
+
+        label = f"{repo} #{pr_number}"
+        link = f"[{_md(label)}]({pr_url})" if pr_url else _md(label)
+        summary = f"{idx}. {link} · 运行 `{elapsed}` · 最近活动 `{active_ago}`"
+        lines.extend([
+            f"<details>",
+            f"<summary>{summary}</summary>",
+            "",
+            f"- 标题：{_md(title)}",
+            f"- 开始：`{_md(started or 'unknown')}`",
+            f"- 当前运行时间：`{elapsed}`",
+            f"- 最近活动：`{_md(rec.get('last_active') or 'unknown')}`（`{active_ago}` 前）",
+            f"- 输出大小：`{_fmt_bytes(rec.get('jsonl_size'))}`",
+        ])
+        if sha:
+            lines.append(f"- SHA：`{sha}`")
+        if jsonl_path:
+            lines.append(f"- JSONL：`{_md(jsonl_path)}`")
+        if pr_url:
+            lines.append(f"- PR：[{_md(pr_url)}]({pr_url})")
+        lines.extend(["", "</details>", ""])
+
+    return "\n".join(lines).rstrip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--open", action="store_true", help="open the dashboard in default browser after writing")
+    parser.add_argument("--html", action="store_true", help="write the legacy HTML history dashboard")
+    parser.add_argument("--open", action="store_true", help="write and open the legacy HTML dashboard in default browser")
     parser.add_argument("--dry-run", action="store_true", help="collect data and print stats, do not write the HTML file")
     args = parser.parse_args()
 
+    now = datetime.now()
+    running = collect_running(now)
+
+    if not args.html and not args.open and not args.dry_run:
+        print(render_running_markdown(running, now))
+        return 0
+
     reviews = collect_reviews()
-    running = collect_running(datetime.now())
 
     if args.dry_run:
         print(f"[dashboard] dry-run: would render {len(reviews)} review(s), {len(running)} running")
