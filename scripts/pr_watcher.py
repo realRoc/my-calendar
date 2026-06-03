@@ -1,28 +1,28 @@
 """GitHub PR watcher → codex review → Apple Calendar.
 
-Polled by launchd every 2 minutes. The script self-throttles overnight (22:00–09:00
+Polled by launchd every 10 minutes. The script self-throttles overnight (22:00–09:00
 local) so the effective cadence is:
 
-  - 09:00–22:00   every 2 minutes
-  - other hours   every 5 minutes (skip if previous run was <5min ago)
+  - 09:00–22:00   every 10 minutes
+  - other hours   every 10 minutes (skip if previous run was <5min ago)
 
 Single-pass flow:
   1. GraphQL: list all open PRs authored by @me across every org.
   2. Filter: keep only PRs whose base == repo default branch.
   3. Compare each PR's head_sha against scripts/pr_state.json.
-       - PR not in state:
-           * if PR.createdAt > _meta.installed_at  → trigger codex review (newly opened PR)
-           * else (PR existed before install, or seed-only mode) → record head_sha, DO NOT comment
+       - PR not in state → seed head_sha, DO NOT comment.
        - PR in state and head_sha unchanged → skip.
        - PR in state and head_sha changed → trigger codex review.
 
-  _meta.installed_at is stamped on the very first run; it's the cutoff that
-  distinguishes "PRs that already existed when the tool was installed" (just
-  seed them to avoid back-reviewing history) from "PRs created after install"
-  (treat as actionable, even if the local git pre-push hook didn't fire — e.g.
-  PR was created via GitHub web UI, gh pr create, or pushed from another
-  machine).
+  The launchd tick is deliberately conservative: it seeds first-seen PRs but
+  does not review them on first sight. Immediate reviews come from the two
+  local trigger channels (`pre-push` for new commits, `pr-created` for PR
+  creation). The tick is only a backstop for missed later commits / retries.
   4. For each triggered PR:
+       0. Under the per-PR lock, persist a pending_review_sha BEFORE codex
+          starts. The GitHub comment is the irreversible idempotency boundary:
+          a crash after comment creation but before local state finalization
+          must not make another process post a second comment for the same SHA.
        a. Render prompt = pr_prompt.md.replace("{pr_link}", url)
        b. codex exec --json --dangerously-bypass-approvals-and-sandbox \
             -s danger-full-access --skip-git-repo-check  <prompt>
@@ -155,6 +155,9 @@ DAYTIME_END = dtime(22, 0)
 NIGHT_MIN_INTERVAL_SEC = 5 * 60      # 夜间最少间隔 5 分钟
 MAX_RUNTIME_PER_TICK_SEC = 25 * 60   # 单次 tick 最长跑 25 分钟，防止两轮叠在一起
 SEARCH_QUERY = "is:pr author:@me state:open archived:false"
+PENDING_REVIEW_RECOVERY_GRACE_SEC = 10 * 60  # Give GitHub comment listing one fallback tick to settle.
+PENDING_REVIEW_STALE_SEC = MAX_RUNTIME_PER_TICK_SEC + PENDING_REVIEW_RECOVERY_GRACE_SEC
+AI_COAUTHOR_METADATA_MARKER = "<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->"
 
 GRAPHQL_QUERY = """
 query($q: String!) {
@@ -186,10 +189,10 @@ query($q: String!) {
 
 # ─── lock ──────────────────────────────────────────────────────────────────────
 #
-# Two trigger channels (git pre-push hook + launchd 2-min tick) can fire on the
-# same PR within seconds. codex runs ~1–2 min, so without serialisation two
-# processes can race past the state check, run codex on the same head_sha, and
-# post duplicate comments.
+# Three entrypoints can touch the same PR: two immediate channels (git pre-push
+# and pr-created) plus the conservative launchd fallback tick. codex runs
+# ~1–2 min, so without serialisation processes can race past the state check,
+# run codex on the same head_sha, and post duplicate comments.
 #
 # Design: per-PR flock + cancel marker + persist lock (reset/reboot semantics).
 #   - Per-PR lock (locks/<safe_id>.lock) gates codex execution for that one PR.
@@ -491,6 +494,13 @@ class PRSnap:
                               # the head branch isn't on the base repo's origin.
 
 
+@dataclass(frozen=True)
+class AICommentLookup:
+    status: str  # found | absent | failed
+    comment_url: str | None = None
+    comment_body: str | None = None
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -744,6 +754,175 @@ def fetch_latest_comment(repo: str, number: int) -> tuple[str | None, str | None
         return data.get("html_url") or None, data.get("body") or None
     except (subprocess.CalledProcessError, json.JSONDecodeError):
         return None, None
+
+
+def fetch_latest_ai_comment_since(
+    repo: str,
+    number: int,
+    since_iso: str | None,
+) -> AICommentLookup:
+    """Return latest pr_watcher-authored AI comment at or after since_iso.
+
+    Used to recover a pending review after the local process died between the
+    irreversible GitHub comment side effect and local state finalization.
+    """
+    since_dt = _parse_iso_utc(since_iso or "")
+    try:
+        me_proc = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            capture_output=True, text=True, check=True,
+        )
+        me = me_proc.stdout.strip()
+        proc = subprocess.run(
+            [
+                "gh", "api",
+                f"repos/{repo}/issues/{number}/comments?per_page=100",
+                "--paginate",
+                "--slurp",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        raw_comments = json.loads(proc.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return AICommentLookup("failed")
+
+    if not isinstance(raw_comments, list):
+        return AICommentLookup("failed")
+
+    comments: list[dict] = []
+    for page_or_comment in raw_comments:
+        page = page_or_comment if isinstance(page_or_comment, list) else [page_or_comment]
+        for c in page:
+            if isinstance(c, dict):
+                comments.append(c)
+
+    candidates: list[tuple[datetime, dict]] = []
+    fallback_dt = datetime.min.replace(tzinfo=timezone.utc)
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        user = c.get("user") or {}
+        if (user.get("login") or "") != me:
+            continue
+        body = c.get("body") or ""
+        if AI_COAUTHOR_METADATA_MARKER not in body:
+            continue
+        created_dt = _parse_iso_utc(c.get("created_at") or "")
+        if since_dt is not None and created_dt is not None and created_dt < since_dt:
+            continue
+        candidates.append((created_dt or fallback_dt, c))
+
+    if not candidates:
+        return AICommentLookup("absent")
+    _, latest = sorted(candidates, key=lambda item: item[0])[-1]
+    comment_url = latest.get("html_url") or None
+    if not comment_url:
+        return AICommentLookup("failed")
+    return AICommentLookup("found", comment_url=comment_url, comment_body=latest.get("body") or None)
+
+
+def _clear_pending_review(entry: dict) -> None:
+    for key in (
+        "pending_review_sha",
+        "pending_review_started_at",
+        "pending_review_source",
+    ):
+        entry.pop(key, None)
+
+
+def _mark_review_pending(state: dict, pr: PRSnap, *, source: str, now: datetime) -> None:
+    entry = state.setdefault("prs", {}).setdefault(pr.url, {})
+    entry.update({
+        "repo": pr.repo,
+        "number": pr.number,
+        "pending_review_sha": pr.head_sha,
+        "pending_review_started_at": now.isoformat(timespec="seconds"),
+        "pending_review_source": source,
+    })
+
+
+def _pending_age_seconds(entry: dict, now: datetime) -> float | None:
+    started = _parse_iso_utc(entry.get("pending_review_started_at") or "")
+    if started is None:
+        return None
+    now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.astimezone().astimezone(timezone.utc)
+    return max(0.0, (now_utc - started).total_seconds())
+
+
+def _pending_is_stale(entry: dict, now: datetime) -> bool:
+    age = _pending_age_seconds(entry, now)
+    return age is None or age >= PENDING_REVIEW_STALE_SEC
+
+
+def _complete_recovered_pending(
+    state: dict,
+    pr: PRSnap,
+    *,
+    comment_url: str,
+    comment_body: str | None,
+    now: datetime,
+) -> None:
+    entry = state.setdefault("prs", {}).setdefault(pr.url, {})
+    pending_started_at = entry.get("pending_review_started_at")
+    entry.update({
+        "repo": pr.repo,
+        "number": pr.number,
+        "last_commented_sha": pr.head_sha,
+        "last_seen_sha": pr.head_sha,
+        "last_comment_url": comment_url,
+        "last_run_at": pending_started_at or now.isoformat(timespec="seconds"),
+        "last_codex_exit": None,
+        "recovered_from_pending_at": now.isoformat(timespec="seconds"),
+    })
+    _clear_pending_review(entry)
+    cache_comment_body(comment_url, comment_body)
+
+
+def _resolved_origin_cwd(origin_cwd: str | None) -> str | None:
+    if not origin_cwd:
+        return None
+    cwd_p = Path(origin_cwd).expanduser().resolve()
+    return str(cwd_p) if cwd_p.is_dir() else None
+
+
+def _same_sha_review_guard(pr: PRSnap, state: dict, now: datetime) -> tuple[str | None, bool]:
+    """Return (action, changed) for same-SHA completed/pending idempotency.
+
+    action is a log string when the caller should skip starting codex. When
+    action is None, the caller may proceed. changed tells the caller whether
+    state was mutated and must be saved before proceeding/returning.
+    """
+    entry = state.setdefault("prs", {}).setdefault(pr.url, {})
+    if entry.get("last_commented_sha") == pr.head_sha:
+        return f"already reviewed sha={pr.head_sha[:8]}", False
+
+    if entry.get("pending_review_sha") != pr.head_sha:
+        return None, False
+
+    if not _pending_is_stale(entry, now):
+        age = _pending_age_seconds(entry, now)
+        age_s = "unknown" if age is None else f"{int(age)}s"
+        return f"review already pending sha={pr.head_sha[:8]} age={age_s}", False
+
+    lookup = fetch_latest_ai_comment_since(
+        pr.repo,
+        pr.number,
+        entry.get("pending_review_started_at"),
+    )
+    if lookup.status == "found" and lookup.comment_url:
+        _complete_recovered_pending(
+            state,
+            pr,
+            comment_url=lookup.comment_url,
+            comment_body=lookup.comment_body,
+            now=now,
+        )
+        return f"recovered existing AI comment for sha={pr.head_sha[:8]}", True
+    if lookup.status == "failed":
+        return f"pending recovery lookup failed for sha={pr.head_sha[:8]}, keeping pending", False
+
+    _clear_pending_review(entry)
+    return None, True
 
 
 # ─── codex ─────────────────────────────────────────────────────────────────────
@@ -1457,6 +1636,7 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool) -> str:
 
             # 同时记录"我们见过这个 sha"，用于 first-run 兼容
             entry["last_seen_sha"] = pr.head_sha
+            _clear_pending_review(entry)
     finally:
         release_lock_fd(persist_fd)
 
@@ -1544,6 +1724,32 @@ def _run_force(args, now: datetime) -> int:
     lock_fd = acquire_pr_lock_nb(pr_url)
     cancelled_prior = False
     if lock_fd is None:
+        try:
+            in_flight_pr = _gh_view_force_pr(pr_url)
+            in_flight_state = load_state()
+            in_flight_prev = in_flight_state.get("prs", {}).get(in_flight_pr.url) or {}
+            if in_flight_prev.get("last_commented_sha") == in_flight_pr.head_sha:
+                new_origin_cwd = _resolved_origin_cwd(args.origin_cwd)
+                if new_origin_cwd:
+                    in_flight_state.setdefault("prs", {}).setdefault(in_flight_pr.url, {})["origin_cwd"] = new_origin_cwd
+                    save_state(in_flight_state, touched_prs={in_flight_pr.url})
+                print(
+                    f"  forced: {in_flight_pr.url}  → already reviewed "
+                    f"sha={in_flight_pr.head_sha[:8]}, skipping"
+                )
+                return 0
+            if in_flight_prev.get("pending_review_sha") == in_flight_pr.head_sha:
+                new_origin_cwd = _resolved_origin_cwd(args.origin_cwd)
+                if new_origin_cwd:
+                    in_flight_state.setdefault("prs", {}).setdefault(in_flight_pr.url, {})["origin_cwd"] = new_origin_cwd
+                    save_state(in_flight_state, touched_prs={in_flight_pr.url})
+                print(
+                    f"  forced: {in_flight_pr.url}  → review already pending "
+                    f"sha={in_flight_pr.head_sha[:8]}, skipping duplicate trigger"
+                )
+                return 0
+        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+            print(f"  forced: {pr_url}  → could not inspect in-flight sha before cancel: {e}")
         # Another leader is mid-review on an older sha. Signal cancel and
         # wait. Notify NOW so the user sees the cancellation even before the
         # restart kicks off; the restart notification goes out below once
@@ -1589,9 +1795,8 @@ def _run_force(args, now: datetime) -> int:
 
         new_origin_cwd: str | None = None
         if args.origin_cwd:
-            cwd_p = Path(args.origin_cwd).expanduser().resolve()
-            if cwd_p.is_dir():
-                new_origin_cwd = str(cwd_p)
+            new_origin_cwd = _resolved_origin_cwd(args.origin_cwd)
+            if new_origin_cwd:
                 state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = new_origin_cwd
             else:
                 print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
@@ -1609,7 +1814,16 @@ def _run_force(args, now: datetime) -> int:
                         print(f"      backfilled origin_cwd into {meta_path.name}")
                 except (OSError, json.JSONDecodeError) as e:
                     print(f"      warn: failed to backfill origin_cwd in prior .meta.json: {e}")
+            _clear_pending_review(prev)
             save_state(state, touched_prs={pr.url})
+            return 0
+
+        force_now = datetime.now()
+        guard_action, guard_changed = _same_sha_review_guard(pr, state, force_now)
+        if guard_action is not None:
+            print(f"  forced: {pr.url}  → {guard_action}, skipping")
+            if guard_changed or new_origin_cwd:
+                save_state(state, touched_prs={pr.url})
             return 0
 
         if cancelled_prior:
@@ -1625,6 +1839,8 @@ def _run_force(args, now: datetime) -> int:
             )
             print(f"  forced: {pr_url}  → restarting review against fresh sha={pr.head_sha[:8]}")
 
+        _mark_review_pending(state, pr, source="force", now=datetime.now())
+        save_state(state, touched_prs={pr.url})
         action = process_pr(pr, state, dry_run=False)
         save_state(state, touched_prs={pr.url})
         print(f"  forced: {pr.url}  → {action}")
@@ -1680,14 +1896,12 @@ def main() -> int:
     if args.force:
         return _run_force(args, now)
 
-    # First-ever run stamps installed_at as the "new PR vs pre-existing PR" cutoff.
-    # PRs created after this timestamp are treated as actionable on first sight;
-    # PRs created before are seeded silently (the original behaviour).
+    # First-ever run stamps installed_at for diagnostics/backward-compatible
+    # state shape. First-seen PRs are now always seeded silently; first reviews
+    # come from the immediate trigger channels.
     if not args.dry_run and "installed_at" not in state.get("_meta", {}):
         state.setdefault("_meta", {})["installed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         print(f"[pr-watcher] first run: stamped installed_at = {state['_meta']['installed_at']}")
-
-    installed_at_dt = _parse_iso_utc(state.get("_meta", {}).get("installed_at", ""))
 
     prs = fetch_open_prs()
     print(f"  open PRs (any base): {len(prs)}")
@@ -1738,37 +1952,25 @@ def main() -> int:
         pr_state_changed = False
         try:
             prev = state["prs"].get(pr.url)
-            # 首次见到此 PR：根据它是 install 之前就存在的旧 PR 还是之后新建的 PR 来决定
+            # Conservative fallback: the launchd tick only seeds first-seen PRs.
+            # Immediate first reviews belong to the local pre-push and
+            # pr-created channels. This avoids duplicate comments when GitHub's
+            # open-PR search lags behind merge/close and when an immediate
+            # review process died after posting a comment but before local state
+            # finalization.
             if prev is None:
-                pr_created_dt = _parse_iso_utc(pr.created_at)
-                is_post_install = (
-                    not args.seed_only
-                    and installed_at_dt is not None
-                    and pr_created_dt is not None
-                    and pr_created_dt > installed_at_dt
-                )
-
-                if not is_post_install:
-                    # 装好工具之前就存在的旧 PR / 或显式 --seed-only：只 seed
-                    reason = "seed-only" if args.seed_only else "pre-install"
-                    print(f"    seed ({reason})  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
-                    if not args.dry_run:
-                        state["prs"][pr.url] = {
-                            "repo": pr.repo,
-                            "number": pr.number,
-                            "last_seen_sha": pr.head_sha,
-                            "last_commented_sha": None,
-                            "seeded_at": now.isoformat(timespec="seconds"),
-                        }
-                        pr_state_changed = True
-                    continue
-
-                # 装好之后才创建的 PR → 即便 git pre-push hook 没抓到（网页 UI、异机 push、gh pr create…），也直接评论
-                print(f"    NEW PR (post-install)  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
-                action = process_pr(pr, state, dry_run=args.dry_run)
+                reason = "seed-only" if args.seed_only else "first-seen fallback"
+                print(f"    seed ({reason})  {pr.url}  sha={pr.head_sha[:8]}  created={pr.created_at}")
                 if not args.dry_run:
+                    state["prs"][pr.url] = {
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_seen_sha": pr.head_sha,
+                        "last_commented_sha": None,
+                        "seeded_at": now.isoformat(timespec="seconds"),
+                        "seed_reason": reason,
+                    }
                     pr_state_changed = True
-                print(f"      → {action}")
                 continue
 
             if args.seed_only:
@@ -1778,14 +1980,46 @@ def main() -> int:
                     pr_state_changed = True
                 continue
 
+            retry_after_pending_clear = False
+            if args.dry_run:
+                if prev.get("last_commented_sha") == pr.head_sha:
+                    print(f"    already reviewed sha={pr.head_sha[:8]}  {pr.url}")
+                    continue
+                if prev.get("pending_review_sha") == pr.head_sha:
+                    age = _pending_age_seconds(prev, now)
+                    age_s = "unknown" if age is None else f"{int(age)}s"
+                    print(f"    review pending (dry-run, no recovery) sha={pr.head_sha[:8]} age={age_s}  {pr.url}")
+                    continue
+            else:
+                had_matching_pending = (prev.get("pending_review_sha") == pr.head_sha)
+                guard_action, guard_changed = _same_sha_review_guard(pr, state, now)
+                retry_after_pending_clear = (
+                    had_matching_pending
+                    and guard_changed
+                    and prev.get("pending_review_sha") is None
+                    and prev.get("last_commented_sha") != pr.head_sha
+                )
+                if guard_changed:
+                    pr_state_changed = True
+                if guard_action is not None:
+                    print(f"    {guard_action}  {pr.url}")
+                    continue
+
             # 已 seed 过：若 head_sha 自上次"评论或 seed"以来未变 → 跳过
             baseline = prev.get("last_commented_sha") or prev.get("last_seen_sha")
-            if baseline == pr.head_sha:
+            if baseline == pr.head_sha and not retry_after_pending_clear:
                 print(f"    unchanged  {pr.url}  sha={pr.head_sha[:8]}")
                 continue
 
             # 有新 commit → 触发 codex
-            print(f"    NEW COMMIT  {pr.url}  {baseline[:8] if baseline else 'NEW'} → {pr.head_sha[:8]}")
+            if retry_after_pending_clear:
+                print(f"    STALE PENDING RETRY  {pr.url}  sha={pr.head_sha[:8]}")
+            else:
+                print(f"    NEW COMMIT  {pr.url}  {baseline[:8] if baseline else 'NEW'} → {pr.head_sha[:8]}")
+            if not args.dry_run:
+                _mark_review_pending(state, pr, source="poll", now=now)
+                pr_state_changed = True
+                save_state(state, touched_prs={pr.url})
             action = process_pr(pr, state, dry_run=args.dry_run)
             if not args.dry_run:
                 pr_state_changed = True

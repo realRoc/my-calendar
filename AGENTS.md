@@ -256,7 +256,7 @@ ls history/*/*__mothers-day__mom.md
 
 第二条独立功能：自动 review 自己跨 org 提交的 PR。
 
-### 触发模型（三通道）
+### 触发模型（两个即时通道 + 一个保守兜底）
 
 **主通道 — 全局 git pre-push hook（即时）**
 
@@ -276,7 +276,8 @@ ls history/*/*__mothers-day__mom.md
 **兜底通道 — launchd 10 min 轮询**
 
 - `com.<user>.calendar.pr-watcher`，`StartInterval=600`
-- 抓本地 hook 漏掉的事件：网页创建的 PR、异机 push、bot 自动 commit、push 时网络抖动导致 hook 失败等
+- 首次见到未知 PR 只 seed，不做首发 review；首发 review 由上面两个即时通道负责
+- 抓保守漏网场景：已 seed PR 的后续 missed commit、pending review 恢复、push 时网络抖动导致 hook 失败后的下一次 SHA 变化等
 - 休眠不唤醒 Mac
 - 每次 tick 单次最长 25 分钟，超时杀掉 codex
 
@@ -286,9 +287,9 @@ ls history/*/*__mothers-day__mom.md
 |---|---|---|
 | 本机 `git push` | ✅ 立即 | — |
 | 本机 `gh pr create` / `/ship` | ✅ 调用 `pr-created` 时立即 | ✅ ≤10min |
-| GitHub 网页 UI 创建/编辑 PR | ❌ | ✅ ≤10min |
-| 其他机器 push | ❌ | ✅ ≤10min |
-| PR bot 自动 commit | ❌ | ✅ ≤10min |
+| GitHub 网页 UI 创建/编辑 PR | ❌ | 首次只 seed；后续 commit/retry ≤10min |
+| 其他机器 push | ❌ | 首次只 seed；后续 commit/retry ≤10min |
+| PR bot 自动 commit | ❌ | 首次只 seed；后续 commit/retry ≤10min |
 
 ### 单次 tick 流程
 
@@ -298,6 +299,7 @@ ls history/*/*__mothers-day__mom.md
    - 首次见到 → seed 落 head_sha，**不评论**
    - head_sha 未变 → 跳过
    - head_sha 变了 → 触发 codex
+   - stale `pending_review_sha` → 先查 GitHub 是否已有本 watcher 的 AI 评论；查到则推进 state 防重复，确认没有才清 pending 并重试，查询失败则保留 pending 等下轮
 4. codex 调用：`codex exec --json --dangerously-bypass-approvals-and-sandbox -s danger-full-access --skip-git-repo-check -C /tmp/codex-pr-runs/<uuid> "<prompt>"`，用 `start_new_session=True` 起独立进程组以便 cancel 时能 `killpg` 整片
 5. 从 JSONL 第一行抓 `thread_id`（用于 `codex resume`）
 6. codex 自己用 `gh pr comment` 发评论；watcher 用 `gh api ...issues/<n>/comments` 兜底取 URL
@@ -323,6 +325,7 @@ ls history/*/*__mothers-day__mom.md
 - 同一 PR 串行（cancel + restart 保持这个语义）；不同 PR 之间继续并行
 - N 次快速 push 不会堆 N 个 review；最终只会留下 1 个 review，对应最后一个 sha
 - launchd 兜底 tick 路径遇到 in-flight review 时仍然 **skip**，不参与 cancel（设计取舍：兜底每 10 分钟跑一次，没必要打断当前 review；下一轮自然 re-check）
+- crash 后如果恢复到已存在的 GitHub AI 评论，优先保证同一 SHA 不再重复评论；这条恢复路径只推进 state / 缓存 comment body，不重建日历事件或 `.meta.json` sidecar
 - 通知用同一 `group="pr-watcher:<pr_url>"`，terminal-notifier 会把同组旧 banner 替换成最新一条，多次 cancel/restart 不会刷屏
 - **不要**再加"写 cancel marker"的新代码路径而绕过 `signal_cancel_and_wait_for_lock`：persist 锁约定要求 marker writer 必须在 persist 锁里 `touch()`，绕过会让 PR #27 修复失效
 
@@ -544,7 +547,7 @@ open 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fgithub.com
 
 ### 没有 origin_cwd 的事件
 
-launchd 兜底路径触发的评论（PR 在网页/异机创建、bot 自动 commit 等）没经过 pre-push hook，`pr_state.json` 里没有 `origin_cwd`。这种事件：
+launchd 兜底路径触发的评论（比如某个 PR 已 seed 后又在网页/异机/bot 路径产生新 commit）没经过 pre-push hook，`pr_state.json` 里可能没有 `origin_cwd`。这种事件：
 
 - URL 还是有效的，只是少了 `origin_cwd` 参数
 - launcher 会弹一个 osascript 文件夹选择器让用户手动定位
