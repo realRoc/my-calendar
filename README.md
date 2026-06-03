@@ -24,7 +24,7 @@ Three independent-but-composable workflows turn your local machine + Apple Calen
 - **Idempotent** — keyed on `(pr_url, head_sha)`; the same commit is reviewed once. A force-push that rewrites the SHA re-triggers.
 - **`codex` does the review** and posts it as a PR comment; the watcher writes a calendar event into a dedicated **"PR 监控"** calendar with the comment link and a `codex resume <thread_id>` command so you can pick the session back up.
 - **Cancel + restart on new commit** — if a new commit lands mid-review, the in-flight review is cancelled and restarted against the latest SHA (no queue pile-up).
-- **Fallback channel** — a launchd poll every 10 min catches what the local hook misses (PRs created on the web, pushes from another machine, bot commits).
+- **Conservative fallback** — a launchd poll every 10 min seeds first-seen PRs, retries stale pending reviews, and catches later missed commits; first-review immediacy comes from the local push / post-create hooks.
 
 ### 2. One-click AI fix from the calendar event (`MyCalFix.app` + `mycalfix://`)
 
@@ -58,7 +58,7 @@ The blockquote is the human-visible signal; the HTML comment is the stable grep 
 └─────────────────┘         └──────────────────────┘         └──────┬───────┘
                                                                     │ finds PR
 ┌──────────────┐  10min     ┌──────────────────┐                    ▼
-│   launchd    │ ──fallback▶│  pr_watcher.py   │◀────── --force <pr-url>
+│   launchd    │ ──retry───▶│  pr_watcher.py   │◀────── --force <pr-url>
 └──────────────┘            │  (Python)        │
                             └────┬─────────────┘
                                  │ codex exec --json --dangerously-bypass…
@@ -130,7 +130,7 @@ After that, every local `git push` kicks off a background codex review (comment 
 # watch the push-trigger chain live
 tail -f ~/.config/my-calendar/git-hooks/logs/trigger.log
 
-# launchd fallback channel
+# conservative launchd seed/retry channel
 tail -f logs/pr-watcher.log
 
 # how each mycalfix:// URL was parsed + launched
