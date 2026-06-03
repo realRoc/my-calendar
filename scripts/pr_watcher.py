@@ -878,6 +878,13 @@ def _complete_recovered_pending(
     cache_comment_body(comment_url, comment_body)
 
 
+def _resolved_origin_cwd(origin_cwd: str | None) -> str | None:
+    if not origin_cwd:
+        return None
+    cwd_p = Path(origin_cwd).expanduser().resolve()
+    return str(cwd_p) if cwd_p.is_dir() else None
+
+
 def _same_sha_review_guard(pr: PRSnap, state: dict, now: datetime) -> tuple[str | None, bool]:
     """Return (action, changed) for same-SHA completed/pending idempotency.
 
@@ -1722,12 +1729,20 @@ def _run_force(args, now: datetime) -> int:
             in_flight_state = load_state()
             in_flight_prev = in_flight_state.get("prs", {}).get(in_flight_pr.url) or {}
             if in_flight_prev.get("last_commented_sha") == in_flight_pr.head_sha:
+                new_origin_cwd = _resolved_origin_cwd(args.origin_cwd)
+                if new_origin_cwd:
+                    in_flight_state.setdefault("prs", {}).setdefault(in_flight_pr.url, {})["origin_cwd"] = new_origin_cwd
+                    save_state(in_flight_state, touched_prs={in_flight_pr.url})
                 print(
                     f"  forced: {in_flight_pr.url}  → already reviewed "
                     f"sha={in_flight_pr.head_sha[:8]}, skipping"
                 )
                 return 0
             if in_flight_prev.get("pending_review_sha") == in_flight_pr.head_sha:
+                new_origin_cwd = _resolved_origin_cwd(args.origin_cwd)
+                if new_origin_cwd:
+                    in_flight_state.setdefault("prs", {}).setdefault(in_flight_pr.url, {})["origin_cwd"] = new_origin_cwd
+                    save_state(in_flight_state, touched_prs={in_flight_pr.url})
                 print(
                     f"  forced: {in_flight_pr.url}  → review already pending "
                     f"sha={in_flight_pr.head_sha[:8]}, skipping duplicate trigger"
@@ -1780,9 +1795,8 @@ def _run_force(args, now: datetime) -> int:
 
         new_origin_cwd: str | None = None
         if args.origin_cwd:
-            cwd_p = Path(args.origin_cwd).expanduser().resolve()
-            if cwd_p.is_dir():
-                new_origin_cwd = str(cwd_p)
+            new_origin_cwd = _resolved_origin_cwd(args.origin_cwd)
+            if new_origin_cwd:
                 state.setdefault("prs", {}).setdefault(pr.url, {})["origin_cwd"] = new_origin_cwd
             else:
                 print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
@@ -1966,19 +1980,30 @@ def main() -> int:
                     pr_state_changed = True
                 continue
 
-            had_matching_pending = (prev.get("pending_review_sha") == pr.head_sha)
-            guard_action, guard_changed = _same_sha_review_guard(pr, state, now)
-            retry_after_pending_clear = (
-                had_matching_pending
-                and guard_changed
-                and prev.get("pending_review_sha") is None
-                and prev.get("last_commented_sha") != pr.head_sha
-            )
-            if guard_changed:
-                pr_state_changed = True
-            if guard_action is not None:
-                print(f"    {guard_action}  {pr.url}")
-                continue
+            retry_after_pending_clear = False
+            if args.dry_run:
+                if prev.get("last_commented_sha") == pr.head_sha:
+                    print(f"    already reviewed sha={pr.head_sha[:8]}  {pr.url}")
+                    continue
+                if prev.get("pending_review_sha") == pr.head_sha:
+                    age = _pending_age_seconds(prev, now)
+                    age_s = "unknown" if age is None else f"{int(age)}s"
+                    print(f"    review pending (dry-run, no recovery) sha={pr.head_sha[:8]} age={age_s}  {pr.url}")
+                    continue
+            else:
+                had_matching_pending = (prev.get("pending_review_sha") == pr.head_sha)
+                guard_action, guard_changed = _same_sha_review_guard(pr, state, now)
+                retry_after_pending_clear = (
+                    had_matching_pending
+                    and guard_changed
+                    and prev.get("pending_review_sha") is None
+                    and prev.get("last_commented_sha") != pr.head_sha
+                )
+                if guard_changed:
+                    pr_state_changed = True
+                if guard_action is not None:
+                    print(f"    {guard_action}  {pr.url}")
+                    continue
 
             # 已 seed 过：若 head_sha 自上次"评论或 seed"以来未变 → 跳过
             baseline = prev.get("last_commented_sha") or prev.get("last_seen_sha")

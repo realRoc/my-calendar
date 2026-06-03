@@ -1461,6 +1461,44 @@ class ConservativeFallbackTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(process_calls, [pr_url])
 
+    def test_dry_run_pending_path_does_not_recover_or_cache(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/208"
+        state = {
+            "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+            "prs": {
+                pr_url: {
+                    "last_seen_sha": "sha208",
+                    "last_commented_sha": None,
+                    "pending_review_sha": "sha208",
+                    "pending_review_started_at": "2000-01-01T00:00:00",
+                },
+            },
+        }
+        pr = pr_watcher.PRSnap(
+            url=pr_url, number=208, title="dry run pending", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="sha208", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            argv = ["pr_watcher.py", "--dry-run"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state") as save_state, \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", lambda: [pr]), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since") as lookup, \
+                    mock.patch.object(pr_watcher, "cache_comment_body") as cache:
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(save_state.call_count, 0)
+        self.assertEqual(lookup.call_count, 0)
+        self.assertEqual(cache.call_count, 0)
+
 
 class ReviewPendingIdempotencyTests(unittest.TestCase):
     def test_force_same_sha_pending_skips_without_cancel(self):
@@ -1509,6 +1547,63 @@ class ReviewPendingIdempotencyTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(cancel.call_count, 0, "same-SHA duplicate trigger must not cancel the in-flight review")
+
+    def test_force_same_sha_pending_backfills_origin_cwd_before_skip(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/209"
+        head_sha = "abc209"
+        state = {
+            "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+            "prs": {
+                pr_url: {
+                    "pending_review_sha": head_sha,
+                    "pending_review_started_at": "2026-06-03T10:00:00",
+                }
+            },
+        }
+        saved: list[dict] = []
+
+        def fake_run(*_args, **_kwargs):
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps({
+                    "url": pr_url,
+                    "number": 209,
+                    "title": "pending origin cwd",
+                    "isDraft": False,
+                    "baseRefName": "main",
+                    "headRefName": "feat",
+                    "headRefOid": head_sha,
+                    "createdAt": "2026-06-03T00:00:00Z",
+                    "headRepository": {"name": "my-calendar"},
+                    "headRepositoryOwner": {"login": "realRoc"},
+                }),
+                stderr="",
+            )
+
+        def fake_save(s, *, touched_prs=None):
+            saved.append(json.loads(json.dumps(s)))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            origin = tmp / "checkout"
+            origin.mkdir()
+            argv = ["pr_watcher.py", "--force", pr_url, "--origin-cwd", str(origin)]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: None), \
+                    mock.patch.object(pr_watcher.subprocess, "run", fake_run), \
+                    mock.patch.object(pr_watcher, "signal_cancel_and_wait_for_lock") as cancel:
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(cancel.call_count, 0)
+        expected_origin = str(origin.resolve())
+        self.assertEqual(state["prs"][pr_url]["origin_cwd"], expected_origin)
+        self.assertEqual(saved[-1]["prs"][pr_url]["origin_cwd"], expected_origin)
 
     def test_force_marks_pending_before_review(self):
         pr_url = "https://github.com/realRoc/my-calendar/pull/204"
