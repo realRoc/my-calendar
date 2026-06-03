@@ -9,6 +9,7 @@ or:
 from __future__ import annotations
 
 import json
+import io
 import os
 import shlex
 import shutil
@@ -25,6 +26,56 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import pr_watcher  # noqa: E402
+import calendar_sync  # noqa: E402
+
+
+class CalendarRemoveEventTests(unittest.TestCase):
+    def test_remove_event_keeps_state_when_eventkit_delete_fails(self):
+        saved_states: list[dict] = []
+
+        class FakeStore:
+            def eventWithIdentifier_(self, event_id):
+                return object()
+
+            def removeEvent_span_error_(self, event, span, err):
+                return False, "boom"
+
+        fake_event_store = mock.MagicMock()
+        fake_event_store.alloc.return_value.init.return_value = FakeStore()
+        state = {"event-key": {"event_id": "ek-1"}}
+
+        with mock.patch.object(calendar_sync, "EKEventStore", fake_event_store), \
+                mock.patch.object(calendar_sync, "_request_access", lambda store: True), \
+                mock.patch.object(calendar_sync, "_load_state", lambda path: dict(state)), \
+                mock.patch.object(calendar_sync, "_save_state", lambda path, s: saved_states.append(s)), \
+                mock.patch.object(calendar_sync.sys, "stderr", io.StringIO()):
+            ok = calendar_sync.remove_event("event-key", Path("/tmp/state.json"))
+
+        self.assertFalse(ok)
+        self.assertEqual(saved_states, [], "failed EventKit delete must not drop the state pointer")
+
+    def test_remove_event_drops_state_after_eventkit_delete_succeeds(self):
+        saved_states: list[dict] = []
+
+        class FakeStore:
+            def eventWithIdentifier_(self, event_id):
+                return object()
+
+            def removeEvent_span_error_(self, event, span, err):
+                return True, None
+
+        fake_event_store = mock.MagicMock()
+        fake_event_store.alloc.return_value.init.return_value = FakeStore()
+        state = {"event-key": {"event_id": "ek-1"}}
+
+        with mock.patch.object(calendar_sync, "EKEventStore", fake_event_store), \
+                mock.patch.object(calendar_sync, "_request_access", lambda store: True), \
+                mock.patch.object(calendar_sync, "_load_state", lambda path: dict(state)), \
+                mock.patch.object(calendar_sync, "_save_state", lambda path, s: saved_states.append(s)):
+            ok = calendar_sync.remove_event("event-key", Path("/tmp/state.json"))
+
+        self.assertTrue(ok)
+        self.assertEqual(saved_states, [{}])
 
 
 class ForceOriginCwdTests(unittest.TestCase):
@@ -178,7 +229,15 @@ class ForceOriginCwdFreshRunTests(unittest.TestCase):
                     mock.patch.object(pr_watcher.subprocess, "run", fake_run), \
                     mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
                     mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: fake_codex_result), \
-                    mock.patch.object(pr_watcher, "fetch_latest_comment", lambda repo, n: ("https://example/c/1", "verdict: pass")), \
+                    mock.patch.object(
+                        pr_watcher,
+                        "fetch_latest_ai_comment_since",
+                        lambda repo, n, since, **kw: pr_watcher.AICommentLookup(
+                            "found",
+                            comment_url="https://example/c/1",
+                            comment_body=pr_watcher.AI_COAUTHOR_METADATA_MARKER,
+                        ),
+                    ), \
                     mock.patch.object(pr_watcher, "upsert_events", lambda events, *a, **kw: {events[0].key: "created"}), \
                     mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
                 rc = pr_watcher.main()
@@ -315,6 +374,70 @@ class ForceCancelRestartTests(unittest.TestCase):
                              f"per-PR lock fd should release exactly once; got {release_calls}")
             self.assertEqual(release_calls[-1], 999,
                              f"per-PR lock should be the last release; got {release_calls}")
+
+    def test_force_cancel_restart_fetches_latest_head_after_wait(self):
+        """Multiple rapid pushes should coalesce: after cancelling the old
+        leader, the restart fetches GitHub's current head and reviews that,
+        not the sha observed before waiting for the lock."""
+        pr_url = "https://github.com/realRoc/my-calendar/pull/11"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr_url: {
+                        "last_seen_sha": "old111",
+                        "last_commented_sha": "old111",
+                        "pending_review_sha": "old111",
+                    }
+                },
+            }
+            viewed_shas = iter(["mid222", "latest333"])
+
+            def fake_gh_run(*args, **_kwargs):
+                sha = next(viewed_shas)
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=json.dumps({
+                        "url": pr_url, "number": 11, "title": "coalesce",
+                        "isDraft": False, "baseRefName": "main",
+                        "headRefName": "feat", "headRefOid": sha,
+                        "createdAt": "2026-05-22T00:00:00Z",
+                        "headRepository": {"name": "my-calendar"},
+                        "headRepositoryOwner": {"login": "realRoc"},
+                    }),
+                    stderr="",
+                )
+
+            reviewed_shas: list[str] = []
+
+            def fake_process_pr(pr, st, dry_run):
+                reviewed_shas.append(pr.head_sha)
+                st.setdefault("prs", {}).setdefault(pr.url, {})["last_commented_sha"] = pr.head_sha
+                pr_watcher._clear_pending_review(st["prs"][pr.url])
+                return "codex ran (mocked)"
+
+            argv = ["pr_watcher.py", "--force", pr_url]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: None), \
+                    mock.patch.object(pr_watcher, "signal_cancel_and_wait_for_lock",
+                                      lambda url: (1002, time.time_ns())), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process_pr), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher.subprocess, "run", fake_gh_run):
+                rc = pr_watcher.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(reviewed_shas, ["latest333"])
+            self.assertEqual(state["prs"][pr_url]["last_commented_sha"], "latest333")
 
     def test_force_no_cancel_when_lock_free(self):
         """If acquire_pr_lock_nb succeeds on first try, this is a normal run —
@@ -1115,8 +1238,11 @@ class ProcessPrCancelShortCircuitTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "notify",
                                       lambda *, title="", **kw: notifications.append(title)), \
                     mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
-                    mock.patch.object(pr_watcher, "fetch_latest_comment",
-                                      lambda repo, n: (None, None)), \
+                    mock.patch.object(
+                        pr_watcher,
+                        "fetch_latest_ai_comment_since",
+                        lambda repo, n, since, **kw: pr_watcher.AICommentLookup("absent"),
+                    ), \
                     mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
                 ret = pr_watcher.process_pr(pr, state, dry_run=False)
 
@@ -1133,6 +1259,592 @@ class ProcessPrCancelShortCircuitTests(unittest.TestCase):
                           f"cancel notification must fire; got {notifications}")
 
 
+class ProcessPrMissingAICommentTests(unittest.TestCase):
+    """A clean codex exit is not enough to mark a SHA reviewed.
+
+    pr_watcher's durable completion boundary is the GitHub AI-marker comment:
+    without it, calendar/state/meta writes would falsely suppress future
+    review attempts for a commit that never received review feedback.
+    """
+
+    def test_missing_ai_comment_keeps_pending_and_skips_persist(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/64",
+            number=64, title="missing comment boundary", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="sha64new", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch-sha64new"
+            scratch.mkdir()
+            jsonl_path = tmp / "20260603-120000__realRoc_my-calendar_pull_64.jsonl"
+            jsonl_path.write_text('{"x":1}\n', encoding="utf-8")
+            meta_path = jsonl_path.with_suffix(".meta.json")
+
+            clean_result = pr_watcher.CodexResult(
+                thread_id="t-missing",
+                last_message="reviewed but did not comment",
+                exit_code=0,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=False,
+            )
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr.url: {
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_commented_sha": "oldsha",
+                        "last_seen_sha": "oldsha",
+                        "pending_review_sha": pr.head_sha,
+                        "pending_review_started_at": "2026-06-03T12:00:00",
+                        "pending_review_source": "force",
+                    }
+                },
+            }
+            prompt_template = "review {pr_link}"
+            upsert_calls: list = []
+
+            with mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: clean_result), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "upsert_events", lambda events, *a, **kw: upsert_calls.append(events) or {}), \
+                    mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: pr), \
+                    mock.patch.object(
+                        pr_watcher,
+                        "fetch_latest_ai_comment_since",
+                        lambda repo, number, since, **kw: pr_watcher.AICommentLookup("absent"),
+                    ), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr, state, dry_run=False)
+
+            self.assertIn("review comment missing", ret)
+            self.assertEqual(upsert_calls, [], "calendar events require a confirmed AI comment")
+            self.assertFalse(meta_path.exists(), "sidecar must not exist without a confirmed AI comment")
+            entry = state["prs"][pr.url]
+            self.assertEqual(entry["last_commented_sha"], "oldsha")
+            self.assertEqual(entry["pending_review_sha"], pr.head_sha)
+            self.assertEqual(entry["pending_review_source"], "force")
+            self.assertFalse(scratch.exists(), "scratch dir should still be cleaned up")
+            self.assertIn("_review_comment_missing", jsonl_path.read_text(encoding="utf-8"))
+
+
+class ProcessPrHeadMovedRevalidationTests(unittest.TestCase):
+    def test_head_move_after_codex_restarts_latest_without_persisting_old(self):
+        pr_old = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/65",
+            number=65, title="head moved", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="old111", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        pr_new = pr_watcher.PRSnap(
+            url=pr_old.url,
+            number=65, title="head moved", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="new222", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch_old = tmp / "scratch-old"
+            scratch_new = tmp / "scratch-new"
+            scratch_old.mkdir()
+            scratch_new.mkdir()
+            old_jsonl = tmp / "20260603-120000__realRoc_my-calendar_pull_65_old.jsonl"
+            new_jsonl = tmp / "20260603-120001__realRoc_my-calendar_pull_65_new.jsonl"
+            old_jsonl.write_text('{"x":"old"}\n', encoding="utf-8")
+            new_jsonl.write_text('{"x":"new"}\n', encoding="utf-8")
+            old_meta = old_jsonl.with_suffix(".meta.json")
+            new_meta = new_jsonl.with_suffix(".meta.json")
+
+            results = iter([
+                pr_watcher.CodexResult(
+                    thread_id="t-old",
+                    last_message="old review",
+                    exit_code=0,
+                    jsonl_path=old_jsonl,
+                    scratch_dir=scratch_old,
+                    cancelled=False,
+                ),
+                pr_watcher.CodexResult(
+                    thread_id="t-new",
+                    last_message="new review",
+                    exit_code=0,
+                    jsonl_path=new_jsonl,
+                    scratch_dir=scratch_new,
+                    cancelled=False,
+                ),
+            ])
+            current_heads = iter([pr_new, pr_new, pr_new, pr_new])
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr_old.url: {
+                        "repo": pr_old.repo,
+                        "number": pr_old.number,
+                        "last_commented_sha": "base000",
+                        "last_seen_sha": "base000",
+                        "pending_review_sha": pr_old.head_sha,
+                        "pending_review_started_at": "2026-06-03T12:00:00",
+                        "pending_review_source": "force",
+                    }
+                },
+            }
+            prompt_template = "review {pr_link} at {head_sha}"
+            upserted_keys: list[str] = []
+            saved_pending: list[str | None] = []
+            fetch_head_shas: list[str | None] = []
+
+            def fake_fetch(repo, number, since, **kw):
+                fetch_head_shas.append(kw.get("head_sha"))
+                return pr_watcher.AICommentLookup(
+                    "found",
+                    comment_url="https://example/c/new",
+                    comment_body=(
+                        f"{pr_watcher.AI_COAUTHOR_METADATA_MARKER}\n"
+                        f"{pr_watcher.head_sha_metadata_marker(pr_new.head_sha)}\n"
+                        "结论：✅ 可以合并\n"
+                    ),
+                )
+
+            def fake_upsert(events, *a, **kw):
+                upserted_keys.extend(event.key for event in events)
+                return {events[0].key: "created"}
+
+            def fake_save(s, *, touched_prs=None):
+                saved_pending.append(s["prs"][pr_old.url].get("pending_review_sha"))
+
+            with mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: next(results)), \
+                    mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: next(current_heads)), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", fake_fetch), \
+                    mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr_old, state, dry_run=False)
+
+            self.assertIn("calendar=created", ret)
+            self.assertEqual(fetch_head_shas, [pr_new.head_sha])
+            self.assertEqual(saved_pending, [pr_new.head_sha])
+            self.assertEqual(upserted_keys, [f"my-calendar:pr-comment:{pr_new.url}:{pr_new.head_sha}"])
+            self.assertFalse(old_meta.exists(), "obsolete review must not get a sidecar")
+            self.assertTrue(new_meta.exists(), "latest review should get the sidecar")
+            entry = state["prs"][pr_old.url]
+            self.assertEqual(entry["last_commented_sha"], pr_new.head_sha)
+            self.assertNotIn("pending_review_sha", entry)
+            self.assertFalse(scratch_old.exists())
+            self.assertFalse(scratch_new.exists())
+            self.assertIn("_head_moved_before_persist", old_jsonl.read_text(encoding="utf-8"))
+
+    def test_head_move_inside_persist_restarts_latest_without_persisting_old(self):
+        pr_old = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/66",
+            number=66, title="late head moved", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="old333", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        pr_new = pr_watcher.PRSnap(
+            url=pr_old.url,
+            number=66, title="late head moved", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="new444", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch_old = tmp / "scratch-old"
+            scratch_new = tmp / "scratch-new"
+            scratch_old.mkdir()
+            scratch_new.mkdir()
+            old_jsonl = tmp / "20260603-120000__realRoc_my-calendar_pull_66_old.jsonl"
+            new_jsonl = tmp / "20260603-120001__realRoc_my-calendar_pull_66_new.jsonl"
+            old_jsonl.write_text('{"x":"old"}\n', encoding="utf-8")
+            new_jsonl.write_text('{"x":"new"}\n', encoding="utf-8")
+            old_meta = old_jsonl.with_suffix(".meta.json")
+            new_meta = new_jsonl.with_suffix(".meta.json")
+
+            results = iter([
+                pr_watcher.CodexResult(
+                    thread_id="t-old",
+                    last_message="old review",
+                    exit_code=0,
+                    jsonl_path=old_jsonl,
+                    scratch_dir=scratch_old,
+                    cancelled=False,
+                ),
+                pr_watcher.CodexResult(
+                    thread_id="t-new",
+                    last_message="new review",
+                    exit_code=0,
+                    jsonl_path=new_jsonl,
+                    scratch_dir=scratch_new,
+                    cancelled=False,
+                ),
+            ])
+            current_heads = iter([pr_old, pr_new, pr_new, pr_new, pr_new])
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr_old.url: {
+                        "repo": pr_old.repo,
+                        "number": pr_old.number,
+                        "last_commented_sha": "base000",
+                        "last_seen_sha": "base000",
+                        "pending_review_sha": pr_old.head_sha,
+                        "pending_review_started_at": "2026-06-03T12:00:00",
+                        "pending_review_source": "force",
+                    }
+                },
+            }
+            prompt_template = "review {pr_link} at {head_sha}"
+            upserted_keys: list[str] = []
+            saved_pending: list[str | None] = []
+            fetch_head_shas: list[str | None] = []
+
+            def fake_fetch(repo, number, since, **kw):
+                head_sha = kw.get("head_sha")
+                fetch_head_shas.append(head_sha)
+                return pr_watcher.AICommentLookup(
+                    "found",
+                    comment_url=f"https://example/c/{head_sha}",
+                    comment_body=(
+                        f"{pr_watcher.AI_COAUTHOR_METADATA_MARKER}\n"
+                        f"{pr_watcher.head_sha_metadata_marker(head_sha or '')}\n"
+                        "结论：✅ 可以合并\n"
+                    ),
+                )
+
+            def fake_upsert(events, *a, **kw):
+                upserted_keys.extend(event.key for event in events)
+                return {events[0].key: "created"}
+
+            def fake_save(s, *, touched_prs=None):
+                saved_pending.append(s["prs"][pr_old.url].get("pending_review_sha"))
+
+            with mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: next(results)), \
+                    mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: next(current_heads)), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", fake_fetch), \
+                    mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr_old, state, dry_run=False)
+
+            self.assertIn("calendar=created", ret)
+            self.assertEqual(fetch_head_shas, [pr_old.head_sha, pr_new.head_sha])
+            self.assertEqual(saved_pending, [pr_new.head_sha])
+            self.assertEqual(upserted_keys, [f"my-calendar:pr-comment:{pr_new.url}:{pr_new.head_sha}"])
+            self.assertFalse(old_meta.exists(), "obsolete review must not get a sidecar")
+            self.assertTrue(new_meta.exists(), "latest review should get the sidecar")
+            entry = state["prs"][pr_old.url]
+            self.assertEqual(entry["last_commented_sha"], pr_new.head_sha)
+            self.assertNotIn("pending_review_sha", entry)
+            self.assertFalse(scratch_old.exists())
+            self.assertFalse(scratch_new.exists())
+            self.assertIn("_head_moved_inside_persist", old_jsonl.read_text(encoding="utf-8"))
+
+    def test_head_move_after_calendar_upsert_rolls_back_old_artifacts_and_restarts(self):
+        pr_old = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/67",
+            number=67, title="post upsert head moved", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="old555", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        pr_new = pr_watcher.PRSnap(
+            url=pr_old.url,
+            number=67, title="post upsert head moved", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="new666", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch_old = tmp / "scratch-old"
+            scratch_new = tmp / "scratch-new"
+            scratch_old.mkdir()
+            scratch_new.mkdir()
+            old_jsonl = tmp / "20260603-120000__realRoc_my-calendar_pull_67_old.jsonl"
+            new_jsonl = tmp / "20260603-120001__realRoc_my-calendar_pull_67_new.jsonl"
+            old_jsonl.write_text('{"x":"old"}\n', encoding="utf-8")
+            new_jsonl.write_text('{"x":"new"}\n', encoding="utf-8")
+            old_meta = old_jsonl.with_suffix(".meta.json")
+            new_meta = new_jsonl.with_suffix(".meta.json")
+
+            results = iter([
+                pr_watcher.CodexResult(
+                    thread_id="t-old",
+                    last_message="old review",
+                    exit_code=0,
+                    jsonl_path=old_jsonl,
+                    scratch_dir=scratch_old,
+                    cancelled=False,
+                ),
+                pr_watcher.CodexResult(
+                    thread_id="t-new",
+                    last_message="new review",
+                    exit_code=0,
+                    jsonl_path=new_jsonl,
+                    scratch_dir=scratch_new,
+                    cancelled=False,
+                ),
+            ])
+            # old early recheck, old pre-write recheck, old post-write recheck
+            # sees the remote move, then the restarted latest review stays stable.
+            current_heads = iter([pr_old, pr_old, pr_new, pr_new, pr_new, pr_new])
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr_old.url: {
+                        "repo": pr_old.repo,
+                        "number": pr_old.number,
+                        "last_commented_sha": "base000",
+                        "last_seen_sha": "base000",
+                        "pending_review_sha": pr_old.head_sha,
+                        "pending_review_started_at": "2026-06-03T12:00:00",
+                        "pending_review_source": "force",
+                    }
+                },
+            }
+            prompt_template = "review {pr_link} at {head_sha}"
+            upserted_keys: list[str] = []
+            removed_keys: list[str] = []
+            saved_pending: list[str | None] = []
+            fetch_head_shas: list[str | None] = []
+
+            def fake_fetch(repo, number, since, **kw):
+                head_sha = kw.get("head_sha")
+                fetch_head_shas.append(head_sha)
+                return pr_watcher.AICommentLookup(
+                    "found",
+                    comment_url=f"https://example/c/{head_sha}",
+                    comment_body=(
+                        f"{pr_watcher.AI_COAUTHOR_METADATA_MARKER}\n"
+                        f"{pr_watcher.head_sha_metadata_marker(head_sha or '')}\n"
+                        "结论：✅ 可以合并\n"
+                    ),
+                )
+
+            def fake_upsert(events, *a, **kw):
+                upserted_keys.extend(event.key for event in events)
+                return {events[0].key: "created"}
+
+            def fake_remove(key, *a, **kw):
+                removed_keys.append(key)
+                return True
+
+            def fake_save(s, *, touched_prs=None):
+                saved_pending.append(s["prs"][pr_old.url].get("pending_review_sha"))
+
+            with mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: next(results)), \
+                    mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: next(current_heads)), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", fake_fetch), \
+                    mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                    mock.patch.object(pr_watcher, "remove_event", fake_remove), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr_old, state, dry_run=False)
+
+            old_key = f"my-calendar:pr-comment:{pr_old.url}:{pr_old.head_sha}"
+            new_key = f"my-calendar:pr-comment:{pr_new.url}:{pr_new.head_sha}"
+            self.assertIn("calendar=created", ret)
+            self.assertEqual(fetch_head_shas, [pr_old.head_sha, pr_new.head_sha])
+            self.assertEqual(upserted_keys, [old_key, new_key])
+            self.assertEqual(removed_keys, [old_key])
+            self.assertEqual(saved_pending, [pr_new.head_sha])
+            self.assertFalse(old_meta.exists(), "rolled-back review must not keep a sidecar")
+            self.assertTrue(new_meta.exists(), "latest review should get the sidecar")
+            entry = state["prs"][pr_old.url]
+            self.assertEqual(entry["last_commented_sha"], pr_new.head_sha)
+            self.assertNotIn("pending_review_sha", entry)
+            self.assertFalse(scratch_old.exists())
+            self.assertFalse(scratch_new.exists())
+            self.assertIn("_head_moved_inside_persist", old_jsonl.read_text(encoding="utf-8"))
+
+    def test_head_move_depth_limit_clears_pending_so_next_run_can_retry_immediately(self):
+        pr_old = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/68",
+            number=68, title="keeps moving", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="old777", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        pr_new = pr_watcher.PRSnap(
+            url=pr_old.url,
+            number=68, title="keeps moving", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="new888", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch"
+            scratch.mkdir()
+            jsonl_path = tmp / "20260603-120000__realRoc_my-calendar_pull_68.jsonl"
+            jsonl_path.write_text('{"x":"old"}\n', encoding="utf-8")
+            result = pr_watcher.CodexResult(
+                thread_id="t-old",
+                last_message="old review",
+                exit_code=0,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=False,
+            )
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr_old.url: {
+                        "repo": pr_old.repo,
+                        "number": pr_old.number,
+                        "last_commented_sha": "base000",
+                        "last_seen_sha": "base000",
+                        "pending_review_sha": pr_old.head_sha,
+                        "pending_review_started_at": "2026-06-03T12:00:00",
+                        "pending_review_source": "force",
+                    }
+                },
+            }
+            saved_pending: list[str | None] = []
+
+            def fake_save(s, *, touched_prs=None):
+                saved_pending.append(s["prs"][pr_old.url].get("pending_review_sha"))
+
+            with mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: "review {pr_link} at {head_sha}")), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: result), \
+                    mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: pr_new), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since",
+                                      lambda *a, **kw: self.fail("comment lookup should not run for stale head")), \
+                    mock.patch.object(pr_watcher, "upsert_events",
+                                      lambda *a, **kw: self.fail("stale head must not be persisted")), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr_old, state, dry_run=False, restart_depth=3)
+
+            self.assertIn("head kept moving", ret)
+            self.assertEqual(saved_pending, [None])
+            self.assertNotIn("pending_review_sha", state["prs"][pr_old.url])
+            self.assertFalse(scratch.exists())
+            self.assertIn("_head_moved_before_persist", jsonl_path.read_text(encoding="utf-8"))
+
+    def test_head_move_failed_calendar_rollback_records_cleanup_key(self):
+        pr_old = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/69",
+            number=69, title="rollback failed", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="old999", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        pr_new = pr_watcher.PRSnap(
+            url=pr_old.url,
+            number=69, title="rollback failed", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="new000", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch"
+            scratch.mkdir()
+            jsonl_path = tmp / "20260603-120000__realRoc_my-calendar_pull_69.jsonl"
+            jsonl_path.write_text('{"x":"old"}\n', encoding="utf-8")
+            meta_path = jsonl_path.with_suffix(".meta.json")
+            result = pr_watcher.CodexResult(
+                thread_id="t-old",
+                last_message="old review",
+                exit_code=0,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=False,
+            )
+            current_heads = iter([pr_old, pr_old, pr_new])
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr_old.url: {
+                        "repo": pr_old.repo,
+                        "number": pr_old.number,
+                        "last_commented_sha": "base000",
+                        "last_seen_sha": "base000",
+                        "pending_review_sha": pr_old.head_sha,
+                        "pending_review_started_at": "2026-06-03T12:00:00",
+                        "pending_review_source": "force",
+                    }
+                },
+            }
+            old_key = f"my-calendar:pr-comment:{pr_old.url}:{pr_old.head_sha}"
+            removed_keys: list[str] = []
+
+            def fake_fetch(repo, number, since, **kw):
+                return pr_watcher.AICommentLookup(
+                    "found",
+                    comment_url=f"https://example/c/{kw.get('head_sha')}",
+                    comment_body=(
+                        f"{pr_watcher.AI_COAUTHOR_METADATA_MARKER}\n"
+                        f"{pr_watcher.head_sha_metadata_marker(kw.get('head_sha') or '')}\n"
+                        "结论：✅ 可以合并\n"
+                    ),
+                )
+
+            with mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: "review {pr_link} at {head_sha}")), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: result), \
+                    mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: next(current_heads)), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", fake_fetch), \
+                    mock.patch.object(pr_watcher, "upsert_events", lambda events, *a, **kw: {events[0].key: "created"}), \
+                    mock.patch.object(pr_watcher, "remove_event", lambda key, *a, **kw: removed_keys.append(key) or False), \
+                    mock.patch.object(pr_watcher, "save_state", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr_old, state, dry_run=False, restart_depth=3)
+
+            self.assertIn("head kept moving", ret)
+            self.assertEqual(removed_keys, [old_key])
+            entry = state["prs"][pr_old.url]
+            self.assertEqual(entry.get("pending_calendar_delete_keys"), [old_key])
+            self.assertNotIn("pending_review_sha", entry)
+            self.assertFalse(meta_path.exists())
+            self.assertFalse(scratch.exists())
+
+    def test_pending_calendar_delete_retry_clears_key_after_success(self):
+        key = "my-calendar:pr-comment:https://github.com/realRoc/my-calendar/pull/69:old999"
+        state = {
+            "prs": {
+                "https://github.com/realRoc/my-calendar/pull/69": {
+                    "pending_calendar_delete_keys": [key],
+                }
+            }
+        }
+        removed: list[str] = []
+
+        with mock.patch.object(pr_watcher, "remove_event", lambda k, *a, **kw: removed.append(k) or True):
+            changed = pr_watcher._retry_pending_calendar_deletes(
+                state,
+                "https://github.com/realRoc/my-calendar/pull/69",
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(removed, [key])
+        self.assertNotIn(
+            "pending_calendar_delete_keys",
+            state["prs"]["https://github.com/realRoc/my-calendar/pull/69"],
+        )
+
+
 class ProcessPrLateMarkerShortCircuitTests(unittest.TestCase):
     """PR #27 codex review blocker: when run_codex returns cancelled=False
     (codex finished naturally) but a new --force writes the per-PR cancel
@@ -1146,7 +1858,7 @@ class ProcessPrLateMarkerShortCircuitTests(unittest.TestCase):
     "stale review committed for obsolete sha + duplicate write for fresh
     sha" outcome.
 
-    Setup: drop the cancel marker from inside fetch_latest_comment's mock
+    Setup: drop the cancel marker from inside fetch_latest_ai_comment_since's mock
     (precisely the window the reviewer called out — run_codex has returned,
     process_pr is mid-way through its continuation, calendar hasn't been
     written yet).
@@ -1208,9 +1920,13 @@ class ProcessPrLateMarkerShortCircuitTests(unittest.TestCase):
             # a new --force arrives and writes the cancel marker. The
             # synchronous check in process_pr (between build_event and
             # upsert_events) must see this and bail out.
-            def fake_fetch(repo, n):
+            def fake_fetch(repo, n, since, **kw):
                 pr_watcher._pr_cancel_path(pr.url).touch()
-                return ("https://example/c/late", "结论：✅ 可以合并\n")
+                return pr_watcher.AICommentLookup(
+                    "found",
+                    comment_url="https://example/c/late",
+                    comment_body=f"{pr_watcher.AI_COAUTHOR_METADATA_MARKER}\n结论：✅ 可以合并\n",
+                )
 
             with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
                     mock.patch.object(pr_watcher, "PROMPT_PATH", mock.MagicMock(read_text=lambda encoding=None: prompt_template)), \
@@ -1218,7 +1934,8 @@ class ProcessPrLateMarkerShortCircuitTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "notify",
                                       lambda *, title="", **kw: notifications.append(title)), \
                     mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
-                    mock.patch.object(pr_watcher, "fetch_latest_comment", fake_fetch), \
+                    mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: pr), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", fake_fetch), \
                     mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
                 ret = pr_watcher.process_pr(pr, state, dry_run=False)
 
@@ -1344,13 +2061,13 @@ class TickSaveStateOrderTests(unittest.TestCase):
 
 
 class ConservativeFallbackTests(unittest.TestCase):
-    def test_tick_first_seen_pr_only_seeds(self):
+    def test_tick_first_seen_historical_pr_only_seeds(self):
         pr_url = "https://github.com/realRoc/my-calendar/pull/200"
         state = {"_meta": {"installed_at": "2026-05-22T00:00:00+00:00"}, "prs": {}}
         pr = pr_watcher.PRSnap(
             url=pr_url, number=200, title="new from web", is_draft=False,
             repo="realRoc/my-calendar", base="main", default_branch="main",
-            head_sha="firstsha", created_at="2026-06-03T00:00:00Z",
+            head_sha="firstsha", created_at="2026-05-21T00:00:00Z",
             head_branch="feat", head_repo="realRoc/my-calendar",
         )
         process_calls: list[str] = []
@@ -1370,9 +2087,160 @@ class ConservativeFallbackTests(unittest.TestCase):
                 rc = pr_watcher.main()
 
         self.assertEqual(rc, 0)
-        self.assertEqual(process_calls, [], "fallback tick must not review first-seen PRs")
+        self.assertEqual(process_calls, [], "fallback tick must not review historical first-seen PRs")
         self.assertEqual(state["prs"][pr_url]["last_seen_sha"], "firstsha")
-        self.assertEqual(state["prs"][pr_url]["seed_reason"], "first-seen fallback")
+        self.assertEqual(state["prs"][pr_url]["seed_reason"], "historical first-seen fallback")
+
+    def test_tick_first_seen_historical_pr_head_commit_after_install_reviews(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/212"
+        state = {"_meta": {"installed_at": "2026-06-01T00:00:00+00:00"}, "prs": {}}
+        pr = pr_watcher.PRSnap(
+            url=pr_url, number=212, title="old pr new activity", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="updated212", created_at="2026-05-21T00:00:00Z",
+            updated_at="2026-06-03T00:00:00Z",
+            head_committed_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        process_calls: list[str] = []
+
+        def fake_process(pr, st, dry_run):
+            process_calls.append(pr.head_sha)
+            st["prs"][pr.url]["last_commented_sha"] = pr.head_sha
+            st["prs"][pr.url]["last_seen_sha"] = pr.head_sha
+            pr_watcher._clear_pending_review(st["prs"][pr.url])
+            return "codex ran"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            argv = ["pr_watcher.py"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 1001), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", lambda: [pr]), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process):
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(process_calls, ["updated212"])
+
+    def test_tick_first_seen_historical_pr_updated_after_install_reviews_as_safe_fallback(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/213"
+        state = {"_meta": {"installed_at": "2026-06-01T00:00:00+00:00"}, "prs": {}}
+        pr = pr_watcher.PRSnap(
+            url=pr_url, number=213, title="old commit pushed after install", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="old213", created_at="2026-05-21T00:00:00Z",
+            updated_at="2026-06-03T00:00:00Z",
+            head_committed_at="2026-05-21T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        process_calls: list[str] = []
+
+        def fake_process(pr, st, dry_run):
+            process_calls.append(pr.head_sha)
+            st["prs"][pr.url]["last_commented_sha"] = pr.head_sha
+            st["prs"][pr.url]["last_seen_sha"] = pr.head_sha
+            pr_watcher._clear_pending_review(st["prs"][pr.url])
+            return "codex ran"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            argv = ["pr_watcher.py"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 1001), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", lambda: [pr]), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process):
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(process_calls, ["old213"])
+        self.assertEqual(state["prs"][pr_url]["last_commented_sha"], "old213")
+
+    def test_tick_first_seen_post_install_pr_reviews_and_marks_pending(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/210"
+        state = {"_meta": {"installed_at": "2026-05-22T00:00:00+00:00"}, "prs": {}}
+        pr = pr_watcher.PRSnap(
+            url=pr_url, number=210, title="missed pr-created hook", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="firstsha210", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        events: list[tuple[str, str | None]] = []
+
+        def fake_save(s, *, touched_prs=None):
+            entry = s["prs"][pr_url]
+            events.append(("save", entry.get("pending_review_sha")))
+
+        def fake_process(pr, st, dry_run):
+            events.append(("process", st["prs"][pr.url].get("pending_review_sha")))
+            st["prs"][pr.url]["last_commented_sha"] = pr.head_sha
+            st["prs"][pr.url]["last_seen_sha"] = pr.head_sha
+            pr_watcher._clear_pending_review(st["prs"][pr.url])
+            return "codex ran"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            argv = ["pr_watcher.py"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 1001), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", lambda: [pr]), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process):
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(state["prs"][pr_url]["last_commented_sha"], "firstsha210")
+        self.assertIn(("save", "firstsha210"), events)
+        self.assertLess(events.index(("save", "firstsha210")), events.index(("process", "firstsha210")))
+
+    def test_tick_first_seen_same_second_as_install_reviews(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/211"
+        state = {"_meta": {"installed_at": "2026-06-03T00:00:00+00:00"}, "prs": {}}
+        pr = pr_watcher.PRSnap(
+            url=pr_url, number=211, title="same second hook miss", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="same211", created_at="2026-06-03T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        process_calls: list[str] = []
+
+        def fake_process(pr, st, dry_run):
+            process_calls.append(pr.head_sha)
+            st["prs"][pr.url]["last_commented_sha"] = pr.head_sha
+            st["prs"][pr.url]["last_seen_sha"] = pr.head_sha
+            pr_watcher._clear_pending_review(st["prs"][pr.url])
+            return "codex ran"
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            argv = ["pr_watcher.py"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 1001), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", lambda: [pr]), \
+                    mock.patch.object(pr_watcher, "process_pr", fake_process):
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(process_calls, ["same211"])
 
     def test_tick_known_pr_new_commit_marks_pending_before_review(self):
         pr_url = "https://github.com/realRoc/my-calendar/pull/201"
@@ -1454,7 +2322,7 @@ class ConservativeFallbackTests(unittest.TestCase):
                     mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 1001), \
                     mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
                     mock.patch.object(pr_watcher, "fetch_open_prs", lambda: [pr]), \
-                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", lambda *a: pr_watcher.AICommentLookup("absent")), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", lambda *a, **kw: pr_watcher.AICommentLookup("absent")), \
                     mock.patch.object(pr_watcher, "process_pr", fake_process):
                 rc = pr_watcher.main()
 
@@ -1695,7 +2563,7 @@ class ReviewPendingIdempotencyTests(unittest.TestCase):
         with mock.patch.object(
                     pr_watcher,
                     "fetch_latest_ai_comment_since",
-                    lambda repo, number, since: pr_watcher.AICommentLookup(
+                    lambda repo, number, since, **kw: pr_watcher.AICommentLookup(
                         "found",
                         comment_url="https://example/comment/203",
                         comment_body=pr_watcher.AI_COAUTHOR_METADATA_MARKER,
@@ -1768,6 +2636,39 @@ class ReviewPendingIdempotencyTests(unittest.TestCase):
         self.assertEqual(lookup.comment_url, "https://example/comment/latest")
         self.assertEqual(lookup.comment_body, f"{marker}\nlatest")
 
+    def test_recovery_comment_lookup_filters_by_head_sha_marker(self):
+        marker = pr_watcher.AI_COAUTHOR_METADATA_MARKER
+        old_sha_marker = pr_watcher.head_sha_metadata_marker("oldsha")
+
+        def fake_run(args, **_kwargs):
+            if args == ["gh", "api", "user", "--jq", ".login"]:
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="realRoc\n", stderr="")
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=json.dumps([
+                    [
+                        {
+                            "user": {"login": "realRoc"},
+                            "body": f"{marker}\n{old_sha_marker}\nold same-second review",
+                            "created_at": "2026-06-03T10:00:00Z",
+                            "html_url": "https://example/comment/old-same-second",
+                        }
+                    ],
+                ]),
+                stderr="",
+            )
+
+        with mock.patch.object(pr_watcher.subprocess, "run", fake_run):
+            lookup = pr_watcher.fetch_latest_ai_comment_since(
+                "realRoc/my-calendar",
+                204,
+                "2026-06-03T10:00:00+00:00",
+                head_sha="newsha",
+            )
+
+        self.assertEqual(lookup.status, "absent")
+
     def test_stale_pending_without_ai_comment_clears_pending_and_allows_retry(self):
         pr_url = "https://github.com/realRoc/my-calendar/pull/205"
         state = {
@@ -1786,7 +2687,7 @@ class ReviewPendingIdempotencyTests(unittest.TestCase):
             head_branch="feat", head_repo="realRoc/my-calendar",
         )
 
-        with mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", lambda *a: pr_watcher.AICommentLookup("absent")):
+        with mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", lambda *a, **kw: pr_watcher.AICommentLookup("absent")):
             action, changed = pr_watcher._same_sha_review_guard(
                 pr,
                 state,
@@ -1818,7 +2719,7 @@ class ReviewPendingIdempotencyTests(unittest.TestCase):
             head_branch="feat", head_repo="realRoc/my-calendar",
         )
 
-        with mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", lambda *a: pr_watcher.AICommentLookup("failed")):
+        with mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", lambda *a, **kw: pr_watcher.AICommentLookup("failed")):
             action, changed = pr_watcher._same_sha_review_guard(
                 pr,
                 state,
@@ -2920,6 +3821,7 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
     # to recognize the old form too if you want historical data parseable.
     PR_BLOCKQUOTE_MARKER = "> 🤖 由 Codex 自动生成"
     PR_HTML_METADATA_MARKER = "<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->"
+    PR_HEAD_SHA_METADATA_MARKER = "<!-- pr-watcher-head-sha: {head_sha} -->"
     FIX_COAUTHOR_TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
 
     def test_pr_prompt_requires_blockquote_marker_on_first_line(self):
@@ -2937,8 +3839,20 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
             "pr_prompt.md lost the HTML metadata marker — scanner parseability lost",
         )
 
+    def test_pr_prompt_requires_head_sha_metadata_marker(self):
+        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            self.PR_HEAD_SHA_METADATA_MARKER, body,
+            "pr_prompt.md lost the head-sha marker — watcher completion could "
+            "reuse an AI comment for the wrong commit",
+        )
+
     def test_runtime_recovery_marker_matches_prompt_contract(self):
         self.assertEqual(pr_watcher.AI_COAUTHOR_METADATA_MARKER, self.PR_HTML_METADATA_MARKER)
+        self.assertEqual(
+            pr_watcher.head_sha_metadata_marker("abc123"),
+            "<!-- pr-watcher-head-sha: abc123 -->",
+        )
 
     def test_pr_prompt_marker_appears_before_section_headers(self):
         # The marker must instruct codex to put it FIRST. If it ended up
@@ -3174,9 +4088,19 @@ class ProcessPrPersistLockSerialisesCancelMarkerTests(unittest.TestCase):
                             mock.patch.object(pr_watcher, "notify",
                                               lambda *a, **kw: None), \
                             mock.patch.object(pr_watcher, "upsert_events", fake_upsert), \
+                            mock.patch.object(pr_watcher, "_gh_view_force_pr",
+                                              lambda url: pr), \
                             mock.patch.object(
-                                pr_watcher, "fetch_latest_comment",
-                                lambda *a: ("https://example/c/1", "结论：✅ 可以合并\n")), \
+                                pr_watcher,
+                                "fetch_latest_ai_comment_since",
+                                lambda *a, **kw: pr_watcher.AICommentLookup(
+                                    "found",
+                                    comment_url="https://example/c/1",
+                                    comment_body=(
+                                        f"{pr_watcher.AI_COAUTHOR_METADATA_MARKER}\n"
+                                        "结论：✅ 可以合并\n"
+                                    ),
+                                )), \
                             mock.patch.object(pr_watcher, "_refresh_dashboard",
                                               lambda *, reason: None):
                         t.start()

@@ -276,8 +276,8 @@ ls history/*/*__mothers-day__mom.md
 **兜底通道 — launchd 10 min 轮询**
 
 - `com.<user>.calendar.pr-watcher`，`StartInterval=600`
-- 首次见到未知 PR 只 seed，不做首发 review；首发 review 由上面两个即时通道负责
-- 抓保守漏网场景：已 seed PR 的后续 missed commit、pending review 恢复、push 时网络抖动导致 hook 失败后的下一次 SHA 变化等
+- 安装时间之前已存在且没有 post-install 活动信号的未知 PR 只 seed，不做历史补评；安装时间之后创建、更新或出现新 head commit、但即时 hook 漏掉的 PR，兜底首次见到也会 review
+- 抓保守漏网场景：post-install first-seen PR、历史 PR 的 post-install 活动 / head commit、后续 missed commit、pending review 恢复、push 时网络抖动导致 hook 失败后的下一次 SHA 变化等
 - 休眠不唤醒 Mac
 - 每次 tick 单次最长 25 分钟，超时杀掉 codex
 
@@ -287,23 +287,25 @@ ls history/*/*__mothers-day__mom.md
 |---|---|---|
 | 本机 `git push` | ✅ 立即 | — |
 | 本机 `gh pr create` / `/ship` | ✅ 调用 `pr-created` 时立即 | ✅ ≤10min |
-| GitHub 网页 UI 创建/编辑 PR | ❌ | 首次只 seed；后续 commit/retry ≤10min |
-| 其他机器 push | ❌ | 首次只 seed；后续 commit/retry ≤10min |
-| PR bot 自动 commit | ❌ | 首次只 seed；后续 commit/retry ≤10min |
+| GitHub 网页 UI 创建/编辑 PR | ❌ | 安装后新 PR 首次 ≤10min；后续 commit/retry ≤10min |
+| 其他机器 push | ❌ | 安装后新 PR 首次 ≤10min；后续 commit/retry ≤10min |
+| PR bot 自动 commit | ❌ | 安装后新 PR 首次 ≤10min；后续 commit/retry ≤10min |
 
 ### 单次 tick 流程
 
 1. `gh api graphql` 一次拉所有 open PR（跨 org，author=@me）
 2. 过滤：`baseRefName == repository.defaultBranchRef.name`
 3. 与 `scripts/pr_state.json` 比对：
-   - 首次见到 → seed 落 head_sha，**不评论**
+   - 首次见到且 PR 创建时间 / 最新 head commit 时间 / PR updatedAt 都早于 watcher `installed_at` → seed 落 head_sha，**不做历史补评**
+   - 首次见到且 PR 创建时间 / 最新 head commit 时间 / PR updatedAt 晚于 watcher `installed_at` → 标记 pending 并触发 codex
    - head_sha 未变 → 跳过
    - head_sha 变了 → 触发 codex
    - stale `pending_review_sha` → 先查 GitHub 是否已有本 watcher 的 AI 评论；查到则推进 state 防重复，确认没有才清 pending 并重试，查询失败则保留 pending 等下轮
 4. codex 调用：`codex exec --json --dangerously-bypass-approvals-and-sandbox -s danger-full-access --skip-git-repo-check -C /tmp/codex-pr-runs/<uuid> "<prompt>"`，用 `start_new_session=True` 起独立进程组以便 cancel 时能 `killpg` 整片
 5. 从 JSONL 第一行抓 `thread_id`（用于 `codex resume`）
-6. codex 自己用 `gh pr comment` 发评论；watcher 用 `gh api ...issues/<n>/comments` 兜底取 URL
-7. EventKit 写到独立日历 **"PR 监控"**，UID = `my-calendar:pr-comment:<pr_url>:<sha>`
+6. codex 退出后先重新 `gh pr view` 校验当前 `headRefOid`；进入 persist 锁临界区、真正写日历 / `.meta` / state 之前再复验一次；本地 artifact 写完后还会最后复验一次。如果 head 已经变了，即使没收到 cancel marker，也丢弃或回滚旧 run 的日历 / `.meta` / state 写入，标记最新 SHA 为 pending，并在同一 per-PR 串行上下文里重启 review。
+7. codex 自己用 `gh pr comment` 发评论；watcher 只接受本次 review 启动后出现、且同时包含 AI coauthor marker 与当前 `head_sha` 隐藏 marker 的 pr_watcher 评论作为完成边界。没找到就保留 `pending_review_sha`，不写日历 / `.meta` / `last_commented_sha`，等 stale recovery 先查 GitHub 再恢复或重试。
+8. EventKit 写到独立日历 **"PR 监控"**，UID = `my-calendar:pr-comment:<pr_url>:<sha>`
 
 ### 进行中收到新 commit：cancel + restart（issue #26）
 
@@ -318,8 +320,8 @@ ls history/*/*__mothers-day__mom.md
 **Persist 锁的原子边界（PR #27 high finding 修复）**：codex 退出后、`process_pr` 写日历 / `.meta` / state 之前还有一段窗口。早先的"在 upsert_events 之前 synchronously 再 check 一次 marker"是 check-then-act：marker writer 可以在 check 通过 *之后* 但 `upsert_events` *之前/之中* 出现，旧 review 还是会落盘。
 现在做法：每个 PR 多一把 `locks/<safe_id>.persist.lock`，
 - `signal_cancel_and_wait_for_lock` 在 `touch()` cancel marker 时持这把锁；
-- `process_pr` 在"最终 check marker + `upsert_events` + 写 `.meta` + 推进内存 state"这一段持同一把锁。
-两者互斥，于是 marker write 与 leader 的不可逆写入完全 totally ordered：要么 marker 在 leader 进入临界区之前落地（leader 看到 marker，短路，不写日历），要么 marker 在 leader 释放 persist 锁之后才落地（leader 这次 review 完整落盘，下一轮 --force 用新 marker 再触发一次 fresh review）。marker 不再可能"夹在 check 和 write 中间"。
+- `process_pr` 在"最终 check marker + 写前复验当前 head + `upsert_events` + 写 `.meta` + 推进内存 state + 写后复验当前 head"这一段持同一把锁；写后复验发现 head 已移动时，会删除刚写的旧日历事件、删 `.meta`、恢复 state，然后重启最新 SHA。若 EventKit 删除旧事件失败，`pr_state.json` 会保留 `pending_calendar_delete_keys`，下次处理同一 PR 前先重试清理。
+两者互斥，于是 marker write 与 leader 的不可逆写入完全 totally ordered：要么 marker 在 leader 进入临界区之前落地（leader 看到 marker，短路，不写日历），要么 head 在写前或写后复验时已经移动（leader 丢弃 / 回滚旧 review 并重启，失败的日历删除也保留 retry 指针），要么 marker 在 leader 释放 persist 锁之后才落地（leader 这次 review 完整落盘，下一轮 --force 用新 marker 再触发一次 fresh review）。marker 不再可能"夹在 check 和 write 中间"，head 也不能在评论查找后、持久化期间悄悄变更却让旧 review 留在日历 / `.meta` / state 且没有后续清理路径。
 
 要点：
 - 同一 PR 串行（cancel + restart 保持这个语义）；不同 PR 之间继续并行
@@ -405,7 +407,7 @@ git -C <repo-path> config core.hooksPath .git/hooks
 - `tail -f logs/pr-watcher.log` 实时看 launchd 兜底
 - `tail -f ~/.config/my-calendar/git-hooks/logs/trigger.log` 看每次 push 的触发链路
 - 验证 hook 装好：`git config --global --get core.hooksPath` 应该返回 `~/.config/my-calendar/git-hooks`
-- 某个 PR 想要 re-review：删 `pr_state.json` 里那条记录，下次 tick 会重新 seed → 下下次有 commit 才会真跑（如果想直接跑，用 `--force`）
+- 某个 PR 想要 re-review：直接用 `--force`；如果删 `pr_state.json` 里那条记录，安装后创建/更新或有新 head commit 的 PR 下次 tick 会当 first-seen 重新 review，静态历史 PR 会重新 seed
 - codex 单次卡死：进程会被 25min 超时杀掉，state 不会更新，下轮会重试
 - 想 resume 某次 codex session：日历事件描述里有 `codex resume <thread_id>` 命令，直接复制执行
 - 模拟 push 测试 hook：`echo "refs/heads/<branch> sha refs/heads/<branch> sha" | bash ~/.config/my-calendar/git-hooks/pre-push origin <remote-url>`
@@ -415,7 +417,7 @@ git -C <repo-path> config core.hooksPath .git/hooks
 - 用 `(pr_url, head_sha)` 作为幂等键。force-push 改了 SHA 才会重新触发评论——这就是"同一 commit 只评论一次"的语义
 - 日历事件用独立日历 "PR 监控"，避免和节日提醒混在一起
 - 不过滤 draft PR（用户当前选择）。如果以后想跳过 draft，在 `fetch_open_prs` 后加 `if pr.is_draft: continue`
-- 不主动跑历史 PR：首轮所有 open PR 进 seed，不评论；只有后续 commit 才触发
+- 不主动跑静态历史 PR：安装时间之前已存在且没有 post-install 活动信号的 open PR 只 seed，不评论；安装后的新建 / 更新 PR 或新 head commit 即使即时 hook 漏掉，兜底也会首次 review。这里把 `updatedAt` 当保守兜底信号，可能让安装后被评论/编辑过的历史 PR 多 review 一次，但避免旧 commit 在安装后才 push 时漏审。
 - codex 用 `-s danger-full-access` + `--dangerously-bypass-approvals-and-sandbox`，cwd 隔离在 `/tmp/codex-pr-runs/<uuid>` 但 sandbox 实际是 full access。prompt 模板里明确写了"只读 diff、只发评论、不改文件、不 push"——如果 PR 描述/diff 里有 prompt injection 试图让 codex 干别的，理论上 codex 可能被诱导。这是 yolo 模式的固有 trade-off
 
 ---
@@ -428,14 +430,14 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 | 产物 | 标记位置 | 规范文本 |
 |---|---|---|
-| codex 通过 pr_watcher 发的 PR review 评论 | 评论 body **第一行** | <pre>> 🤖 由 Codex 自动生成<br>&lt;!-- ai-coauthor: codex; agent: pr_watcher; mode: automated --&gt;</pre> |
+| codex 通过 pr_watcher 发的 PR review 评论 | 评论 body **开头** | <pre>> 🤖 由 Codex 自动生成<br>&lt;!-- ai-coauthor: codex; agent: pr_watcher; mode: automated --&gt;<br>&lt;!-- pr-watcher-head-sha: &lt;head_sha&gt; --&gt;</pre> |
 | claude 通过 MyCalFix 起的修复 commit | commit message body | `Co-Authored-By: Claude <noreply@anthropic.com>`（Claude Code 默认自动加，fix_prompt.md 强制保留） |
 | 手敲的、纯人类 PR / 评论 | 无标记 | — |
 
 ### 为什么 codex 评论用 blockquote + HTML 注释两层
 
 - **blockquote**（可见）让 GitHub 上看到评论的人立刻知道这条不是手敲的——避免外人误以为我亲自写了 30 个文件的 review
-- **HTML 注释**（GitHub 渲染时不显示）给未来的扫描器一个**稳定的 grep key**：`<!-- ai-coauthor: ...`。下游 dashboard（issue #17）可以靠这一行做精确 bucket，不用解析中文 emoji 文本
+- **HTML 注释**（GitHub 渲染时不显示）给未来的扫描器一个**稳定的 grep key**：`<!-- ai-coauthor: ...`。下游 dashboard（issue #17）可以靠这一行做精确 bucket，不用解析中文 emoji 文本；`pr-watcher-head-sha` 则用于 watcher 确认评论覆盖的是当前 commit，避免秒级时间戳复用旧评论。
 - 两个都丢掉的话，统计就会把 AI 评论错算成人类活跃度
 
 ### 为什么 MyCalFix 修复 commit 用 `Co-Authored-By:`
@@ -446,12 +448,12 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 ### prompt 模板的硬约束
 
-- `scripts/pr_prompt.md` 第 4 步要求 codex 在评论 body **第一行**就 emit 这两行（原样照抄，包括 HTML 注释），下面才允许空一行 + 正文
+- `scripts/pr_prompt.md` 第 4 步要求 codex 在评论 body **开头** emit AI 标记 + 当前 head SHA 隐藏标记（原样照抄，包括 HTML 注释），下面才允许空一行 + 正文
 - `scripts/fix_prompt.md` 第 4 步要求 commit message body 同时包含 `Reviewed-Comment:` 和 `Co-Authored-By: Claude` 两条 trailer，并解释这是与 pr_prompt.md 镜像的同一套约定
 
 ### 测试守门
 
-`scripts/test_pr_watcher.py::AICoAuthorMarkerContractTests` 锁住两个 prompt 文件的 canonical 字符串：blockquote、HTML metadata、`Co-Authored-By:` trailer、以及 pr_prompt.md 里"marker 必须先于 section 规则出现"的结构断言。任何编辑 prompt 时把这些字符串拼错或挪到末尾，测试都会红。
+`scripts/test_pr_watcher.py::AICoAuthorMarkerContractTests` 锁住两个 prompt 文件的 canonical 字符串：blockquote、HTML metadata、head SHA metadata、`Co-Authored-By:` trailer、以及 pr_prompt.md 里"marker 必须先于 section 规则出现"的结构断言。任何编辑 prompt 时把这些字符串拼错或挪到末尾，测试都会红。
 
 ### 老评论怎么办
 
@@ -547,7 +549,7 @@ open 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fgithub.com
 
 ### 没有 origin_cwd 的事件
 
-launchd 兜底路径触发的评论（比如某个 PR 已 seed 后又在网页/异机/bot 路径产生新 commit）没经过 pre-push hook，`pr_state.json` 里可能没有 `origin_cwd`。这种事件：
+launchd 兜底路径触发的评论（比如安装后新 PR 的首次漏网 review，或网页/异机/bot 路径产生新 commit）没经过 pre-push hook，`pr_state.json` 里可能没有 `origin_cwd`。这种事件：
 
 - URL 还是有效的，只是少了 `origin_cwd` 参数
 - launcher 会弹一个 osascript 文件夹选择器让用户手动定位

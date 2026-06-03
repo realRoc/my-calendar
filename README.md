@@ -23,8 +23,8 @@ Three independent-but-composable workflows turn your local machine + Apple Calen
 - **Default-branch only** — PRs whose base ≠ the repo's default branch are skipped (feature → feature never triggers).
 - **Idempotent** — keyed on `(pr_url, head_sha)`; the same commit is reviewed once. A force-push that rewrites the SHA re-triggers.
 - **`codex` does the review** and posts it as a PR comment; the watcher writes a calendar event into a dedicated **"PR 监控"** calendar with the comment link and a `codex resume <thread_id>` command so you can pick the session back up.
-- **Cancel + restart on new commit** — if a new commit lands mid-review, the in-flight review is cancelled and restarted against the latest SHA (no queue pile-up).
-- **Conservative fallback** — a launchd poll every 10 min seeds first-seen PRs, retries stale pending reviews, and catches later missed commits; first-review immediacy comes from the local push / post-create hooks.
+- **Cancel + restart on new commit** — if a new commit lands mid-review, the in-flight review is cancelled and restarted against the latest SHA; the watcher re-checks the head around final local writes and rolls back stale artifacts, so old reviews do not remain in calendar/state.
+- **Conservative fallback** — a launchd poll every 10 min seeds static historical first-seen PRs, reviews post-install PR activity missed by local hooks, retries stale pending reviews, and catches later missed commits.
 
 ### 2. One-click AI fix from the calendar event (`MyCalFix.app` + `mycalfix://`)
 
@@ -41,7 +41,7 @@ Every artifact that is "AI-generated, no human in the loop" carries a machine-de
 
 | Artifact | Marker |
 |---|---|
-| codex PR review comment | first line: a `> 🤖 由 Codex 自动生成` blockquote + `<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->` HTML comment |
+| codex PR review comment | comment header: a `> 🤖 由 Codex 自动生成` blockquote + `<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->` HTML comment + hidden `<!-- pr-watcher-head-sha: ... -->` commit marker |
 | `claude` fix commit (via MyCalFix) | `Co-Authored-By: Claude <noreply@anthropic.com>` trailer in the commit body |
 | hand-typed human PR / comment | none |
 

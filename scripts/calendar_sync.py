@@ -225,7 +225,10 @@ def remove_event(key: str, state_path: Path) -> bool:
         return False
     ek_event = store.eventWithIdentifier_(entry["event_id"])
     if ek_event is not None:
-        store.removeEvent_span_error_(ek_event, EKSpanThisEvent, None)
+        ok, err = store.removeEvent_span_error_(ek_event, EKSpanThisEvent, None)
+        if not ok:
+            print(f"[error] delete failed for {key}: {err}", file=sys.stderr)
+            return False
     state.pop(key, None)
     _save_state(state_path, state)
     return True
