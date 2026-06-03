@@ -2054,6 +2054,7 @@ def _run_force(args, now: datetime) -> int:
             else:
                 print(f"  warn: --origin-cwd {args.origin_cwd!r} is not a directory; ignoring")
 
+        cleanup_changed = _retry_pending_calendar_deletes(state, pr.url)
         prev = state.get("prs", {}).get(pr.url) or {}
         if prev.get("last_commented_sha") == pr.head_sha:
             print(f"  forced: {pr.url}  → already reviewed sha={pr.head_sha[:8]}, skipping")
@@ -2075,7 +2076,7 @@ def _run_force(args, now: datetime) -> int:
         guard_action, guard_changed = _same_sha_review_guard(pr, state, force_now)
         if guard_action is not None:
             print(f"  forced: {pr.url}  → {guard_action}, skipping")
-            if guard_changed or new_origin_cwd:
+            if guard_changed or cleanup_changed or new_origin_cwd:
                 save_state(state, touched_prs={pr.url})
             return 0
 
@@ -2248,6 +2249,9 @@ def main() -> int:
                     state["prs"][pr.url]["last_seen_sha"] = pr.head_sha
                     pr_state_changed = True
                 continue
+
+            if not args.dry_run and _retry_pending_calendar_deletes(state, pr.url):
+                pr_state_changed = True
 
             retry_after_pending_clear = False
             if args.dry_run:

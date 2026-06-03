@@ -2059,6 +2059,64 @@ class TickSaveStateOrderTests(unittest.TestCase):
         self.assertLess(save_b_idx, release_b_idx,
                         f"PR B save_state must come BEFORE release_lock_fd. Events: {events}")
 
+    def test_tick_retries_pending_calendar_delete_before_same_sha_skip(self):
+        pr_url = "https://github.com/realRoc/my-calendar/pull/102"
+        head_sha = "same102"
+        old_key = f"my-calendar:pr-comment:{pr_url}:old102"
+        state = {
+            "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+            "prs": {
+                pr_url: {
+                    "repo": "realRoc/my-calendar",
+                    "number": 102,
+                    "last_seen_sha": head_sha,
+                    "last_commented_sha": head_sha,
+                    "pending_calendar_delete_keys": [old_key],
+                },
+            },
+        }
+        pr = pr_watcher.PRSnap(
+            url=pr_url, number=102, title="cleanup retry", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha=head_sha, created_at="2026-05-25T00:00:00Z",
+            head_branch="feat-cleanup", head_repo="realRoc/my-calendar",
+        )
+        removed_keys: list[str] = []
+        process_calls: list[str] = []
+        events: list[tuple] = []
+
+        def fake_save_state(s, *, touched_prs=None):
+            events.append(("save", set(touched_prs) if touched_prs is not None else None))
+
+        def fake_release_lock_fd(fd):
+            events.append(("release", fd))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            argv = ["pr_watcher.py"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", fake_save_state), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 1001), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", fake_release_lock_fd), \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", lambda: [pr]), \
+                    mock.patch.object(pr_watcher, "process_pr", lambda pr, st, dry_run: process_calls.append(pr.url) or "codex"), \
+                    mock.patch.object(pr_watcher, "remove_event", lambda key, *a, **kw: removed_keys.append(key) or True):
+                rc = pr_watcher.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(removed_keys, [old_key])
+        self.assertNotIn("pending_calendar_delete_keys", state["prs"][pr_url])
+        self.assertEqual(process_calls, [], "same-SHA cleanup retry must not start a duplicate review")
+        self.assertIn(("save", {pr_url}), events)
+        self.assertLess(
+            events.index(("save", {pr_url})),
+            events.index(("release", 1001)),
+            f"cleanup state must persist before the per-PR lock is released: {events}",
+        )
+
 
 class ConservativeFallbackTests(unittest.TestCase):
     def test_tick_first_seen_historical_pr_only_seeds(self):
