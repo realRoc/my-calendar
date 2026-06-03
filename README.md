@@ -18,6 +18,7 @@ Three independent-but-composable workflows turn your local machine + Apple Calen
 ### 1. Automatic PR review on every push (`pr_watcher`)
 
 - **Zero-latency trigger** — a global `git pre-push` hook fires a background worker within ~2–3s of any local `git push`.
+- **Post-create trigger** — local tools can call `~/.config/my-calendar/git-hooks/pr-created <pr-url> [origin-cwd]` right after `gh pr create`; gstack `/ship` uses this to avoid missing PRs created after the push polling window.
 - **Cross-org** — one `gh` GraphQL call sweeps every open PR you authored, across all organizations.
 - **Default-branch only** — PRs whose base ≠ the repo's default branch are skipped (feature → feature never triggers).
 - **Idempotent** — keyed on `(pr_url, head_sha)`; the same commit is reviewed once. A force-push that rewrites the SHA re-triggers.
@@ -122,6 +123,9 @@ After that, every local `git push` kicks off a background codex review (comment 
 
 # force a run on a specific PR (bypasses the state check)
 .venv/bin/python scripts/pr_watcher.py --force https://github.com/<owner>/<repo>/pull/<n>
+
+# trigger the installed post-create hook used by local PR tools
+~/.config/my-calendar/git-hooks/pr-created https://github.com/<owner>/<repo>/pull/<n> "$PWD"
 
 # watch the push-trigger chain live
 tail -f ~/.config/my-calendar/git-hooks/logs/trigger.log

@@ -18,6 +18,7 @@
 ### 1. 每次 push 自动 review PR（`pr_watcher`）
 
 - **触发零延迟** — 全局 `git pre-push` hook，本地 push 后约 2–3 秒内异步起后台 worker。
+- **PR 创建后触发** — 本地工具可以在 `gh pr create` 成功后调用 `~/.config/my-calendar/git-hooks/pr-created <pr-url> [origin-cwd]`；gstack `/ship` 已接入，避免 PR 创建晚于 push 轮询窗口时漏掉 review。
 - **跨 org** — 一次 `gh` GraphQL 调用扫所有 organization 下你发起的 open PR。
 - **只看默认分支** — base ≠ 仓库默认分支的 PR 自动剔除（feature → feature 不触发）。
 - **幂等** — 以 `(pr_url, head_sha)` 为键，同一 commit 只评论一次；force-push 重写 SHA 后才会重审。
@@ -122,6 +123,9 @@ bash scripts/install_app.sh                       # 编译 + 安装 MyCalFix.app
 
 # 对指定 PR 强制跑一次（绕过 state 检查）
 .venv/bin/python scripts/pr_watcher.py --force https://github.com/<owner>/<repo>/pull/<n>
+
+# 触发已安装的 PR-created hook（本地 PR 工具使用这个入口）
+~/.config/my-calendar/git-hooks/pr-created https://github.com/<owner>/<repo>/pull/<n> "$PWD"
 
 # 实时观察 push 触发链路
 tail -f ~/.config/my-calendar/git-hooks/logs/trigger.log
