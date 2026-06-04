@@ -151,6 +151,11 @@ if [[ -z "$BASE" ]]; then
     BASE="$default_branch"
 fi
 
+if [[ "$branch" == "$default_branch" ]]; then
+    echo "ERROR: refusing to open a PR from the default branch '$default_branch'" >&2
+    exit 1
+fi
+
 if [[ "$branch" == "$BASE" ]]; then
     echo "ERROR: refusing to open a PR from the base branch '$BASE'" >&2
     exit 1
@@ -175,8 +180,15 @@ echo "BASE=$BASE"
 git fetch origin "$BASE" >/dev/null 2>&1 || true
 git push -u origin HEAD >/dev/null
 
-existing_pr="$(gh pr view --json url -q '.url' 2>/dev/null || true)"
+existing_pr_json="$(gh pr view --json url,baseRefName 2>/dev/null || true)"
+existing_pr="$(echo "$existing_pr_json" | jq -r '.url // ""' 2>/dev/null || true)"
 if [[ -n "$existing_pr" && "$existing_pr" != "null" ]]; then
+    existing_base="$(echo "$existing_pr_json" | jq -r '.baseRefName // ""')"
+    if [[ "$existing_base" != "$BASE" ]]; then
+        echo "ERROR: existing PR targets '$existing_base', but this run targets '$BASE'" >&2
+        echo "       Re-run with --base '$existing_base' or update the PR base explicitly." >&2
+        exit 1
+    fi
     pr_url="$existing_pr"
 else
     args=(pr create --base "$BASE" --fill)

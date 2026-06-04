@@ -40,7 +40,8 @@ This is the light path. Do not run the full `/ship` ceremony: no version bump, n
    Resolve the path relative to the `SKILL.md` you loaded:
 
    ```bash
-   bash scripts/light_pr.sh
+   SKILL_DIR=/path/to/pr
+   bash "$SKILL_DIR/scripts/light_pr.sh"
    ```
 
    The helper will:
@@ -58,12 +59,12 @@ This is the light path. Do not run the full `/ship` ceremony: no version bump, n
 Use these only when the user or repo context calls for them:
 
 ```bash
-bash scripts/light_pr.sh --base <branch>
-bash scripts/light_pr.sh --draft
-bash scripts/light_pr.sh --title "PR title"
-bash scripts/light_pr.sh --body-file /path/to/body.md
-bash scripts/light_pr.sh --allow-dirty
-bash scripts/light_pr.sh --trigger-only <pr-url>
+bash "$SKILL_DIR/scripts/light_pr.sh" --base <branch>
+bash "$SKILL_DIR/scripts/light_pr.sh" --draft
+bash "$SKILL_DIR/scripts/light_pr.sh" --title "PR title"
+bash "$SKILL_DIR/scripts/light_pr.sh" --body-file /path/to/body.md
+bash "$SKILL_DIR/scripts/light_pr.sh" --allow-dirty
+bash "$SKILL_DIR/scripts/light_pr.sh" --trigger-only <pr-url>
 ```
 
 `--trigger-only` skips push and PR creation and just hands an existing GitHub PR URL to my-calendar.
