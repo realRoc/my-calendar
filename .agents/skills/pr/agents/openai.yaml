@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR"
+  short_description: "Create or update a GitHub PR and trigger my-calendar review."
+  default_prompt: "Create a lightweight PR for the current branch and trigger my-calendar review."

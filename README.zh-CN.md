@@ -105,11 +105,14 @@ cd my-calendar
 ./scripts/install_git_hook.sh                     # 全局 pre-push hook
 .venv/bin/python scripts/pr_watcher.py --seed-only  # 记录现有 open PR，首轮不评论
 
+# 可选：安装给 Claude Code + Codex 用的轻量 /pr skill
+bash scripts/install_pr_skill.sh
+
 # 启用一键修复
 bash scripts/install_app.sh                       # 编译 + 安装 MyCalFix.app，注册 mycalfix:// scheme
 ```
 
-之后每次本地 `git push`：hook 在几秒内异步起 codex review、发评论、写日历事件——不阻塞 push。
+之后每次本地 `git push`：hook 在几秒内异步起 codex review、发评论、写日历事件——不阻塞 push。在 Claude Code 或 Codex 里说 `/pr`，就是轻量 PR 路径：做必要检查、push/create PR，然后立刻交给 my-calendar 异步 review。
 
 > 某个 repo 已有自己的 `.git/hooks/pre-push`（CI 校验等）：改名为 `.git/hooks/pre-push.local`，全局 hook 会先 exec 它再触发 watcher。某个 repo 完全不想被监控：`git -C <repo> config core.hooksPath .git/hooks`。
 
