@@ -2,9 +2,10 @@
 # Lightweight GitHub PR handoff for my-calendar.
 #
 # This helper intentionally does only the mechanical part:
-# push the current branch, create/reuse a PR, then call my-calendar's
-# pr-created hook. The agent using the skill remains responsible for
-# understanding the diff, running relevant checks, and creating commits.
+# push the current branch, create/update an open PR with a clear title/body,
+# then call my-calendar's pr-created hook. The agent using the skill remains
+# responsible for understanding the diff, running relevant checks, and creating
+# high-signal PR text; this helper only provides a structured fallback.
 
 set -euo pipefail
 
@@ -15,6 +16,16 @@ BODY_FILE=""
 TRIGGER_ONLY=0
 PR_URL_ARG=""
 ALLOW_DIRTY=0
+AUTO_BODY_FILE=""
+TITLE_SOURCE="provided"
+BODY_SOURCE="provided"
+
+cleanup() {
+    if [[ -n "${AUTO_BODY_FILE:-}" && -f "$AUTO_BODY_FILE" ]]; then
+        rm -f "$AUTO_BODY_FILE"
+    fi
+}
+trap cleanup EXIT
 
 usage() {
     cat <<'EOF'
@@ -22,8 +33,9 @@ Usage:
   light_pr.sh [--base <branch>] [--draft] [--title <title>] [--body-file <file>] [--allow-dirty]
   light_pr.sh --trigger-only <github-pr-url>
 
-Creates or reuses a GitHub PR for the current branch and triggers my-calendar's
-PR review pipeline via the pr-created hook.
+Creates a new GitHub PR or updates an existing OPEN PR for the current branch,
+then immediately triggers my-calendar's PR review pipeline via the pr-created
+hook. MERGED/CLOSED PRs are never reused as the current handoff.
 EOF
 }
 
@@ -117,6 +129,67 @@ trigger_my_calendar() {
     return 0
 }
 
+ensure_pr_text() {
+    local range=""
+    local latest_subject=""
+    local commits=""
+    local diffstat=""
+
+    latest_subject="$(git log -1 --pretty=%s)"
+    if [[ -z "$TITLE" ]]; then
+        TITLE="$latest_subject"
+        TITLE_SOURCE="latest-commit"
+    fi
+
+    if [[ -n "$BODY_FILE" ]]; then
+        if [[ ! -f "$BODY_FILE" ]]; then
+            echo "ERROR: --body-file does not exist: $BODY_FILE" >&2
+            exit 2
+        fi
+        return 0
+    fi
+
+    BODY_SOURCE="generated"
+    AUTO_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/light-pr-body.XXXXXX.md")"
+    BODY_FILE="$AUTO_BODY_FILE"
+
+    if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
+        range="origin/$BASE..HEAD"
+    else
+        range="HEAD~1..HEAD"
+    fi
+
+    commits="$(git log --format='- %s' "$range" 2>/dev/null || git log --format='- %s' -1)"
+    diffstat="$(git diff --stat "$range" 2>/dev/null || git show --stat --oneline --format='' HEAD)"
+
+    {
+        echo "## 解决什么问题"
+        echo
+        echo "- $TITLE"
+        echo "- 变更范围基于当前分支相对 \`$BASE\` 的 diff。"
+        echo
+        echo "## 实现方式"
+        echo
+        if [[ -n "$commits" ]]; then
+            echo "$commits"
+        else
+            echo "- 更新当前分支中的相关实现。"
+        fi
+        echo
+        echo "## 验证"
+        echo
+        echo "- 未由 helper 采集；调用 /pr 的 agent 应在最终回报中列出已通过或跳过的检查。"
+        if [[ -n "$diffstat" ]]; then
+            echo
+            echo "## 文件摘要"
+            echo
+            echo '```'
+            echo "$diffstat"
+            echo '```'
+        fi
+    } > "$BODY_FILE"
+}
+
 if [[ "$TRIGGER_ONLY" -eq 1 ]]; then
     if [[ "$PR_URL_ARG" != https://github.com/*/*/pull/* ]]; then
         echo "ERROR: --trigger-only requires a GitHub PR URL" >&2
@@ -178,30 +251,33 @@ echo "BRANCH=$branch"
 echo "BASE=$BASE"
 
 git fetch origin "$BASE" >/dev/null 2>&1 || true
+ensure_pr_text
 git push -u origin HEAD >/dev/null
 
-existing_pr_json="$(gh pr view --json url,baseRefName 2>/dev/null || true)"
-existing_pr="$(echo "$existing_pr_json" | jq -r '.url // ""' 2>/dev/null || true)"
-if [[ -n "$existing_pr" && "$existing_pr" != "null" ]]; then
-    existing_base="$(echo "$existing_pr_json" | jq -r '.baseRefName // ""')"
-    if [[ "$existing_base" != "$BASE" ]]; then
-        echo "ERROR: existing PR targets '$existing_base', but this run targets '$BASE'" >&2
-        echo "       Re-run with --base '$existing_base' or update the PR base explicitly." >&2
-        exit 1
-    fi
-    pr_url="$existing_pr"
+pr_list_json="$(gh pr list --head "$branch" --base "$BASE" --state all --json number,url,state,baseRefName,headRefName,updatedAt --limit 20)"
+open_pr_json="$(echo "$pr_list_json" | jq -c '[.[] | select(.state == "OPEN")][0] // empty')"
+if [[ -n "$open_pr_json" ]]; then
+    pr_url="$(echo "$open_pr_json" | jq -r '.url')"
+    pr_number="$(echo "$open_pr_json" | jq -r '.number')"
+    echo "PR_ACTION=updated"
+    echo "EXISTING_PR_STATE=OPEN"
+    gh pr edit "$pr_url" --title "$TITLE" --body-file "$BODY_FILE" >/dev/null
 else
-    args=(pr create --base "$BASE" --fill)
+    non_open_pr_json="$(echo "$pr_list_json" | jq -c '[.[] | select(.state != "OPEN")][0] // empty')"
+    if [[ -n "$non_open_pr_json" ]]; then
+        echo "EXISTING_PR_STATE=$(echo "$non_open_pr_json" | jq -r '.state')"
+        echo "EXISTING_PR_URL=$(echo "$non_open_pr_json" | jq -r '.url')"
+        echo "PR_ACTION=created-new-after-non-open"
+    else
+        echo "PR_ACTION=created"
+    fi
+
+    args=(pr create --base "$BASE" --title "$TITLE" --body-file "$BODY_FILE")
     if [[ "$DRAFT" -eq 1 ]]; then
         args+=(--draft)
     fi
-    if [[ -n "$TITLE" ]]; then
-        args+=(--title "$TITLE")
-    fi
-    if [[ -n "$BODY_FILE" ]]; then
-        args+=(--body-file "$BODY_FILE")
-    fi
     pr_url="$(gh "${args[@]}")"
+    pr_number="${pr_url##*/}"
 fi
 
 if [[ "$pr_url" != https://github.com/*/*/pull/* ]]; then
@@ -209,5 +285,8 @@ if [[ "$pr_url" != https://github.com/*/*/pull/* ]]; then
     exit 1
 fi
 
+echo "PR_NUMBER=$pr_number"
+echo "PR_TITLE_SOURCE=$TITLE_SOURCE"
+echo "PR_BODY_SOURCE=$BODY_SOURCE"
 echo "PR_URL=$pr_url"
 trigger_my_calendar "$pr_url" "$repo_root"
