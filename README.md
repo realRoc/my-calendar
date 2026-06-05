@@ -105,11 +105,14 @@ cd my-calendar
 ./scripts/install_git_hook.sh                     # global pre-push hook
 .venv/bin/python scripts/pr_watcher.py --seed-only  # record current open PRs, never comment on the first pass
 
+# optional: install the lightweight /pr skill for Claude Code + Codex
+bash scripts/install_pr_skill.sh
+
 # enable one-click fix
 bash scripts/install_app.sh                       # builds + installs MyCalFix.app, registers mycalfix:// scheme
 ```
 
-After that, every local `git push` kicks off a background codex review (comment + calendar event) within a couple of seconds, without blocking the push.
+After that, every local `git push` kicks off a background codex review (comment + calendar event) within a couple of seconds, without blocking the push. In Claude Code or Codex, say `/pr` when you want the light PR path: focused checks, push/create PR, then immediate my-calendar review handoff.
 
 > If a repo already has its own `.git/hooks/pre-push` (CI checks etc.), rename it to `.git/hooks/pre-push.local` — the global hook execs it first, then triggers the watcher. To opt a repo out entirely: `git -C <repo> config core.hooksPath .git/hooks`.
 

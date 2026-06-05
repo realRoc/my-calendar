@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR"
+  short_description: "Create/update an OPEN GitHub PR with clear title/body and trigger my-calendar review."
+  default_prompt: "Create a lightweight PR for the current branch with a clear title and description, then trigger my-calendar review."
