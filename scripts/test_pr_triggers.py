@@ -128,6 +128,16 @@ printf '%s\\n' "$@" >> {calls}
 
 
 class PrReviewTriggerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_terminal_bridge = os.environ.get("MY_CALENDAR_PR_TERMINAL_BRIDGE")
+        os.environ["MY_CALENDAR_PR_TERMINAL_BRIDGE"] = "0"
+
+    def tearDown(self) -> None:
+        if self._old_terminal_bridge is None:
+            os.environ.pop("MY_CALENDAR_PR_TERMINAL_BRIDGE", None)
+        else:
+            os.environ["MY_CALENDAR_PR_TERMINAL_BRIDGE"] = self._old_terminal_bridge
+
     def _fake_bin(self, tmp: Path, *, base: str = "main", default: str = "main", sha: str = "abc123") -> Path:
         fake = tmp / "fake-bin"
         fake.mkdir()
@@ -147,6 +157,68 @@ class PrReviewTriggerTests(unittest.TestCase):
             """),
         )
         return fake
+
+    def test_review_trigger_bridges_codex_desktop_to_terminal_before_watcher(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            home.mkdir()
+            origin = tmp / "checkout"
+            origin.mkdir()
+            fake = tmp / "fake-bin"
+            fake.mkdir()
+            open_args = tmp / "open.args"
+            command_copy = tmp / "bridge.command"
+            _write_exe(
+                fake / "open",
+                textwrap.dedent("""\
+                    #!/usr/bin/env bash
+                    last=""
+                    for arg in "$@"; do
+                      last="$arg"
+                    done
+                    printf '%s\\n' "$@" > "$OPEN_ARGS_OUT"
+                    cp "$last" "$OPEN_CAPTURE_OUT"
+                """),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env["PATH"] = f"{fake}:{env['PATH']}"
+            env["MY_CALENDAR_PR_TERMINAL_BRIDGE"] = "1"
+            env["OPEN_ARGS_OUT"] = str(open_args)
+            env["OPEN_CAPTURE_OUT"] = str(command_copy)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts" / "pr_review_trigger.sh"),
+                    "--source",
+                    "pr-created",
+                    "https://github.com/realRoc/my-calendar/pull/42",
+                    str(origin),
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("terminal bridge launched", result.stdout)
+            self.assertEqual(
+                open_args.read_text(encoding="utf-8").splitlines()[:3],
+                ["-g", "-a", "Terminal"],
+            )
+            command = command_copy.read_text(encoding="utf-8")
+            self.assertIn("export MY_CALENDAR_PR_TERMINAL_BRIDGE=0", command)
+            self.assertIn("--source pr-created:terminal-bridge", command)
+            self.assertIn("https://github.com/realRoc/my-calendar/pull/42", command)
+            self.assertIn(str(origin), command)
+            debounce_dir = home / ".config" / "my-calendar" / "git-hooks" / "review-triggers"
+            self.assertFalse(list(debounce_dir.glob("*.stamp")))
 
     def test_review_trigger_skips_non_default_base(self):
         with tempfile.TemporaryDirectory() as td:

@@ -272,6 +272,7 @@ ls history/*/*__mothers-day__mom.md
 - 给 `gh pr create` / gstack `/ship` 这类本地 PR 创建工具调用
 - 验证 `base == default`，按 `(pr_url, head_sha)` 做短窗口去重，再异步触发 `pr_watcher.py --force <pr-url>`
 - 解决 `/ship` 先 push、后创建 PR，PR 创建晚于 pre-push 轮询窗口导致漏 review 的场景
+- 如果任一即时触发链路从 Codex Desktop 发起，`pr_review_trigger.sh` 会先用 `open -g -a Terminal <tmp.command>` 把真正的 `pr_watcher.py --force` 交给 Terminal 跑；这样 EventKit 写入归属到已授权的 Terminal，而不是没有 Calendar 权限的 Codex app。可用 `MY_CALENDAR_PR_TERMINAL_BRIDGE=0` 禁用，或设为 `1` 强制走桥接。
 
 **兜底通道 — launchd 10 min 轮询**
 

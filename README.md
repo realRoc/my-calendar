@@ -19,6 +19,7 @@ Three independent-but-composable workflows turn your local machine + Apple Calen
 
 - **Zero-latency trigger** — a global `git pre-push` hook fires a background worker within ~2–3s of any local `git push`.
 - **Post-create trigger** — local tools can call `~/.config/my-calendar/git-hooks/pr-created <pr-url> [origin-cwd]` right after `gh pr create`; gstack `/ship` uses this to avoid missing PRs created after the push polling window.
+- **Codex → Terminal bridge** — when an immediate PR trigger is launched from Codex Desktop, it hands the watcher to a Terminal-opened `.command` file so Calendar writes use Terminal's EventKit permission instead of Codex's.
 - **Cross-org** — one `gh` GraphQL call sweeps every open PR you authored, across all organizations.
 - **Default-branch only** — PRs whose base ≠ the repo's default branch are skipped (feature → feature never triggers).
 - **Idempotent** — keyed on `(pr_url, head_sha)`; the same commit is reviewed once. A force-push that rewrites the SHA re-triggers.
