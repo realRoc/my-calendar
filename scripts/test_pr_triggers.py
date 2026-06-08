@@ -176,6 +176,39 @@ printf '%s\\n' "$1" "$2" > {calls}
             self.assertEqual(got_url, pr_url)
             self.assertEqual(Path(got_root).resolve(), repo.resolve())
 
+    def test_trigger_only_rejects_non_canonical_pr_url(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            repo = tmp / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            hook_calls = tmp / "hook.calls"
+            hook = tmp / "pr-created"
+            _write_exe(hook, f"#!/usr/bin/env bash\necho called > {hook_calls}\n")
+
+            env = os.environ.copy()
+            env["MY_CALENDAR_PR_CREATED_HOOK"] = str(hook)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / ".agents" / "skills" / "pr" / "scripts" / "light_pr.sh"),
+                    "--trigger-only",
+                    "https://github.com/realRoc/my-calendar/pull/42/extra",
+                ],
+                cwd=str(repo),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--trigger-only requires a GitHub PR URL", result.stderr)
+            self.assertFalse(hook_calls.exists())
+
 
 class PrReviewTriggerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -269,6 +302,59 @@ class PrReviewTriggerTests(unittest.TestCase):
             self.assertIn(str(origin), command)
             debounce_dir = home / ".config" / "my-calendar" / "git-hooks" / "review-triggers"
             self.assertFalse(list(debounce_dir.glob("*.stamp")))
+
+    def test_review_trigger_auto_bridges_codex_desktop_bundle_identifier(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            home.mkdir()
+            fake = tmp / "fake-bin"
+            fake.mkdir()
+            open_args = tmp / "open.args"
+            command_copy = tmp / "bridge.command"
+            _write_exe(
+                fake / "open",
+                textwrap.dedent("""\
+                    #!/usr/bin/env bash
+                    last=""
+                    for arg in "$@"; do
+                      last="$arg"
+                    done
+                    printf '%s\\n' "$@" > "$OPEN_ARGS_OUT"
+                    cp "$last" "$OPEN_CAPTURE_OUT"
+                """),
+            )
+
+            env = os.environ.copy()
+            env.pop("MY_CALENDAR_PR_TERMINAL_BRIDGE", None)
+            env["HOME"] = str(home)
+            env["PATH"] = f"{fake}:{env['PATH']}"
+            env["__CFBundleIdentifier"] = "com.openai.codex"
+            env["OPEN_ARGS_OUT"] = str(open_args)
+            env["OPEN_CAPTURE_OUT"] = str(command_copy)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts" / "pr_review_trigger.sh"),
+                    "https://github.com/realRoc/my-calendar/pull/42",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("terminal bridge launched", result.stdout)
+            self.assertEqual(
+                open_args.read_text(encoding="utf-8").splitlines()[:3],
+                ["-g", "-a", "Terminal"],
+            )
+            command = command_copy.read_text(encoding="utf-8")
+            self.assertIn("--source manual:terminal-bridge", command)
 
     def test_review_trigger_skips_non_default_base(self):
         with tempfile.TemporaryDirectory() as td:

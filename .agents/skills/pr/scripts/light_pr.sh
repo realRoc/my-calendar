@@ -190,7 +190,7 @@ ensure_pr_text() {
 }
 
 if [[ "$TRIGGER_ONLY" -eq 1 ]]; then
-    if [[ "$PR_URL_ARG" != https://github.com/*/*/pull/* ]]; then
+    if [[ ! "$PR_URL_ARG" =~ ^https://github\.com/[^/]+/[^/]+/pull/[0-9]+$ ]]; then
         echo "ERROR: --trigger-only requires a GitHub PR URL" >&2
         exit 2
     fi
