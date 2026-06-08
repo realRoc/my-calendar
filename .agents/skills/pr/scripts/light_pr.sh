@@ -8,6 +8,7 @@
 # high-signal PR text; this helper only provides a structured fallback.
 
 set -euo pipefail
+export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 BASE=""
 DRAFT=0
@@ -86,8 +87,6 @@ need_cmd() {
 }
 
 need_cmd git
-need_cmd gh
-need_cmd jq
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
@@ -199,6 +198,9 @@ if [[ "$TRIGGER_ONLY" -eq 1 ]]; then
     trigger_my_calendar "$PR_URL_ARG" "$repo_root"
     exit 0
 fi
+
+need_cmd gh
+need_cmd jq
 
 branch="$(git branch --show-current)"
 if [[ -z "$branch" ]]; then

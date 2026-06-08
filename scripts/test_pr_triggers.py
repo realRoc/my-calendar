@@ -127,6 +127,56 @@ printf '%s\\n' "$@" >> {calls}
             self.assertFalse(calls.exists())
 
 
+class LightPrHelperTests(unittest.TestCase):
+    def test_trigger_only_does_not_require_gh_or_jq(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            repo = tmp / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            fake = tmp / "fake-bin"
+            fake.mkdir()
+            _write_exe(fake / "gh", "#!/usr/bin/env bash\necho 'gh should not be called' >&2\nexit 99\n")
+            _write_exe(fake / "jq", "#!/usr/bin/env bash\necho 'jq should not be called' >&2\nexit 98\n")
+
+            calls = tmp / "hook.calls"
+            hook = tmp / "pr-created"
+            _write_exe(
+                hook,
+                f"""#!/usr/bin/env bash
+printf '%s\\n' "$1" "$2" > {calls}
+""",
+            )
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake}:/usr/bin:/bin"
+            env["MY_CALENDAR_PR_CREATED_HOOK"] = str(hook)
+
+            pr_url = "https://github.com/realRoc/my-calendar/pull/42"
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / ".agents" / "skills" / "pr" / "scripts" / "light_pr.sh"),
+                    "--trigger-only",
+                    pr_url,
+                ],
+                cwd=str(repo),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"PR_URL={pr_url}", result.stdout)
+            self.assertIn("MY_CALENDAR_TRIGGER=hook:", result.stdout)
+            got_url, got_root = calls.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(got_url, pr_url)
+            self.assertEqual(Path(got_root).resolve(), repo.resolve())
+
+
 class PrReviewTriggerTests(unittest.TestCase):
     def setUp(self) -> None:
         self._old_terminal_bridge = os.environ.get("MY_CALENDAR_PR_TERMINAL_BRIDGE")
