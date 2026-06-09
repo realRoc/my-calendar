@@ -19,6 +19,7 @@
 
 - **触发零延迟** — 全局 `git pre-push` hook，本地 push 后约 2–3 秒内异步起后台 worker。
 - **PR 创建后触发** — 本地工具可以在 `gh pr create` 成功后调用 `~/.config/my-calendar/git-hooks/pr-created <pr-url> [origin-cwd]`；gstack `/ship` 已接入，避免 PR 创建晚于 push 轮询窗口时漏掉 review。
+- **当前 session `/pr` 快路径** — 轻量 `/pr` skill 现在创建/更新 PR 后，会先在 my-calendar state 里 claim 当前 head SHA，由当前 Codex/Claude session 自己发 review 评论；随后只把短暂的日历/state 写入通过 Terminal bridge 交给已授权的 Terminal。
 - **跨 org** — 一次 `gh` GraphQL 调用扫所有 organization 下你发起的 open PR。
 - **只看默认分支** — base ≠ 仓库默认分支的 PR 自动剔除（feature → feature 不触发）。
 - **幂等** — 以 `(pr_url, head_sha)` 为键，同一 commit 只评论一次；force-push 重写 SHA 后才会重审。
@@ -112,7 +113,7 @@ bash scripts/install_pr_skill.sh
 bash scripts/install_app.sh                       # 编译 + 安装 MyCalFix.app，注册 mycalfix:// scheme
 ```
 
-之后每次本地 `git push`：hook 在几秒内异步起 codex review、发评论、写日历事件——不阻塞 push。在 Claude Code 或 Codex 里说 `/pr`，就是轻量 PR 路径：做必要检查、push/create PR，然后立刻交给 my-calendar 异步 review。
+之后普通本地 `git push`：hook 在几秒内异步起 codex review、发评论、写日历事件——不阻塞 push。在 Claude Code 或 Codex 里说 `/pr`，就是轻量 PR 路径：做必要检查、push/create PR、当前 session review/comment，然后让 my-calendar 把这条评论记录进日历。
 
 > 某个 repo 已有自己的 `.git/hooks/pre-push`（CI 校验等）：改名为 `.git/hooks/pre-push.local`，全局 hook 会先 exec 它再触发 watcher。某个 repo 完全不想被监控：`git -C <repo> config core.hooksPath .git/hooks`。
 

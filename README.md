@@ -20,6 +20,7 @@ Three independent-but-composable workflows turn your local machine + Apple Calen
 - **Zero-latency trigger** — a global `git pre-push` hook fires a background worker within ~2–3s of any local `git push`.
 - **Post-create trigger** — local tools can call `~/.config/my-calendar/git-hooks/pr-created <pr-url> [origin-cwd]` right after `gh pr create`; gstack `/ship` uses this to avoid missing PRs created after the push polling window.
 - **Codex → Terminal bridge** — when an immediate PR trigger is launched from Codex Desktop, it hands the watcher to a Terminal-opened `.command` file so Calendar writes use Terminal's EventKit permission instead of Codex's.
+- **Current-session `/pr` fast path** — the lightweight `/pr` skill now creates/updates the PR, reserves the head SHA in my-calendar state, lets the active Codex/Claude session post the review comment, then bridges only the short Calendar/state write through Terminal if needed.
 - **Cross-org** — one `gh` GraphQL call sweeps every open PR you authored, across all organizations.
 - **Default-branch only** — PRs whose base ≠ the repo's default branch are skipped (feature → feature never triggers).
 - **Idempotent** — keyed on `(pr_url, head_sha)`; the same commit is reviewed once. A force-push that rewrites the SHA re-triggers.
@@ -113,7 +114,7 @@ bash scripts/install_pr_skill.sh
 bash scripts/install_app.sh                       # builds + installs MyCalFix.app, registers mycalfix:// scheme
 ```
 
-After that, every local `git push` kicks off a background codex review (comment + calendar event) within a couple of seconds, without blocking the push. In Claude Code or Codex, say `/pr` when you want the light PR path: focused checks, push/create PR, then immediate my-calendar review handoff.
+After that, every ordinary local `git push` kicks off a background codex review (comment + calendar event) within a couple of seconds, without blocking the push. In Claude Code or Codex, say `/pr` when you want the light PR path: focused checks, push/create PR, current-session review/comment, then my-calendar records that comment into Calendar.
 
 > If a repo already has its own `.git/hooks/pre-push` (CI checks etc.), rename it to `.git/hooks/pre-push.local` — the global hook execs it first, then triggers the watcher. To opt a repo out entirely: `git -C <repo> config core.hooksPath .git/hooks`.
 
