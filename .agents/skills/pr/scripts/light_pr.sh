@@ -3,9 +3,9 @@
 #
 # This helper intentionally does only the mechanical part:
 # push the current branch, create/update an open PR with a clear title/body,
-# then call my-calendar's pr-created hook. The agent using the skill remains
-# responsible for understanding the diff, running relevant checks, and creating
-# high-signal PR text; this helper only provides a structured fallback.
+# then reserve that PR for the current Codex/Claude session's review. The
+# agent using the skill remains responsible for understanding the diff, running
+# relevant checks, posting the review comment, and recording it into calendar.
 
 set -euo pipefail
 export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -20,6 +20,7 @@ ALLOW_DIRTY=0
 AUTO_BODY_FILE=""
 TITLE_SOURCE="provided"
 BODY_SOURCE="provided"
+REVIEW_MODE="current-session"
 
 cleanup() {
     if [[ -n "${AUTO_BODY_FILE:-}" && -f "$AUTO_BODY_FILE" ]]; then
@@ -31,12 +32,13 @@ trap cleanup EXIT
 usage() {
     cat <<'EOF'
 Usage:
-  light_pr.sh [--base <branch>] [--draft] [--title <title>] [--body-file <file>] [--allow-dirty]
+  light_pr.sh [--base <branch>] [--draft] [--title <title>] [--body-file <file>] [--allow-dirty] [--trigger-async-review]
   light_pr.sh --trigger-only <github-pr-url>
 
-Creates a new GitHub PR or updates an existing OPEN PR for the current branch,
-then immediately triggers my-calendar's PR review pipeline via the pr-created
-hook. MERGED/CLOSED PRs are never reused as the current handoff.
+Creates a new GitHub PR or updates an existing OPEN PR for the current branch.
+By default, it reserves the PR for the current agent session's review and does
+not launch the background codex watcher. MERGED/CLOSED PRs are never reused as
+the current handoff.
 EOF
 }
 
@@ -60,6 +62,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --allow-dirty)
             ALLOW_DIRTY=1
+            shift
+            ;;
+        --trigger-async-review)
+            REVIEW_MODE="async"
             shift
             ;;
         --trigger-only)
@@ -126,6 +132,45 @@ trigger_my_calendar() {
     echo "         Run bash scripts/install_git_hook.sh from your my-calendar checkout, then retry:" >&2
     echo "         light_pr.sh --trigger-only '$pr_url'" >&2
     return 0
+}
+
+claim_current_session_review() {
+    local pr_url="$1"
+    local origin_cwd="$2"
+    local checkout="${MY_CALENDAR_HOME:-}"
+    local script=""
+    local python=""
+
+    if [[ -n "$checkout" && -f "$checkout/scripts/pr_session_review.py" ]]; then
+        script="$checkout/scripts/pr_session_review.py"
+    else
+        for candidate in "$HOME/Desktop/my-calendar" "$HOME/my-calendar" "$HOME/src/my-calendar"; do
+            if [[ -f "$candidate/scripts/pr_session_review.py" ]]; then
+                script="$candidate/scripts/pr_session_review.py"
+                checkout="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$script" ]]; then
+        echo "MY_CALENDAR_SESSION_CLAIM=missing"
+        echo "WARNING: my-calendar current-session claim script was not found." >&2
+        return 0
+    fi
+
+    python="$checkout/.venv/bin/python"
+    if [[ ! -x "$python" ]]; then
+        python="python3"
+    fi
+
+    if "$python" "$script" --claim --pr-url "$pr_url" --origin-cwd "$origin_cwd"; then
+        echo "MY_CALENDAR_SESSION_CLAIM=checkout:$script"
+    else
+        echo "MY_CALENDAR_SESSION_CLAIM=failed"
+        echo "WARNING: failed to claim current-session review in my-calendar state; continuing." >&2
+        return 0
+    fi
 }
 
 ensure_pr_text() {
@@ -254,7 +299,11 @@ echo "BASE=$BASE"
 
 git fetch origin "$BASE" >/dev/null 2>&1 || true
 ensure_pr_text
-git push -u origin HEAD >/dev/null
+if [[ "$REVIEW_MODE" == "current-session" ]]; then
+    MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW=1 git push -u origin HEAD >/dev/null
+else
+    git push -u origin HEAD >/dev/null
+fi
 
 pr_list_json="$(gh pr list --head "$branch" --base "$BASE" --state all --json number,url,state,baseRefName,headRefName,updatedAt --limit 20)"
 open_pr_json="$(echo "$pr_list_json" | jq -c '[.[] | select(.state == "OPEN")][0] // empty')"
@@ -291,4 +340,8 @@ echo "PR_NUMBER=$pr_number"
 echo "PR_TITLE_SOURCE=$TITLE_SOURCE"
 echo "PR_BODY_SOURCE=$BODY_SOURCE"
 echo "PR_URL=$pr_url"
-trigger_my_calendar "$pr_url" "$repo_root"
+if [[ "$REVIEW_MODE" == "async" ]]; then
+    trigger_my_calendar "$pr_url" "$repo_root"
+else
+    claim_current_session_review "$pr_url" "$repo_root"
+fi

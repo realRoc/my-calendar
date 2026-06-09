@@ -8,6 +8,8 @@
 #   2. After the local chain passes, spawn a detached background process that
 #      polls for the PR matching each pushed branch, then triggers pr_watcher
 #      --force <pr-url>. Returns 0 immediately so push proceeds without delay.
+#      Set MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW=1 to keep the local hook safety
+#      checks but skip this detached review trigger for the current push.
 #
 # git pre-push contract:
 #   $1 = remote name (e.g. "origin")
@@ -54,6 +56,14 @@ if [[ "$REMOTE_URL" != *"github.com"* ]]; then
     rm -f "$STDIN_TMP"
     exit 0
 fi
+
+case "${MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW:-}" in
+    1|true|TRUE|on|ON|yes|YES)
+        echo "[my-calendar pre-push] skip review trigger: MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW is set" >>"$LOG_DIR/trigger.log"
+        rm -f "$STDIN_TMP"
+        exit 0
+        ;;
+esac
 
 # ── 4. Resolve the local repo root to forward to the trigger ──
 # This is the cwd a future "/fix this PR" launcher should drop into. Prefer the
