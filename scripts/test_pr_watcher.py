@@ -623,6 +623,69 @@ class RunCodexCancelObserveTests(unittest.TestCase):
             self.assertIn("cancelled_new_commit", jsonl,
                           "jsonl should record the cancellation marker reason")
 
+    def test_stdout_silence_still_times_out_codex(self):
+        """Regression: Codex can print turn.started and then go silent forever.
+
+        The timeout watchdog must not depend on `for line in proc.stdout`
+        receiving another line, otherwise launchd stays pinned until the child
+        exits naturally.
+        """
+        import time as _time
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/101",
+            number=101, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-timeout"}\'\n'
+                "sleep 10\n"
+            )
+            fake_codex.chmod(0o755)
+
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "MAX_RUNTIME_PER_TICK_SEC", 0.3), \
+                    mock.patch.object(pr_watcher, "CANCEL_POLL_SEC", 0.05), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                orig_popen = pr_watcher.subprocess.Popen
+
+                def patched_popen(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "codex":
+                        cmd = [str(fake_codex)] + cmd[1:]
+                    return orig_popen(cmd, *args, **kwargs)
+
+                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                    t0 = _time.time()
+                    result = pr_watcher.run_codex("prompt-text", pr)
+                    elapsed = _time.time() - t0
+
+            self.assertFalse(result.cancelled, "timeout is not a new-commit cancellation")
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertLess(
+                elapsed, 3,
+                f"silent codex must be killed by wall-clock timeout, not after sleep exits "
+                f"(elapsed={elapsed:.1f}s)",
+            )
+            jsonl = result.jsonl_path.read_text(encoding="utf-8")
+            self.assertIn('"reason":"timeout"', jsonl)
+
     def test_no_marker_means_not_cancelled(self):
         """Negative case: a clean codex run never sees the marker; result.cancelled
         stays False even though the watcher thread was running."""

@@ -1180,8 +1180,9 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     thread_id: str | None = None
     cancelled = False
     proc: subprocess.Popen | None = None
-    stop_cancel_watcher = threading.Event()
+    stop_run_watcher = threading.Event()
     cancel_observed = threading.Event()
+    timeout_observed = threading.Event()
     cancel_reason_written = False
 
     def _kill_proc_group(p: subprocess.Popen) -> None:
@@ -1228,11 +1229,17 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
         except OSError:
             pass
 
-    def _cancel_watcher() -> None:
-        """Poll the cancel marker; any marker observed during the codex run
-        window is a fresh cancel signal from a new --force (with the
-        mtime-based stale cleanup at lock acquisition, no stale marker can
-        reach this point — see clear_stale_cancel_marker docstring).
+    def _run_watcher(start_monotonic: float) -> None:
+        """Poll cancellation and wall-clock timeout while Codex is running.
+
+        Timeout must live outside the stdout read loop. A stuck Codex can emit
+        `turn.started` and then stay silent forever; if the only watchdog check
+        happens after reading a new line, launchd remains pinned indefinitely.
+
+        Any cancel marker observed during the codex run window is a fresh cancel
+        signal from a new --force (with the mtime-based stale cleanup at lock
+        acquisition, no stale marker can reach this point — see
+        clear_stale_cancel_marker docstring).
 
         Behaviour:
           - marker + proc alive  → kill codex group, set cancel_observed
@@ -1243,9 +1250,11 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
             gets committed and the waiting --force then writes a duplicate
             for the fresh sha)
 
-        In both cases we unlink the marker so the next leader's stale-cleanup
+          - timeout + proc alive → kill codex group, set timeout_observed
+
+        For cancel markers, we unlink the marker so the next leader's stale-cleanup
         has less to do (and so a marker doesn't survive into a future leader's
-        generation as a phantom signal). Exits when stop_cancel_watcher fires
+        generation as a phantom signal). Exits when stop_run_watcher fires
         (the main thread already finished post-codex housekeeping).
         """
         while True:
@@ -1253,10 +1262,18 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 if proc is not None and proc.poll() is None:
                     _kill_proc_group(proc)
                 return
-            if stop_cancel_watcher.wait(CANCEL_POLL_SEC):
+            if (
+                proc is not None
+                and proc.poll() is None
+                and time.monotonic() - start_monotonic > MAX_RUNTIME_PER_TICK_SEC
+            ):
+                timeout_observed.set()
+                _kill_proc_group(proc)
+                return
+            if stop_run_watcher.wait(CANCEL_POLL_SEC):
                 return
 
-    watcher_thread = threading.Thread(target=_cancel_watcher, daemon=True)
+    watcher_thread: threading.Thread | None = None
     watcher_started = False
 
     try:
@@ -1273,9 +1290,10 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 # parent leaves orphaned helpers holding the stdout pipe open.
                 start_new_session=True,
             )
+            start = time.monotonic()
+            watcher_thread = threading.Thread(target=_run_watcher, args=(start,), daemon=True)
             watcher_thread.start()
             watcher_started = True
-            start = time.time()
             assert proc.stdout is not None
             for line in proc.stdout:
                 f.write(line)
@@ -1287,10 +1305,6 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                         thread_id = obj.get("thread_id")
                     except Exception:
                         pass
-                if time.time() - start > MAX_RUNTIME_PER_TICK_SEC:
-                    _kill_proc_group(proc)
-                    f.write('{"type":"_killed_by_watcher","reason":"timeout"}\n')
-                    break
             proc.wait()
             # Belt-and-suspenders for PR #27 review blocker 2b: a marker
             # landing in the narrow window between the watcher's last poll
@@ -1303,6 +1317,8 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
                 cancelled = True
                 f.write('{"type":"_killed_by_watcher","reason":"cancelled_new_commit"}\n')
                 cancel_reason_written = True
+            elif timeout_observed.is_set():
+                f.write('{"type":"_killed_by_watcher","reason":"timeout"}\n')
     finally:
         # Stop the watcher thread BEFORE releasing the slot so a brand-new
         # codex (acquired by another --force right after) can't be confused
@@ -1315,8 +1331,8 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
         # the slot release + sidecar cleanup below. The double-guard
         # (watcher_started flag + try/except RuntimeError) keeps cleanup
         # running even if the threading API changes underfoot.
-        stop_cancel_watcher.set()
-        if watcher_started:
+        stop_run_watcher.set()
+        if watcher_started and watcher_thread is not None:
             try:
                 watcher_thread.join(timeout=2)
             except RuntimeError:
