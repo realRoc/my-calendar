@@ -48,6 +48,81 @@ class CurrentSessionReviewTests(unittest.TestCase):
             STATE_LOCK_PATH=lock_dir / "state.lock",
         )
 
+    def test_claim_review_writes_current_session_pending(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pr = self._pr()
+
+            with self._patch_paths(tmp), \
+                    mock.patch.object(pr_session_review, "fetch_pr", return_value=pr):
+                result = pr_session_review.claim_review(pr.url, origin_cwd=None)
+
+            self.assertEqual(result["status"], "claimed")
+            self.assertEqual(result["head_sha"], pr.head_sha)
+            state = json.loads((tmp / "pr_state.json").read_text(encoding="utf-8"))
+            entry = state["prs"][pr.url]
+            self.assertEqual(entry["pending_review_sha"], pr.head_sha)
+            self.assertEqual(entry["pending_review_source"], "current-session")
+            self.assertEqual(entry["last_seen_sha"], pr.head_sha)
+
+    def test_claim_review_rejects_when_pr_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pr = self._pr()
+
+            with self._patch_paths(tmp), \
+                    mock.patch.object(pr_session_review, "fetch_pr", return_value=pr):
+                held_fd = pr_watcher.acquire_pr_lock_nb(pr.url)
+                self.assertIsNotNone(held_fd)
+                try:
+                    with self.assertRaisesRegex(ValueError, "already in progress"):
+                        pr_session_review.claim_review(pr.url, origin_cwd=None)
+                finally:
+                    pr_watcher.release_lock_fd(held_fd)
+
+            self.assertFalse((tmp / "pr_state.json").exists())
+
+    def test_claim_review_rejects_already_recorded_same_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pr = self._pr()
+
+            with self._patch_paths(tmp), \
+                    mock.patch.object(pr_session_review, "fetch_pr", return_value=pr):
+                pr_watcher.STATE_PATH.write_text(json.dumps({
+                    "_meta": {},
+                    "prs": {
+                        pr.url: {
+                            "last_commented_sha": pr.head_sha,
+                            "last_comment_url": "https://example/comment",
+                        }
+                    },
+                }), encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "already recorded"):
+                    pr_session_review.claim_review(pr.url, origin_cwd=None)
+
+    def test_claim_review_rejects_non_stale_pending_same_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pr = self._pr()
+
+            with self._patch_paths(tmp), \
+                    mock.patch.object(pr_session_review, "fetch_pr", return_value=pr):
+                pr_watcher.STATE_PATH.write_text(json.dumps({
+                    "_meta": {},
+                    "prs": {
+                        pr.url: {
+                            "pending_review_sha": pr.head_sha,
+                            "pending_review_started_at": "2999-01-01T00:00:00",
+                            "pending_review_source": "poll",
+                        }
+                    },
+                }), encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "already pending"):
+                    pr_session_review.claim_review(pr.url, origin_cwd=None)
+
     def test_record_review_writes_event_sidecar_and_clears_pending(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
