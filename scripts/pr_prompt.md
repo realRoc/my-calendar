@@ -13,7 +13,9 @@
    - **成本与资源影响（按需评估）**：判断这次改动是否会让后端成本 / 机器资源出现可见变化。**不要套固定模板**——根据 PR 实际触及的领域去看相关维度：改了 SQL / ORM 就看查询代价、索引、N+1；加了定时任务 / 后台 worker 就看频率与并发；引入第三方服务（LLM、邮件、地理、支付等）就看调用量与计费；新增常驻状态（缓存、in-memory index、长连接）就看内存与连接资源；纯前端 / 文档 / 配置类改动很可能完全不涉及，那就跳过这一节。**只有发现实际风险或非零成本时才写这一节**，不要为了凑维度而硬写"不涉及"。
    - **可优化建议**：可读性、命名、潜在 bug、重复代码、缺失测试等真正有价值的修改建议。没有就略过，不要凑数。
 
-4. **发布评论**：用 `gh pr comment {pr_link} --body "..."` 把 review 结果发到 PR 上。评论格式遵循"按需出现、简洁优先"：
+4. **发布前去重（强制检查）**：在调用 `gh pr comment` 之前，先查询该 PR 已有 comments；如果已经存在由当前 GitHub 用户发布、同时包含 `<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->` 和 `<!-- pr-watcher-head-sha: {head_sha} -->` 的评论，说明同一 head SHA 已经被另一路 reviewer 覆盖，**不要再发新评论**。直接跳到最后一步，只打印那条已有评论的 HTML URL。
+
+5. **发布评论**：用 `gh pr comment {pr_link} --body "..."` 把 review 结果发到 PR 上。评论格式遵循"按需出现、简洁优先"：
    - **评论 body 开头必须是下面这段 AI 共著标记（原样照抄，包括 HTML 注释）**——下游的"人类活跃度"统计依赖前两行识别 AI 自动产物，不允许省略、改写、翻译或挪到末尾：
 
      ```
@@ -37,7 +39,7 @@
      - `结论：❌ 暂不可合并（存在 blocker）`
    - 判定规则：`## Blocker / 必须修正` 这一节存在且有内容 → "存在 blocker"；该节被省略 → "未发现 blocker"。
 
-5. 评论发送成功后，**在你的最终回复中只打印一行**：评论的 HTML URL（形如 `https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`）。如果 `gh pr comment` 的输出已经给出这个 URL，直接复述即可；如果没有，用 `gh api repos/<owner>/<repo>/issues/<n>/comments --jq '.[-1].html_url'` 拿到。
+6. 评论发送成功后，**在你的最终回复中只打印一行**：评论的 HTML URL（形如 `https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`）。如果 `gh pr comment` 的输出已经给出这个 URL，直接复述即可；如果没有，用 `gh api repos/<owner>/<repo>/issues/<n>/comments --jq '.[-1].html_url'` 拿到。
 
 约束：
 - 不要修改任何文件、不要 push 任何 commit。你只读 diff、发一条评论。

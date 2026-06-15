@@ -1698,6 +1698,19 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
         )
 
     comment_lookup = fetch_latest_ai_comment_since(pr.repo, pr.number, started_at, head_sha=pr.head_sha)
+    if comment_lookup.status == "absent":
+        # A detached run can start from stale local state while another path has
+        # already posted the same-SHA review. The prompt below tells codex not
+        # to post a duplicate in that situation, so the completion boundary may
+        # be an older AI-marked comment rather than one created after started_at.
+        existing_lookup = fetch_latest_ai_comment_since(pr.repo, pr.number, None, head_sha=pr.head_sha)
+        if existing_lookup.status == "found" and existing_lookup.comment_url:
+            comment_lookup = existing_lookup
+            print(
+                f"      recovered existing same-sha AI comment before this run "
+                f"{existing_lookup.comment_url}",
+                flush=True,
+            )
     if comment_lookup.status != "found" or not comment_lookup.comment_url:
         print(
             f"      warn: no AI-marked review comment found after this run "
@@ -1762,6 +1775,7 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
     # contract and acquisition-order argument.
     cancel_marker = _pr_cancel_path(pr.url)
     cancelled_late = False
+    already_recorded_late = False
     head_moved_late: PRSnap | None = None
     head_revalidation_late_error: str | None = None
     meta_path = result.jsonl_path.with_suffix(".meta.json")
@@ -1804,70 +1818,93 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
                 if current_pr.head_sha and current_pr.head_sha != pr.head_sha:
                     head_moved_late = current_pr
                 else:
-                    actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
-                    cal_action = actions.get(event.key, "?")
-                    event_written = cal_action in {"created", "updated", "unchanged"}
-
-                    # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
-                    meta = {
-                        "started_at": started_at,
-                        "repo": pr.repo,
-                        "pr_number": pr.number,
-                        "pr_url": pr.url,
-                        "pr_title": pr.title,
-                        "head_sha": pr.head_sha,
-                        "thread_id": result.thread_id,
-                        "comment_url": comment_url,
-                        "comment_body": comment_body or "",
-                        "codex_exit": result.exit_code,
-                        "jsonl_path": str(result.jsonl_path),
-                        "origin_cwd": origin_cwd,
-                    }
-                    try:
-                        meta_path.write_text(
-                            json.dumps(meta, indent=2, ensure_ascii=False),
-                            encoding="utf-8",
-                        )
-                    except OSError as e:
-                        print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
-
-                    entry = state["prs"].setdefault(pr.url, {})
-                    entry.update({
-                        "repo": pr.repo,
-                        "number": pr.number,
-                        "last_commented_sha": pr.head_sha,
-                        "last_thread_id": result.thread_id,
-                        "last_comment_url": comment_url,
-                        "last_run_at": started_at,
-                        "last_codex_exit": result.exit_code,
-                        "last_jsonl": str(result.jsonl_path),
-                    })
-
-                    # 同时记录"我们见过这个 sha"，用于 first-run 兼容
-                    entry["last_seen_sha"] = pr.head_sha
-                    _clear_pending_review(entry)
-
-                    try:
-                        final_pr = _gh_view_force_pr(pr.url)
-                    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError) as e:
-                        head_revalidation_late_error = str(e)
+                    fresh_state = load_state()
+                    fresh_entry = fresh_state.get("prs", {}).get(pr.url) or {}
+                    if fresh_entry.get("last_commented_sha") == pr.head_sha:
+                        already_recorded_late = True
+                        state.setdefault("prs", {})[pr.url] = fresh_entry
                         print(
-                            f"      warn: cannot revalidate current PR head after local persist: {e}; "
-                            f"rolling back sha={pr.head_sha[:8]}",
+                            f"      already recorded by another session "
+                            f"sha={pr.head_sha[:8]}; dropping duplicate local persist",
                             flush=True,
                         )
                         try:
                             with result.jsonl_path.open("a", encoding="utf-8") as f:
                                 f.write(json.dumps({
-                                    "type": "_head_revalidation_failed_after_local_persist",
+                                    "type": "_same_sha_already_recorded",
                                     "head_sha": pr.head_sha,
-                                    "error": str(e),
+                                    "existing_comment_url": fresh_entry.get("last_comment_url"),
                                 }, ensure_ascii=False) + "\n")
                         except OSError:
                             pass
                     else:
-                        if final_pr.head_sha and final_pr.head_sha != pr.head_sha:
-                            head_moved_late = final_pr
+                        if fresh_entry:
+                            state.setdefault("prs", {})[pr.url] = fresh_entry
+
+                        actions = upsert_events([event], CAL_STATE_PATH, dry_run=False, calendar_name=PR_CALENDAR_NAME)
+                        cal_action = actions.get(event.key, "?")
+                        event_written = cal_action in {"created", "updated", "unchanged"}
+
+                        # ── sidecar: one .meta.json per review run, canonical history record for dashboard.py ──
+                        meta = {
+                            "started_at": started_at,
+                            "repo": pr.repo,
+                            "pr_number": pr.number,
+                            "pr_url": pr.url,
+                            "pr_title": pr.title,
+                            "head_sha": pr.head_sha,
+                            "thread_id": result.thread_id,
+                            "comment_url": comment_url,
+                            "comment_body": comment_body or "",
+                            "codex_exit": result.exit_code,
+                            "jsonl_path": str(result.jsonl_path),
+                            "origin_cwd": origin_cwd,
+                        }
+                        try:
+                            meta_path.write_text(
+                                json.dumps(meta, indent=2, ensure_ascii=False),
+                                encoding="utf-8",
+                            )
+                        except OSError as e:
+                            print(f"      warn: failed to write sidecar {meta_path}: {e}", flush=True)
+
+                        entry = state["prs"].setdefault(pr.url, {})
+                        entry.update({
+                            "repo": pr.repo,
+                            "number": pr.number,
+                            "last_commented_sha": pr.head_sha,
+                            "last_thread_id": result.thread_id,
+                            "last_comment_url": comment_url,
+                            "last_run_at": started_at,
+                            "last_codex_exit": result.exit_code,
+                            "last_jsonl": str(result.jsonl_path),
+                        })
+
+                        # 同时记录"我们见过这个 sha"，用于 first-run 兼容
+                        entry["last_seen_sha"] = pr.head_sha
+                        _clear_pending_review(entry)
+
+                        try:
+                            final_pr = _gh_view_force_pr(pr.url)
+                        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError) as e:
+                            head_revalidation_late_error = str(e)
+                            print(
+                                f"      warn: cannot revalidate current PR head after local persist: {e}; "
+                                f"rolling back sha={pr.head_sha[:8]}",
+                                flush=True,
+                            )
+                            try:
+                                with result.jsonl_path.open("a", encoding="utf-8") as f:
+                                    f.write(json.dumps({
+                                        "type": "_head_revalidation_failed_after_local_persist",
+                                        "head_sha": pr.head_sha,
+                                        "error": str(e),
+                                    }, ensure_ascii=False) + "\n")
+                            except OSError:
+                                pass
+                        else:
+                            if final_pr.head_sha and final_pr.head_sha != pr.head_sha:
+                                head_moved_late = final_pr
 
                     if head_revalidation_late_error or head_moved_late is not None:
                         calendar_delete_failed = False
@@ -1909,6 +1946,14 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
             pass
         _refresh_dashboard(reason="cancelled")
         return f"cancelled (new commit between codex exit and persist, elapsed={fmt_duration(elapsed)})"
+
+    if already_recorded_late:
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        _refresh_dashboard(reason="same-sha-already-recorded")
+        return f"already reviewed by another session (elapsed={fmt_duration(elapsed)})"
 
     if head_revalidation_late_error:
         try:

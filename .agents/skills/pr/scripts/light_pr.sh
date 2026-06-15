@@ -168,8 +168,8 @@ claim_current_session_review() {
         echo "MY_CALENDAR_SESSION_CLAIM=checkout:$script"
     else
         echo "MY_CALENDAR_SESSION_CLAIM=failed"
-        echo "WARNING: failed to claim current-session review in my-calendar state; continuing." >&2
-        return 0
+        echo "ERROR: failed to claim current-session review in my-calendar state; aborting before posting a duplicate review." >&2
+        return 1
     fi
 }
 

@@ -91,23 +91,54 @@ def _safe_id(pr_url: str) -> str:
 
 def claim_review(pr_url: str, origin_cwd: str | None) -> dict:
     pr = fetch_pr(pr_url)
-    state = pr_watcher.load_state()
-    entry = state.setdefault("prs", {}).setdefault(pr.url, {})
-    now = datetime.now()
-    resolved_origin = resolve_origin_cwd(origin_cwd, entry)
+    lock_fd = pr_watcher.acquire_pr_lock_nb(pr.url)
+    if lock_fd is None:
+        raise ValueError(
+            f"review already in progress for {pr.url}; refusing to start a "
+            "current-session duplicate"
+        )
 
-    entry.update({
-        "repo": pr.repo,
-        "number": pr.number,
-        "last_seen_sha": pr.head_sha,
-        "pending_review_sha": pr.head_sha,
-        "pending_review_started_at": now.isoformat(timespec="seconds"),
-        "pending_review_source": "current-session",
-    })
-    if resolved_origin:
-        entry["origin_cwd"] = resolved_origin
+    try:
+        state = pr_watcher.load_state()
+        entry = state.setdefault("prs", {}).setdefault(pr.url, {})
+        now = datetime.now()
+        resolved_origin = resolve_origin_cwd(origin_cwd, entry)
 
-    pr_watcher.save_state(state, touched_prs={pr.url})
+        if entry.get("last_commented_sha") == pr.head_sha:
+            raise ValueError(
+                f"review already recorded for {pr.url} sha={pr.head_sha[:8]}"
+            )
+
+        if entry.get("pending_review_sha") == pr.head_sha:
+            if not pr_watcher._pending_is_stale(entry, now):
+                source = entry.get("pending_review_source") or "unknown"
+                raise ValueError(
+                    f"review already pending for {pr.url} sha={pr.head_sha[:8]} "
+                    f"source={source}"
+                )
+
+            guard_action, guard_changed = pr_watcher._same_sha_review_guard(pr, state, now)
+            if guard_changed:
+                pr_watcher.save_state(state, touched_prs={pr.url})
+                entry = state.setdefault("prs", {}).setdefault(pr.url, {})
+            if guard_action is not None:
+                raise ValueError(f"{guard_action} for {pr.url}")
+
+        entry.update({
+            "repo": pr.repo,
+            "number": pr.number,
+            "last_seen_sha": pr.head_sha,
+            "pending_review_sha": pr.head_sha,
+            "pending_review_started_at": now.isoformat(timespec="seconds"),
+            "pending_review_source": "current-session",
+        })
+        if resolved_origin:
+            entry["origin_cwd"] = resolved_origin
+
+        pr_watcher.save_state(state, touched_prs={pr.url})
+    finally:
+        pr_watcher.release_lock_fd(lock_fd)
+
     return {
         "status": "claimed",
         "pr_url": pr.url,
@@ -178,46 +209,60 @@ def record_review(
         actions = {event.key: "would-upsert"}
         meta_path = jsonl_path.with_suffix(".meta.json")
     else:
-        actions = pr_watcher.upsert_events(
-            [event],
-            pr_watcher.CAL_STATE_PATH,
-            dry_run=False,
-            calendar_name=PR_CALENDAR_NAME,
-        )
-        pr_watcher.cache_comment_body(canonical_comment_url, comment_body)
-        meta_path = jsonl_path.with_suffix(".meta.json")
-        meta = {
-            "started_at": started_at,
-            "repo": pr.repo,
-            "pr_number": pr.number,
-            "pr_url": pr.url,
-            "pr_title": pr.title,
-            "head_sha": pr.head_sha,
-            "thread_id": thread_id,
-            "comment_url": canonical_comment_url,
-            "comment_body": comment_body,
-            "codex_exit": 0,
-            "jsonl_path": str(jsonl_path),
-            "origin_cwd": resolved_origin,
-            "review_mode": "current-session",
-        }
-        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        persist_fd = pr_watcher.acquire_persist_lock(pr.url)
+        try:
+            fresh_state = pr_watcher.load_state()
+            fresh_entry = fresh_state.setdefault("prs", {}).setdefault(pr.url, entry)
+            existing_sha = fresh_entry.get("last_commented_sha")
+            existing_url = fresh_entry.get("last_comment_url")
+            if existing_sha == pr.head_sha and existing_url != canonical_comment_url:
+                raise ValueError(
+                    f"review already recorded for {pr.url} sha={pr.head_sha[:8]} "
+                    f"at {existing_url}"
+                )
 
-        entry.update({
-            "repo": pr.repo,
-            "number": pr.number,
-            "last_commented_sha": pr.head_sha,
-            "last_thread_id": thread_id,
-            "last_comment_url": canonical_comment_url,
-            "last_run_at": started_at,
-            "last_codex_exit": 0,
-            "last_jsonl": str(jsonl_path),
-            "last_seen_sha": pr.head_sha,
-        })
-        if resolved_origin:
-            entry["origin_cwd"] = resolved_origin
-        pr_watcher._clear_pending_review(entry)
-        pr_watcher.save_state(state, touched_prs={pr.url})
+            actions = pr_watcher.upsert_events(
+                [event],
+                pr_watcher.CAL_STATE_PATH,
+                dry_run=False,
+                calendar_name=PR_CALENDAR_NAME,
+            )
+            pr_watcher.cache_comment_body(canonical_comment_url, comment_body)
+            meta_path = jsonl_path.with_suffix(".meta.json")
+            meta = {
+                "started_at": started_at,
+                "repo": pr.repo,
+                "pr_number": pr.number,
+                "pr_url": pr.url,
+                "pr_title": pr.title,
+                "head_sha": pr.head_sha,
+                "thread_id": thread_id,
+                "comment_url": canonical_comment_url,
+                "comment_body": comment_body,
+                "codex_exit": 0,
+                "jsonl_path": str(jsonl_path),
+                "origin_cwd": resolved_origin,
+                "review_mode": "current-session",
+            }
+            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            fresh_entry.update({
+                "repo": pr.repo,
+                "number": pr.number,
+                "last_commented_sha": pr.head_sha,
+                "last_thread_id": thread_id,
+                "last_comment_url": canonical_comment_url,
+                "last_run_at": started_at,
+                "last_codex_exit": 0,
+                "last_jsonl": str(jsonl_path),
+                "last_seen_sha": pr.head_sha,
+            })
+            if resolved_origin:
+                fresh_entry["origin_cwd"] = resolved_origin
+            pr_watcher._clear_pending_review(fresh_entry)
+            pr_watcher.save_state(fresh_state, touched_prs={pr.url})
+        finally:
+            pr_watcher.release_lock_fd(persist_fd)
         pr_watcher._refresh_dashboard(reason="current-session-record")
 
     return {
