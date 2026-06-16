@@ -327,6 +327,143 @@ class LightPrHelperTests(unittest.TestCase):
             self.assertIn("--claim", claim_calls.read_text(encoding="utf-8"))
             self.assertFalse(hook_calls.exists())
 
+    def test_default_flow_aborts_when_current_session_claim_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            repo = tmp / "repo"
+            repo.mkdir()
+            fake = tmp / "fake-bin"
+            fake.mkdir()
+            push_env = tmp / "push.env"
+            my_calendar = tmp / "my-calendar"
+            (my_calendar / "scripts").mkdir(parents=True)
+
+            _write_exe(
+                fake / "git",
+                textwrap.dedent("""\
+                    #!/usr/bin/env bash
+                    case "$1" in
+                      rev-parse)
+                        if [[ "$2" == "--show-toplevel" ]]; then
+                          echo "$FAKE_REPO_ROOT"
+                          exit 0
+                        fi
+                        if [[ "$2" == "--verify" ]]; then
+                          exit 1
+                        fi
+                        ;;
+                      branch)
+                        echo feature/current-session
+                        exit 0
+                        ;;
+                      remote)
+                        echo git@github.com:realRoc/my-calendar.git
+                        exit 0
+                        ;;
+                      status)
+                        exit 0
+                        ;;
+                      log)
+                        if [[ "$*" == *"--pretty=%s"* ]]; then
+                          echo "fix(pr): current session review"
+                        else
+                          echo "- fix(pr): current session review"
+                        fi
+                        exit 0
+                        ;;
+                      diff|show)
+                        echo " scripts/example.py | 1 +"
+                        exit 0
+                        ;;
+                      fetch)
+                        exit 0
+                        ;;
+                      push)
+                        printf '%s\\n' "${MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW:-}" > "$PUSH_ENV_OUT"
+                        exit 0
+                        ;;
+                    esac
+                    echo "unexpected git args: $*" >&2
+                    exit 99
+                """),
+            )
+            _write_exe(
+                fake / "gh",
+                textwrap.dedent("""\
+                    #!/usr/bin/env bash
+                    if [[ "$1" == "repo" && "$2" == "view" ]]; then
+                      echo '{"nameWithOwner":"realRoc/my-calendar","defaultBranchRef":{"name":"main"}}'
+                      exit 0
+                    fi
+                    if [[ "$1" == "pr" && "$2" == "list" ]]; then
+                      echo '[]'
+                      exit 0
+                    fi
+                    if [[ "$1" == "pr" && "$2" == "create" ]]; then
+                      echo 'https://github.com/realRoc/my-calendar/pull/42'
+                      exit 0
+                    fi
+                    echo "unexpected gh args: $*" >&2
+                    exit 98
+                """),
+            )
+            _write_exe(
+                fake / "jq",
+                textwrap.dedent("""\
+                    #!/usr/bin/env bash
+                    expr=""
+                    for arg in "$@"; do
+                      expr="$arg"
+                    done
+                    case "$expr" in
+                      .nameWithOwner) echo realRoc/my-calendar ;;
+                      .defaultBranchRef.name) echo main ;;
+                      *'select(.state == "OPEN")'*) ;;
+                      *'select(.state != "OPEN")'*) ;;
+                      *) echo "unexpected jq expr: $expr" >&2; exit 97 ;;
+                    esac
+                """),
+            )
+            (my_calendar / "scripts" / "pr_session_review.py").write_text(
+                textwrap.dedent("""\
+                    import sys
+                    print("ERROR: review already pending", file=sys.stderr)
+                    raise SystemExit(13)
+                """),
+                encoding="utf-8",
+            )
+
+            body = tmp / "body.md"
+            body.write_text("## 解决什么问题\n\n- test\n", encoding="utf-8")
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake}:/usr/bin:/bin"
+            env["FAKE_REPO_ROOT"] = str(repo)
+            env["PUSH_ENV_OUT"] = str(push_env)
+            env["MY_CALENDAR_HOME"] = str(my_calendar)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / ".agents" / "skills" / "pr" / "scripts" / "light_pr.sh"),
+                    "--title",
+                    "fix(pr): current session review",
+                    "--body-file",
+                    str(body),
+                ],
+                cwd=str(repo),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("MY_CALENDAR_SESSION_CLAIM=failed", result.stdout)
+            self.assertIn("aborting before posting a duplicate review", result.stderr)
+            self.assertEqual(push_env.read_text(encoding="utf-8").strip(), "1")
+
     def test_trigger_only_does_not_require_gh_or_jq(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

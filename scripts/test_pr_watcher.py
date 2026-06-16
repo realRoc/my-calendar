@@ -623,6 +623,69 @@ class RunCodexCancelObserveTests(unittest.TestCase):
             self.assertIn("cancelled_new_commit", jsonl,
                           "jsonl should record the cancellation marker reason")
 
+    def test_stdout_silence_still_times_out_codex(self):
+        """Regression: Codex can print turn.started and then go silent forever.
+
+        The timeout watchdog must not depend on `for line in proc.stdout`
+        receiving another line, otherwise launchd stays pinned until the child
+        exits naturally.
+        """
+        import time as _time
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/101",
+            number=101, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            log_dir = tmp / "pr_logs"
+            log_dir.mkdir()
+            scratch_base = tmp / "scratch"
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-timeout"}\'\n'
+                "sleep 10\n"
+            )
+            fake_codex.chmod(0o755)
+
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+
+            with mock.patch.object(pr_watcher, "LOG_DIR", log_dir), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", scratch_base), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(pr_watcher, "MAX_RUNTIME_PER_TICK_SEC", 0.3), \
+                    mock.patch.object(pr_watcher, "CANCEL_POLL_SEC", 0.05), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                orig_popen = pr_watcher.subprocess.Popen
+
+                def patched_popen(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "codex":
+                        cmd = [str(fake_codex)] + cmd[1:]
+                    return orig_popen(cmd, *args, **kwargs)
+
+                with mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                    t0 = _time.time()
+                    result = pr_watcher.run_codex("prompt-text", pr)
+                    elapsed = _time.time() - t0
+
+            self.assertFalse(result.cancelled, "timeout is not a new-commit cancellation")
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertLess(
+                elapsed, 3,
+                f"silent codex must be killed by wall-clock timeout, not after sleep exits "
+                f"(elapsed={elapsed:.1f}s)",
+            )
+            jsonl = result.jsonl_path.read_text(encoding="utf-8")
+            self.assertIn('"reason":"timeout"', jsonl)
+
     def test_no_marker_means_not_cancelled(self):
         """Negative case: a clean codex run never sees the marker; result.cancelled
         stays False even though the watcher thread was running."""
@@ -3929,6 +3992,13 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
             "Marker must be described before the section rules it precedes",
         )
 
+    def test_pr_prompt_requires_same_sha_dedupe_before_commenting(self):
+        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("发布前去重", body)
+        self.assertIn(self.PR_HTML_METADATA_MARKER, body)
+        self.assertIn(self.PR_HEAD_SHA_METADATA_MARKER, body)
+        self.assertIn("不要再发新评论", body)
+
     def test_fix_prompt_requires_coauthor_trailer(self):
         body = self.FIX_PROMPT_PATH.read_text(encoding="utf-8")
         self.assertIn(
@@ -4024,6 +4094,91 @@ class RunCodexSlotWaitCancelTests(unittest.TestCase):
                              "no .running sidecar on slot-cancel path")
             self.assertIn("cancelled_in_slot_wait",
                           result.jsonl_path.read_text(encoding="utf-8"))
+
+
+class ProcessPrSameShaAlreadyRecordedTests(unittest.TestCase):
+    def test_process_pr_skips_local_persist_when_same_sha_already_recorded(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/88",
+            number=88, title="duplicate guard", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="same888", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            scratch = tmp / "scratch"
+            scratch.mkdir()
+            lock_dir = tmp / "locks"
+            lock_dir.mkdir()
+            jsonl_path = tmp / "20260525-120000__realRoc_my-calendar_pull_88.jsonl"
+            jsonl_path.write_text('{"x":1}\n', encoding="utf-8")
+            meta_path = jsonl_path.with_suffix(".meta.json")
+            state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr.url: {
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_commented_sha": "oldsha",
+                        "last_seen_sha": "oldsha",
+                    }
+                },
+            }
+            recorded_state = {
+                "_meta": {"installed_at": "2026-05-22T00:00:00+00:00"},
+                "prs": {
+                    pr.url: {
+                        "repo": pr.repo,
+                        "number": pr.number,
+                        "last_commented_sha": pr.head_sha,
+                        "last_comment_url": "https://example/current-session",
+                        "last_seen_sha": pr.head_sha,
+                    }
+                },
+            }
+            clean_result = pr_watcher.CodexResult(
+                thread_id="t-dup",
+                last_message="ok",
+                exit_code=0,
+                jsonl_path=jsonl_path,
+                scratch_dir=scratch,
+                cancelled=False,
+            )
+
+            with mock.patch.object(pr_watcher, "LOCK_DIR", lock_dir), \
+                    mock.patch.object(
+                        pr_watcher, "PROMPT_PATH",
+                        mock.MagicMock(read_text=lambda encoding=None: "review {pr_link} {head_sha}")), \
+                    mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: clean_result), \
+                    mock.patch.object(pr_watcher, "notify", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: pr), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since",
+                                      lambda *a, **kw: pr_watcher.AICommentLookup(
+                                          "found",
+                                          comment_url="https://example/detached",
+                                          comment_body=(
+                                              f"{pr_watcher.AI_COAUTHOR_METADATA_MARKER}\n"
+                                              f"{pr_watcher.head_sha_metadata_marker(pr.head_sha)}\n"
+                                              "结论：✅ 可以合并\n"
+                                          ),
+                                      )), \
+                    mock.patch.object(pr_watcher, "cache_comment_body", lambda *a, **kw: None), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: recorded_state), \
+                    mock.patch.object(pr_watcher, "upsert_events",
+                                      lambda *a, **kw: self.fail("duplicate persist must not write calendar")), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
+                ret = pr_watcher.process_pr(pr, state, dry_run=False)
+
+            self.assertIn("already reviewed by another session", ret)
+            self.assertFalse(meta_path.exists(), "duplicate run must not write a sidecar")
+            self.assertEqual(
+                state["prs"][pr.url]["last_comment_url"],
+                "https://example/current-session",
+            )
+            self.assertIn("_same_sha_already_recorded", jsonl_path.read_text(encoding="utf-8"))
+
 
 class ProcessPrPersistLockSerialisesCancelMarkerTests(unittest.TestCase):
     """PR #27 high finding: the synchronous late-marker re-check just before

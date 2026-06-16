@@ -68,7 +68,7 @@ Why current-session review: Codex Desktop may not have Calendar permission and d
    - inspect existing PRs for the current branch and target base
    - reuse only an existing `OPEN` PR, then update its title and description
    - create a new PR when the previous PR for that branch is `MERGED` or `CLOSED`
-   - mark the current PR SHA as `pending_review_source=current-session` in my-calendar state, which prevents the 10-minute launchd fallback from racing this session
+   - mark the current PR SHA as `pending_review_source=current-session` in my-calendar state, which prevents the 10-minute launchd fallback from racing this session; if the same SHA is already reviewed or owned by an in-flight watcher, the helper aborts before this session posts a duplicate review
 
 6. Review the PR in the current session.
 
