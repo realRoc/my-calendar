@@ -146,6 +146,41 @@ launch_terminal_bridge() {
         printf 'mkdir -p %s\n' "$(shell_quote "$STATUS_DIR")"
         printf 'cd %s\n' "$(shell_quote "$ROOT")"
         printf 'export MY_CALENDAR_PR_RECORD_TERMINAL_BRIDGE=0\n'
+        cat <<'BRIDGE_SCRIPT'
+auto_close_terminal_bridge_if_success() {
+    local rc="$1"
+    local tty_name
+
+    [[ "$rc" -eq 0 ]] || return 0
+    case "${MY_CALENDAR_PR_RECORD_TERMINAL_AUTO_CLOSE:-1}" in
+        0|false|FALSE|off|OFF|no|NO)
+            return 0
+            ;;
+    esac
+
+    tty_name="$(tty 2>/dev/null || true)"
+    [[ -n "$tty_name" && "$tty_name" != "not a tty" ]] || return 0
+
+    /usr/bin/nohup /usr/bin/osascript - "$tty_name" >/dev/null 2>&1 <<'APPLESCRIPT' &
+on run argv
+    delay 0.3
+    set targetTty to item 1 of argv
+    tell application "Terminal"
+        repeat with w in windows
+            repeat with t in tabs of w
+                if (tty of t as text) is targetTty then
+                    if (count of tabs of w) is 1 then
+                        close w saving no
+                    end if
+                    return
+                end if
+            end repeat
+        end repeat
+    end tell
+end run
+APPLESCRIPT
+}
+BRIDGE_SCRIPT
         printf 'set +e\n'
         printf '%s %s --record --pr-url %s --comment-url %s' \
             "$(shell_quote "$PYTHON")" \
@@ -158,6 +193,7 @@ launch_terminal_bridge() {
         printf ' >%s 2>%s\n' "$(shell_quote "$out_file")" "$(shell_quote "$err_file")"
         printf 'rc=$?\n'
         printf 'printf '"'"'rc=%%s\\n'"'"' "$rc" > %s\n' "$(shell_quote "$status_file")"
+        printf 'auto_close_terminal_bridge_if_success "$rc"\n'
         printf 'exit "$rc"\n'
     } > "$command_file"
     chmod 700 "$command_file"
