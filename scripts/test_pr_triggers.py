@@ -717,5 +717,93 @@ class PrReviewTriggerTests(unittest.TestCase):
             self.assertFalse(stamp.exists())
 
 
+class PrRecordReviewTriggerTests(unittest.TestCase):
+    def test_terminal_record_bridge_auto_closes_successful_window(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            root = tmp / "repo"
+            scripts = root / "scripts"
+            venv_bin = root / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            venv_bin.mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "pr_record_review_trigger.sh", scripts / "pr_record_review_trigger.sh")
+            (scripts / "pr_record_review_trigger.sh").chmod(0o755)
+            (scripts / "pr_session_review.py").write_text("# fake recorder target\n", encoding="utf-8")
+            _write_exe(venv_bin / "python", "#!/usr/bin/env bash\nexit 0\n")
+
+            home = tmp / "home"
+            home.mkdir()
+            fake = tmp / "fake-bin"
+            fake.mkdir()
+            open_args = tmp / "open.args"
+            command_copy = tmp / "bridge.command"
+            _write_exe(
+                fake / "open",
+                textwrap.dedent("""\
+                    #!/usr/bin/env bash
+                    last=""
+                    for arg in "$@"; do
+                      last="$arg"
+                    done
+                    printf '%s\\n' "$@" > "$OPEN_ARGS_OUT"
+                    cp "$last" "$OPEN_CAPTURE_OUT"
+                    status="$(awk '/^printf .* > .*\\.status$/ {print $NF; exit}' "$last")"
+                    if [[ -z "$status" ]]; then
+                      echo "status path not found in generated command" >&2
+                      exit 93
+                    fi
+                    mkdir -p "$(dirname "$status")"
+                    printf 'rc=0\\n' > "$status"
+                """),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env["PATH"] = f"{fake}:{env['PATH']}"
+            env["MY_CALENDAR_PR_RECORD_TERMINAL_BRIDGE"] = "1"
+            env["OPEN_ARGS_OUT"] = str(open_args)
+            env["OPEN_CAPTURE_OUT"] = str(command_copy)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(scripts / "pr_record_review_trigger.sh"),
+                    "--timeout",
+                    "2",
+                    "https://github.com/realRoc/my-calendar/pull/42",
+                    "https://github.com/realRoc/my-calendar/pull/42#issuecomment-123",
+                    str(root),
+                ],
+                cwd=str(root),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("MY_CALENDAR_RECORD=terminal-bridge:success", result.stdout)
+            self.assertEqual(
+                open_args.read_text(encoding="utf-8").splitlines()[:3],
+                ["-g", "-a", "Terminal"],
+            )
+            command = command_copy.read_text(encoding="utf-8")
+            self.assertIn('MY_CALENDAR_PR_RECORD_TERMINAL_AUTO_CLOSE:-1', command)
+            self.assertIn('auto_close_terminal_bridge_if_success "$rc"', command)
+            self.assertIn('[[ "$rc" -eq 0 ]] || return 0', command)
+            self.assertIn("if (count of tabs of w) is 1 then", command)
+            self.assertIn("close w saving no", command)
+            self.assertNotIn("close t saving no", command)
+            syntax = subprocess.run(
+                ["bash", "-n", str(command_copy)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
