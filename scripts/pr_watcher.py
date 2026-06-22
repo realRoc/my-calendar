@@ -1502,15 +1502,12 @@ def build_event(
         body_section.append("（未抓到评论内容）")
 
     # ── fix 入口（仅 ⚠️ / ❌；✅ 不需要修复） ──
-    # The mycalfix:// URL goes on EKEvent.url — Calendar.app surfaces it as a
-    # clickable attachment icon, which is the single discoverable entry point.
-    # We deliberately do NOT repeat the URL as text in the body (the user
-    # called out the URL appearing multiple times as visual noise). The body
-    # keeps only the paste-ready degradation command (for users without
-    # MyCalFix.app), the origin_cwd-unknown advisory, and the fork-PR
-    # explanation. Fork PRs never get a launcher URL — the launcher's
-    # `git fetch origin <branch>` would fail on a head branch that lives in
-    # someone else's fork.
+    # Do not put mycalfix:// into EKEvent.url. iOS Calendar renders custom
+    # schemes in that field as a misleading "call" action. Keep the launcher
+    # URL in notes instead; macOS users can click/copy it, and iOS no longer
+    # shows a fake phone action. Fork PRs never get a launcher URL — the
+    # launcher's `git fetch origin <branch>` would fail on a head branch that
+    # lives in someone else's fork.
     fix_url: str | None = None
     fix_section: list[str] = []
     if verdict in ("⚠️", "❌"):
@@ -1532,6 +1529,12 @@ def build_event(
             if not origin_cwd:
                 fix_section.append("⚠️  origin_cwd 未知（本次走的 launchd 兜底路径，没有 hook 喂数据）。")
                 fix_section.append("    MyCalFix 触发时会弹目录选择器；下次本地 push 同 PR 会自动落 origin_cwd。")
+                fix_section.append("")
+            if fix_url:
+                fix_section.append("MyCalFix 链接（Mac 上点击或复制打开）：")
+                fix_section.append(fix_url)
+                fix_section.append("Mac 终端命令：")
+                fix_section.append(f"open {shlex.quote(fix_url)}")
                 fix_section.append("")
             fix_section.append("paste-ready 命令（无 MyCalFix.app 时降级用）：")
             fix_section.append(paste_cmd)
@@ -1565,7 +1568,7 @@ def build_event(
         on_date=now.date(),
         start_at=now,
         duration_min=15,
-        url=fix_url,
+        url=None,
     )
 
 

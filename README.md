@@ -30,8 +30,8 @@ Three independent-but-composable workflows turn your local machine + Apple Calen
 
 ### 2. One-click AI fix from the calendar event (`MyCalFix.app` + `mycalfix://`)
 
-- When a review verdict is **⚠️ (fix-then-merge)** or **❌ (not yet)**, the calendar event carries a `mycalfix://fix?...` URL.
-- Click it → `MyCalFix.app` pops a per-click **Yolo / Interactive / Cancel** dialog → on confirm it opens Terminal, fetches the branch into an isolated `git worktree`, and starts an interactive `claude` session pre-loaded with a fix prompt.
+- When a review verdict is **⚠️ (fix-then-merge)** or **❌ (not yet)**, the calendar event notes include a `mycalfix://fix?...` link and `open 'mycalfix://...'` command. It is intentionally not stored in the EventKit URL field, because iOS Calendar renders custom schemes there as a misleading "call" action.
+- Open that link/command on macOS → `MyCalFix.app` pops a per-click **Yolo / Interactive / Cancel** dialog → on confirm it opens Terminal, fetches the branch into an isolated `git worktree`, and starts an interactive `claude` session pre-loaded with a fix prompt.
 - The fix happens in a throwaway worktree (your main checkout's WIP is untouched); `claude` pushes the fix back to the same PR branch.
 - Hard guardrails in the prompt: abort if the diff is > 1000 lines, only touch what the review named, run the project's self-checks, no `--force` push. Yolo is an **explicit per-session choice**, never a silent default.
 
@@ -72,9 +72,9 @@ The blockquote is the human-visible signal; the HTML comment is the stable grep 
                                  ▼
                             ┌──────────────────────────┐  EventKit   ┌──────────────┐
                             │  build calendar event    │ ──────────▶ │ "PR 监控"     │
-                            │  (mycalfix:// fix URL)    │             │  calendar    │
+                            │  (MyCalFix link in notes) │             │  calendar    │
                             └──────────────────────────┘             └──────────────┘
-                                 │ click fix URL
+                                 │ macOS link / open command
                                  ▼
                             MyCalFix.app → Terminal → git worktree → claude (fix session)
 ```
@@ -140,6 +140,9 @@ tail -f logs/pr-watcher.log
 
 # how each mycalfix:// URL was parsed + launched
 tail -f ~/Library/Logs/MyCalFix/launch_fix.log
+
+# one-time cleanup for old PR events that still show as "call" on iOS Calendar
+.venv/bin/python scripts/migrate_pr_event_urls.py
 ```
 
 Concurrency cap, prompt customization, cancel-restart internals, and the security trade-offs of yolo mode are documented in the **PR 监控** and **PR review 修复入口** sections of [`AGENTS.md`](./AGENTS.md).
