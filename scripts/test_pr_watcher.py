@@ -3999,6 +3999,24 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
         self.assertIn(self.PR_HEAD_SHA_METADATA_MARKER, body)
         self.assertIn("不要再发新评论", body)
 
+    def test_pr_prompt_requires_boundary_condition_review_checklist(self):
+        """Keep the PR reviewer looking for recovery/timing edge cases."""
+        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "边界条件复核",
+            "状态机",
+            "断线重连",
+            "缓存失效后的数据库 fallback",
+            "`0` / `None` / 空字符串是否会覆盖已有可信值",
+            "粗粒度 `request_time`",
+            "Redis/缓存路径和 Mongo/历史路径",
+            "只有错误码无正文",
+            "offset 重放",
+            "误判成功或把坏值落盘",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, body)
+
     def test_fix_prompt_requires_coauthor_trailer(self):
         body = self.FIX_PROMPT_PATH.read_text(encoding="utf-8")
         self.assertIn(
