@@ -29,8 +29,8 @@
 
 ### 2. 从日历事件一键 AI 修复（`MyCalFix.app` + `mycalfix://`）
 
-- review 结论是 **⚠️（修正后可合并）** 或 **❌（暂不可合并）** 时，日历事件带一个 `mycalfix://fix?...` 链接。
-- 点它 → `MyCalFix.app` 弹一个 per-click 的 **Yolo / Interactive / Cancel** 对话框 → 确认后打开 Terminal，把分支 fetch 进一个隔离的 `git worktree`，起一个已灌好 fix prompt 的交互式 `claude` 会话。
+- review 结论是 **⚠️（修正后可合并）** 或 **❌（暂不可合并）** 时，日历事件描述里带一个 `mycalfix://fix?...` 链接和 `open 'mycalfix://...'` 命令。它不会写进 EventKit URL 字段，因为 iOS 日历会把自定义 scheme 误显示成"打电话"。
+- 在 macOS 上点链接或复制 `open` 命令 → `MyCalFix.app` 弹一个 per-click 的 **Yolo / Interactive / Cancel** 对话框 → 确认后打开 Terminal，把分支 fetch 进一个隔离的 `git worktree`，起一个已灌好 fix prompt 的交互式 `claude` 会话。
 - 修复跑在一次性 worktree 里（主 checkout 的 WIP 完全不受打扰）；`claude` 改完 push 回原 PR 分支。
 - prompt 里的硬约束：diff > 1000 行 abort、只改 review 点名处、跑项目自检、不 `--force` push。Yolo 是**显式的 per-session 选择**，永远不是静默默认。
 
@@ -71,9 +71,9 @@ blockquote 是给人看的可见信号；HTML 注释是给扫描器的稳定 gre
                                  ▼
                             ┌──────────────────────────┐  EventKit   ┌──────────────┐
                             │  build calendar event    │ ──────────▶ │ "PR 监控" 日历│
-                            │  (mycalfix:// 修复 URL)   │             └──────────────┘
+                            │  (notes 里的 MyCalFix 入口)│             └──────────────┘
                             └──────────────────────────┘
-                                 │ 点修复 URL
+                                 │ macOS 点链接 / open 命令
                                  ▼
                             MyCalFix.app → Terminal → git worktree → claude（修复会话）
 ```
@@ -139,6 +139,9 @@ tail -f logs/pr-watcher.log
 
 # 每个 mycalfix:// URL 被怎么解析 + 启动
 tail -f ~/Library/Logs/MyCalFix/launch_fix.log
+
+# 一次性清理旧 PR 事件，避免 iOS 日历继续显示"打电话"
+.venv/bin/python scripts/migrate_pr_event_urls.py
 ```
 
 并发上限、prompt 自定义、cancel-restart 内部机制、yolo 模式的安全取舍见 [`AGENTS.md`](./AGENTS.md) 的 **PR 监控（pr_watcher）** 与 **PR review 修复入口** 两节。

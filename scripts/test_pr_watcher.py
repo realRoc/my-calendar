@@ -2951,8 +2951,7 @@ class BuildFixUrlTests(unittest.TestCase):
 
 class BuildEventVerdictRoutingTests(unittest.TestCase):
     """build_event must:
-      - set event.url to a mycalfix:// URL on ⚠️ / ❌,
-      - leave event.url=None on ✅ / 🤖,
+      - never set event.url to a mycalfix:// URL,
       - always include a paste-ready degraded command on ⚠️ / ❌."""
 
     def _pr(self):
@@ -2978,7 +2977,7 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
             scratch_dir=Path("/tmp/scratch"),
         )
 
-    def test_verdict_blocker_sets_url_and_paste_cmd(self):
+    def test_verdict_blocker_keeps_launcher_out_of_event_url(self):
         body = "存在 blocker。\n\n结论：❌ 暂不可合并（存在 blocker）"
         from datetime import datetime
         event = pr_watcher.build_event(
@@ -2989,16 +2988,16 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
             now=datetime(2026, 5, 22, 15, 0, 0),
             origin_cwd="/Users/me/repo",
         )
-        self.assertIsNotNone(event.url)
-        self.assertTrue(event.url.startswith("mycalfix://fix?"))
-        self.assertIn("origin_cwd=%2FUsers%2Fme%2Frepo", event.url)
+        # iOS Calendar renders custom schemes in EKEvent.url as a misleading
+        # "call" action, so the launcher must live in notes instead.
+        self.assertIsNone(event.url)
+        self.assertIn("MyCalFix 链接", event.notes)
+        self.assertIn("mycalfix://fix?", event.notes)
+        self.assertIn("origin_cwd=%2FUsers%2Fme%2Frepo", event.notes)
+        self.assertIn("open 'mycalfix://fix?", event.notes)
         self.assertIn("paste-ready 命令", event.notes)
         # paste cmd should have actual cwd, not placeholder
         self.assertIn("/Users/me/repo", event.notes)
-        # The mycalfix:// URL must NOT appear inline in the notes — the
-        # attachment icon on EKEvent.url is the single entry point. Inlining
-        # the URL again was visual noise the user explicitly asked to remove.
-        self.assertNotIn("mycalfix://", event.notes)
         self.assertNotIn("🛠 修复入口", event.notes)
 
     def test_verdict_pass_clears_url(self):
@@ -3028,9 +3027,12 @@ class BuildEventVerdictRoutingTests(unittest.TestCase):
             now=datetime(2026, 5, 22, 15, 0, 0),
             origin_cwd=None,
         )
-        # URL still valid (launcher will folder-pick), just no origin_cwd param
-        self.assertIsNotNone(event.url)
-        self.assertNotIn("origin_cwd=", event.url)
+        # No EKEvent.url on iOS; notes still carry a valid launcher URL that
+        # will folder-pick because origin_cwd is absent.
+        self.assertIsNone(event.url)
+        self.assertIn("mycalfix://fix?", event.notes)
+        launcher_line = next(line for line in event.notes.splitlines() if line.startswith("mycalfix://fix?"))
+        self.assertNotIn("origin_cwd=", launcher_line)
         self.assertIn("<填入本地 repo 路径>", event.notes)
         self.assertIn("origin_cwd 未知", event.notes)
 
@@ -3410,6 +3412,27 @@ class ForkPRTests(unittest.TestCase):
         # paste-ready cmd would also fail; must NOT be present for fork PRs.
         self.assertNotIn("paste-ready", event.notes)
         self.assertNotIn("mycalfix://", event.notes)
+
+
+class MigratePrEventUrlTests(unittest.TestCase):
+    def test_notes_with_mycalfix_link_appends_link_and_open_command(self):
+        import migrate_pr_event_urls
+
+        url = "mycalfix://fix?repo=realRoc%2Fmy-calendar&branch=main"
+        notes = migrate_pr_event_urls._notes_with_mycalfix_link("body", url)
+
+        self.assertIn("body", notes)
+        self.assertIn("MyCalFix 链接", notes)
+        self.assertIn(url, notes)
+        self.assertIn("open 'mycalfix://fix?", notes)
+
+    def test_notes_with_mycalfix_link_does_not_duplicate_existing_url(self):
+        import migrate_pr_event_urls
+
+        url = "mycalfix://fix?repo=realRoc%2Fmy-calendar&branch=main"
+        notes = migrate_pr_event_urls._notes_with_mycalfix_link(f"already {url}", url)
+
+        self.assertEqual(notes, f"already {url}")
 
 
 class CodexCapConfigTests(unittest.TestCase):

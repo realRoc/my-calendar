@@ -481,9 +481,10 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 ```
 PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
-  ├─ EKEvent.url = mycalfix://fix?repo=...&branch=...&comment=...&pr=...&origin_cwd=...
+  ├─ 描述里贴 MyCalFix 链接：mycalfix://fix?repo=...&branch=...&comment=...&pr=...&origin_cwd=...
+  ├─ 描述里贴 Mac 终端命令：open 'mycalfix://...'
   └─ 描述里同步贴一段 paste-ready bash 命令（无 .app 时降级）
-       ↓ 点链接
+       ↓ 在 macOS 上点链接或复制 open 命令
   MyCalFix.app（on open location）
        ↓ 调
   scripts/launch_fix.sh '<url>'
@@ -521,13 +522,13 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
 
 ### 触发条件（pr_watcher 里）
 
-`build_event` 根据 codex verdict 决定要不要塞 URL：
+`build_event` 根据 codex verdict 决定要不要提供 MyCalFix 入口。注意：**不要**把 `mycalfix://` 放进 `EKEvent.url`；iOS Calendar 会把自定义 scheme 渲染成误导性的"打电话"动作。MyCalFix 链接只放在事件描述里。
 
-| verdict | EKEvent.url | 描述里贴 paste-ready 命令？ |
+| verdict | EKEvent.url | 描述里贴 MyCalFix 链接 / paste-ready 命令？ |
 |---|---|---|
 | ✅ 可以合并 | None | 否（不需要修复） |
-| ⚠️ 修正后可合并 | mycalfix://... | 是 |
-| ❌ 暂不可合并 | mycalfix://... | 是 |
+| ⚠️ 修正后可合并 | None | 是 |
+| ❌ 暂不可合并 | None | 是 |
 | 🤖 fallback | None | 否（解析不出 verdict，可能 codex 自己跑挂了） |
 
 ### 关键文件
@@ -536,6 +537,7 @@ PR 监控日历事件（verdict 是 ⚠️ 或 ❌）
 |---|---|
 | `scripts/fix_prompt.md` | 修复 prompt 模板（含 `{pr_url}` / `{comment_url}` / `{branch}` / `{comment_body_path}` 占位）。第一步优先读 `{comment_body_path}` 指向的本地缓存文件（pr_watcher 预取，无网络），缓存缺失再退到 `gh api` 兜底。硬约束包括：diff >1000 行 abort、只改 review 点名的地方、跑项目自检、commit + push 同分支不要 --force |
 | `scripts/launch_fix.sh` | URL handler 本体（repo 里的"源"；install 时被复制进 .app）。每次点击弹 osascript 对话框选 **Yolo / Interactive / Cancel**，默认按钮 Interactive。`MYCALFIX_MODE=yolo\|interactive\|cancel` env var 可跳过对话框（测试 / 脚本化场景用）。所有 URL 都会落到 `~/Library/Logs/MyCalFix/launch_fix.log` 方便排错 |
+| `scripts/migrate_pr_event_urls.py` | 一次性迁移旧 PR 日历事件：把遗留在 `EKEvent.url` 里的 `mycalfix://` 清空，并补到事件描述里，避免 iOS 日历把自定义 scheme 误显示成"打电话" |
 | `app/MyCalFix/main.applescript` | AppleScript 源（自包含；运行时用 `path to me` 找 `Contents/Resources/launch_fix.sh`） |
 | `scripts/install_app.sh` | osacompile + plutil 设 `CFBundleURLTypes` + `LSUIElement=true`（无 Dock 图标）+ 把 `launch_fix.sh` / `parse_fix_url.py` / `fix_prompt.md` 复制进 `Contents/Resources/`（少一个就 abort）+ 安装时 smoke-test bundled parser + `xattr -dr com.apple.quarantine` + `lsregister -f` + `tccutil reset All <bundle-id>`（清旧 TCC 决定） |
 | `~/Applications/MyCalFix.app` | 部署后的 .app；`com.wuyupeng.mycalfix` bundle id，注册 `mycalfix:` scheme；`Contents/Resources/` 内含 bundled `launch_fix.sh` + `parse_fix_url.py` + `fix_prompt.md` |
@@ -563,7 +565,7 @@ open 'mycalfix://fix?repo=foo%2Fbar&branch=main&comment=https%3A%2F%2Fgithub.com
 
 launchd 兜底路径触发的评论（比如安装后新 PR 的首次漏网 review，或网页/异机/bot 路径产生新 commit）没经过 pre-push hook，`pr_state.json` 里可能没有 `origin_cwd`。这种事件：
 
-- URL 还是有效的，只是少了 `origin_cwd` 参数
+- 描述里的 MyCalFix 链接还是有效的，只是少了 `origin_cwd` 参数
 - launcher 会弹一个 osascript 文件夹选择器让用户手动定位
 - 描述里贴的 paste-ready 命令会显示 `<填入本地 repo 路径>` 占位 + 一段"⚠️ origin_cwd 未知"提示
 - 一旦用户本地 push 同 PR 一次，pre-push hook 会把 `origin_cwd` 回写到 state + 上一次 review 的 `.meta.json` 里
@@ -571,6 +573,7 @@ launchd 兜底路径触发的评论（比如安装后新 PR 的首次漏网 revi
 ### 调试
 
 - `tail -f ~/Library/Logs/MyCalFix/launch_fix.log` 看每次 URL 被怎么解析的，最末尾会看到 `launching via .command: /tmp/mycalfix.xxxx.command`
+- 旧事件在 iOS 日历仍显示"打电话"：从有日历权限的 Terminal 跑 `.venv/bin/python scripts/migrate_pr_event_urls.py`，清掉遗留的 `EKEvent.url`
 - 改了 `launch_fix.sh` / `fix_prompt.md` / `main.applescript` **都**必须 `bash scripts/install_app.sh` 重装——三个文件都被复制进 bundle，repo 里的源只是模板
 - 若看到 EPERM "Operation not permitted (126)"：bundled launcher 路径有问题或 .app 没装好；先 `ls ~/Applications/MyCalFix.app/Contents/Resources/` 确认 `launch_fix.sh` + `fix_prompt.md` 都在
 - Gatekeeper 第一次警告：installer 已经做了 `xattr -dr com.apple.quarantine`，理论上不会再弹；如果还弹，**右键 → 打开**，之后永久放行
@@ -583,7 +586,7 @@ launchd 兜底路径触发的评论（比如安装后新 PR 的首次漏网 revi
 `scripts/test_pr_watcher.py` 覆盖：
 
 - `_build_fix_url`：有 origin_cwd / 无 origin_cwd / 缺 head_branch / 缺 comment_url 四种情形
-- `build_event`：verdict 是 ❌/⚠️ 时 URL 设置 + paste-ready 命令含 origin_cwd；verdict 是 ✅ 时 URL=None 且无修复入口区块；origin_cwd 缺失时 paste 命令带 `<填入本地 repo 路径>` 占位
+- `build_event`：verdict 是 ❌/⚠️ 时 `EKEvent.url` 仍为 None（避免 iOS Calendar 误显示"打电话"），描述里含 MyCalFix 链接 / `open 'mycalfix://...'` / paste-ready 命令；verdict 是 ✅ 时无修复入口区块；origin_cwd 缺失时 paste 命令带 `<填入本地 repo 路径>` 占位
 - `ParseFixUrlTests`：URL 解析器拒绝 wrong scheme / wrong action / non-github pr / repo mismatch / 控制字符等
 - `CacheCommentBodyTests`：option E 契约——`cache_comment_body()` 把 codex review body 写到 `~/.cache/my-calendar/fix-comments/<comment_id>.md`，URL 缺 `#issuecomment-<id>` fragment / body 为空 / URL 为空都返回 None
 - `FixPromptUsesLocalCommentBodyTests`：fix_prompt.md 必须含 `{comment_body_path}` 占位符，且本地路径段要排在 `gh api` 兜底段之前（确保 claude 优先读本地），同时仍保留 gh api 兜底（老日历事件无缓存时仍能跑）
