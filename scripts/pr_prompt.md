@@ -5,10 +5,12 @@
 
 请按以下步骤进行：
 
-1. 用 `gh pr view {pr_link} --json title,body,additions,deletions,changedFiles,files,baseRefName,headRefName,mergeable,mergeStateStatus` 了解 PR 的基本信息、涉及文件，并**记下 `mergeable` 和 `mergeStateStatus` 的值**（后面 Blocker 判定要用）。
+1. 用 `gh pr view {pr_link} --json title,body,additions,deletions,changedFiles,files,baseRefName,headRefName,mergeable,mergeStateStatus,commits` 了解 PR 的基本信息、涉及文件、提交列表，并**记下 `baseRefName`、`headRefName`、`mergeable`、`mergeStateStatus` 和 commits 列表**（后面 Blocker 判定要用）。
 2. 用 `gh pr diff {pr_link}` 拉取完整 diff。如果 diff 过大（>3000 行），优先聚焦在关键改动文件上，并明确说明你抽样了哪些部分。
 3. 评审重点：
    - **合并状态（强制检查）**：如果 step 1 拿到的 `mergeable == "CONFLICTING"` 或 `mergeStateStatus == "DIRTY"`，**必须**作为一条 blocker（"与 base 分支 `<baseRefName>` 存在合并冲突，需先 rebase / merge 解决"），并把最终结论强制改成 `⚠️ 修正后可合并`。`mergeStateStatus == "UNKNOWN"` 时不阻断，但在评论里提一句 GitHub 还没算完合并状态、建议人工复核。
+   - **分支来源（强制检查）**：确认当前 PR 分支是否是从目标 base 分支（通常是 `main` / 仓库默认分支）为基础开发，而不是叠在 `dev`、其他 feature 分支或旧任务分支上。优先用 step 1 的 PR commit 列表和 `gh pr diff` 暴露的文件范围判断；必要时用 `gh api repos/<owner>/<repo>/compare/<baseRefName>...<headRefName>` 或 `git merge-base` 辅助判断。若发现 PR 混入了不属于本任务的历史提交、依赖另一个未合并 feature 分支、或明显不是从 `<baseRefName>` 分出，**必须**作为 blocker，要求作者从最新 `<baseRefName>` 重新分支 / rebase 并拆干净。
+   - **改动范围（强制检查）**：结合 PR 标题/正文、changed files 和 diff，检查当前分支是否改动到了理论上不需要本任务触碰的文件（例如无关文档、配置、生成产物、其他功能模块、历史数据、锁文件或 prompt/脚本之外的文件）。不要把“文件能编译”当成足够理由；如果改动无法从本 PR 目标解释、看起来是上一个任务残留、顺手重构、格式化噪音或跨 feature 污染，**必须**作为 blocker，要求移出本 PR 或解释必要性。只有在 PR 目标明确需要这些文件时才不阻断。
    - **Blocker / 必须修正**：可能导致生产事故、数据丢失、安全漏洞、API 破坏性变更、明显的逻辑错误、未处理的失败路径、并发/竞态问题；以及代码正确性 bug、错误的边界条件、误用 API、错误的错误处理、缺失的关键测试。
    - **边界条件复核（强制思考，按需写入评论）**：对本 PR 改到的状态机、恢复/重试/断线重连、缓存失效后的数据库 fallback、计时/计费/统计落盘、错误码/终态映射、并发更新和幂等路径，主动找“刷新/重连后才出现”的缝隙。尤其检查：`0` / `None` / 空字符串是否会覆盖已有可信值；是否用粗粒度 `request_time` 推导了只属于某一阶段的时长；Redis/缓存路径和 Mongo/历史路径对终态、错误码、answer fallback 的语义是否一致；接口失败、无首 token、只有思考无正文、只有错误码无正文、缓存过期、offset 重放、重复提交、旧响应晚到等场景是否会显示空白、误判成功或把坏值落盘。发现真实风险时按严重程度写进 Blocker / 必须修正章节或建议章节；没有发现就不要单独写空章节。
    - **成本与资源影响（按需评估）**：判断这次改动是否会让后端成本 / 机器资源出现可见变化。**不要套固定模板**——根据 PR 实际触及的领域去看相关维度：改了 SQL / ORM 就看查询代价、索引、N+1；加了定时任务 / 后台 worker 就看频率与并发；引入第三方服务（LLM、邮件、地理、支付等）就看调用量与计费；新增常驻状态（缓存、in-memory index、长连接）就看内存与连接资源；纯前端 / 文档 / 配置类改动很可能完全不涉及，那就跳过这一节。**只有发现实际风险或非零成本时才写这一节**，不要为了凑维度而硬写"不涉及"。
