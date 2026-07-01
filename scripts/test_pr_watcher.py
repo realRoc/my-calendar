@@ -4040,6 +4040,35 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, body)
 
+    def test_pr_prompt_requires_branch_source_blocker_check(self):
+        """Reviewer must catch PRs stacked on the wrong branch."""
+        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "commits 列表",
+            "分支来源（强制检查）",
+            "从目标 base 分支",
+            "叠在 `dev`、其他 feature 分支或旧任务分支上",
+            "不属于本任务的历史提交",
+            "不是从 `<baseRefName>` 分出",
+            "必须**作为 blocker",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, body)
+
+    def test_pr_prompt_requires_change_scope_blocker_check(self):
+        """Reviewer must catch unrelated file changes in the PR."""
+        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "改动范围（强制检查）",
+            "理论上不需要本任务触碰的文件",
+            "无关文档、配置、生成产物、其他功能模块、历史数据、锁文件",
+            "上一个任务残留",
+            "顺手重构、格式化噪音或跨 feature 污染",
+            "要求移出本 PR 或解释必要性",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, body)
+
     def test_fix_prompt_requires_coauthor_trailer(self):
         body = self.FIX_PROMPT_PATH.read_text(encoding="utf-8")
         self.assertIn(
