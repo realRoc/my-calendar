@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import re
@@ -47,6 +48,7 @@ MEDS_PATH = HEALTH_DIR / "medications.md"
 LOG_DIR = HEALTH_DIR / "log"
 STATE_PATH = HERE / "health_state.json"
 PLAN_CACHE_PATH = HERE / "health_plan_cache.json"
+LOCK_PATH = HERE / "locks" / "health.lock"
 
 HEALTH_CALENDAR_NAME = "健康提醒"
 
@@ -274,10 +276,10 @@ def build_nags(now: datetime, today_log: dict[str, Any], state: dict[str, dict],
         if nag_key("weight") in state:
             to_remove.append(nag_key("weight"))
     elif now.time() >= NAG_WEIGHT_AFTER and nag_key("weight") not in state:
-        days = "还" if last_weight is None else f"已经 {(d - last_weight).days} 天"
+        days = "一直还" if last_weight is None else f"已经 {(d - last_weight).days} 天"
         to_create.append(nag_event(
             "weight", "⚖️ 该称体重了",
-            f"体重{days}没记录了。明早起床空腹称一下，一句话告诉 Claude。"))
+            f"体重{days}没记录。明早起床空腹称一下，一句话告诉 Claude。"))
 
     return to_create, to_remove
 
@@ -317,10 +319,32 @@ def prune_old(state: dict[str, dict], cache: dict[str, str], today: date) -> Non
 # ─── main ──────────────────────────────────────────────────────────────────────
 
 
+def _try_acquire_lock():
+    """Single-writer guard: the launchd tick and a record-health-triggered manual
+    run may overlap; concurrent upserts would race health_state.json and can leave
+    a duplicate calendar event whose id is lost (never cleanable). Loser exits —
+    the next tick reconciles anyway. Returns an open fd holder or None."""
+    LOCK_PATH.parent.mkdir(exist_ok=True)
+    f = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Health calendar tick")
     parser.add_argument("--dry-run", action="store_true", help="plan only, no EventKit writes")
     args = parser.parse_args()
+
+    lock = None
+    if not args.dry_run:
+        lock = _try_acquire_lock()
+        if lock is None:
+            print("[skip] another health_check run holds the lock; next tick reconciles")
+            return 0
 
     now = datetime.now()
     today = now.date()
