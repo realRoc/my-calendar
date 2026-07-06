@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__INSTALL_DIR__/.venv/bin/python</string>
+        <string>__INSTALL_DIR__/scripts/health_check.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__INSTALL_DIR__</string>
+
+    <!-- 30-min tick. Events carry relative alarms and sync to iCloud, so the
+         iPhone still notifies while the Mac sleeps; each tick also pre-creates
+         tomorrow's events so morning alarms survive overnight sleep. The
+         content-hash cache inside health_check.py makes no-change ticks free
+         (no EventKit writes). launchd does not wake the Mac for StartInterval. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Fire once at login so missed ticks reconcile on boot. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- /tmp/ only — Python redirects its own stdout to logs/health.log via
+         MY_CAL_LOG_FILE below. Same EX_CONFIG=78 defense as the other jobs. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/__LABEL__.boot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/__LABEL__.boot.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>zh_CN.UTF-8</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>MY_CAL_LOG_FILE</key>
+        <string>__INSTALL_DIR__/logs/health.log</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>

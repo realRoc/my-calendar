@@ -37,6 +37,8 @@
 | "新增/加一个节日"、"X 是个节日，记一下" | `add-holiday` |
 | "新增一个家人/朋友档案"、"记一下 X 的偏好" | `add-person` |
 | "记一下今天送了 X 给 Y"、"X 说那个礼物 Y/不喜欢"、"补一下反馈" | `record-history` |
+| "记一下今天体重 X"、"今天游了泳"、"膝盖/手腕不舒服"、发体态照说"记录一下" | `record-health` |
+| "健康周报"、"减脂进展怎么样"、"复盘/调整一下训练计划" | `health-review` |
 
 skill 文件位置：`.claude/skills/<skill-name>/SKILL.md`
 
@@ -57,10 +59,21 @@ my-calendar/
 ├── people/                         # 人物档案
 ├── history/                        # 过往行为与反馈
 │   └── YYYY/                       # 按年分目录
+├── health/                         # 个人健康模块（除 README 外全部 gitignore）
+│   ├── profile.md                  # 静态档案：身高/生日/伤病/偏好/作息约束
+│   ├── medications.md              # 用药登记（active 条目生成每日用药提醒事件）
+│   ├── goals/                      # 目标（status: active|paused|done|abandoned）
+│   ├── plans/current.md            # 宏观执行计划（health-review 迭代）
+│   ├── plans/week.md               # 一周逐日具体建议（health_check.py 数据源）
+│   ├── log/YYYY/                   # 每日记录，一天一个文件
+│   └── photos/YYYY/                # 体态/餐食照（导入即压缩 ≤1600px JPEG）
 ├── scripts/
 │   ├── holiday_resolver.py         # 解析阴历/可变日期、列出未来 N 天节日
 │   ├── calendar_sync.py            # EventKit 写入苹果日历（支持多日历名）
 │   ├── daily_check.py              # 节日入口：解析+查历史+写日历（launchd 每天 06:00）
+│   ├── health_check.py             # 健康入口：读 week.md/medications/log → 写"健康提醒"日历（launchd 每 30 min）
+│   ├── health_state.json           # "健康提醒" 日历事件 ID 索引（gitignore）
+│   ├── health_plan_cache.json      # 事件内容 hash 缓存，无变化 tick 不写 EventKit（gitignore）
 │   ├── state.json                  # 节日已创建事件 ID 索引
 │   ├── pr_watcher.py               # PR 监控入口：扫 open PR → codex review → 写日历（launchd 每 10 min）
 │   ├── pr_prompt.md                # codex review 用的 prompt 模板（含 {pr_link} 占位）
@@ -75,6 +88,7 @@ my-calendar/
 ├── logs/                           # launchd stdout/stderr（launch_fix.log 在 ~/Library/Logs/MyCalFix/）
 ├── com.YOURNAME.calendar.daily.plist        # 节日任务（install_launchd.sh 渲染）
 ├── com.YOURNAME.calendar.pr-watcher.plist   # PR 监控任务（同上）
+├── com.YOURNAME.calendar.health.plist       # 健康提醒任务（同上）
 └── .venv/                          # Python 依赖（pyobjc + lunardate）
 ```
 
@@ -249,6 +263,74 @@ ls history/*/*__mothers-day__mom.md
 - 强制重建某事件：删 `scripts/state.json` 里对应条目，再跑 daily_check
 - 临时禁用某节日：在它的 frontmatter 加 `disabled: true`
 - 首次运行会弹"日历访问"权限对话框；如果误点拒绝，去**系统设置 → 隐私与安全性 → 日历**手动勾选 Terminal/Python
+
+---
+
+## Health 模块（个人健康记录 + AI 教练 + 日历提醒）
+
+第四条功能线：把体重/饮食/体态照/运动/伤痛/睡眠/用药落成本地文件当"记忆"，Claude 会话基于这些记忆给建议并按周复盘；`scripts/health_check.py`（launchd 每 30 分钟）把**具体建议**（吃什么、练什么、几点吃药）写成带闹钟的定时事件到独立日历 **"健康提醒"**。schema 与目录约定见 `health/README.md`（唯一入库的文件）。
+
+### 数据分层（五层，各司其职）
+
+| 层 | 文件 | 变更频率 | 谁改 |
+|---|---|---|---|
+| 档案 | `health/profile.md` + `health/medications.md` | 极低（新伤病/确诊/用药变更/作息变化） | `record-health` |
+| 目标 | `health/goals/<goal-id>.md` | 低（只有目标值/期限/status 变了才改） | `health-review` |
+| 计划 | `health/plans/current.md`（宏观） | 中（复盘驱动，version 递增，大改先归档 `plans/archive/`） | `health-review` |
+| 周计划 | `health/plans/week.md`（逐日具体建议；health_check 数据源） | 高（每周日整体重写；当日 meal2 随第一顿记录动态改） | `health-review` / `record-health` |
+| 记录 | `health/log/YYYY/YYYY-MM-DD.md` + `health/photos/YYYY/` | 高（日常随口记，一天一文件 upsert） | `record-health` |
+
+单向依赖：记录 → 复盘 → 计划 → （偶尔）目标。log 是 append-heavy 的事实层，永远不被"改写历史"。
+
+### 日历提醒闭环（health_check.py）
+
+- launchd `com.<user>.calendar.health` 每 30 分钟 tick + RunAtLoad；每次 upsert **今天 + 明天**的事件（提前建事件 + 相对闹钟 → iCloud 同步后 Mac 睡着 iPhone 也会响）
+- 每日事件：💊 用药（medications.md 各 active 条目的 `time`，标题不含药名）、🍳 第一顿建议 10:00、🥗 第二顿建议 17:00、🚶/🏊 运动（工作日 09:15 / 周末 15:00，可被 week.md `workout_time` 覆盖）
+- **催记录 nag**：12:30 没记第一顿、19:30 没记第二顿、体重 ≥3 天没记 → 建即时提醒事件；record-health 落盘后下一 tick 自动 `remove_event` 清掉
+- **当日联动**：用户记第一顿 → record-health 生成第二顿针对性建议 → 改 week.md 当天 `meal2` → 跑 `health_check.py` → 17:00 事件描述更新
+- 幂等与降噪：UID `my-calendar:health:<date>:<slot>`；state `scripts/health_state.json`；内容 hash 缓存 `scripts/health_plan_cache.json` 让无变化 tick 零 EventKit 写入；state/cache 30 天滚动清理（日历里的历史事件保留，本身就是记录）
+- week.md 缺日期/缺字段 → 内置通用建议兜底，不开天窗
+- 饮食建议**只写具体食物 + 手掌法份量，不写热量数字**（用户明确要求）
+
+### 隐私边界（**红线**）
+
+- `health/*` 全部 gitignore（只留 `health/README.md`）——repo 是 public 的，体态照/体重/伤病/用药永不入 git
+- 照片导入即压缩（`sips` ≤1600px JPEG）存 `health/photos/YYYY/YYYY-MM-DD__<slug>.jpg`，原图不复制进 repo
+- 用药日历事件标题只写"💊 用药提醒"，药名只出现在事件描述里（锁屏通知不暴露）
+- 任何会被 commit 的文件（AGENTS.md、skill、脚本、测试）里不得出现具体健康数值或照片
+
+### 趋势查询（无数据库）
+
+```bash
+grep -H "weight_kg:" health/log/*/*.md   # 文件名排序即时间序
+ls health/log/2026/ | tail -14           # 最近两周的记录
+```
+
+### 调试
+
+- `tail -f logs/health.log` 看每次 tick
+- `.venv/bin/python scripts/health_check.py --dry-run` 看本 tick 会写什么
+- 强制重建某事件：删 `scripts/health_state.json` + `health_plan_cache.json` 里对应 key 再跑一次
+- 单测：`scripts/test_health_check.py`（纯逻辑：week.md 解析、事件构建、nag 判定、hash 缓存、state 清理）
+
+### 未来扩展（设计好但暂未实现）
+
+- 多目标并行（增肌期/恢复期）：goals/ 下多个 active 文件，plan frontmatter 的 `goal:` 指向主目标
+- MISSING.md 复用：长期漏记（如连续 7 天无 log）升级到会话开始提醒通道
+
+---
+
+## 模块化架构约定（新增模块时照此办理）
+
+my-calendar = 多个互相独立的模块（节日 / PR 监控 / health / 未来更多），共享同一套基础设施。新模块按下面五件套接入，**不要**发明新模式：
+
+1. **数据**：根目录一个模块目录，markdown + YAML frontmatter，kebab-case id，按 `YYYY/` 分年；schema 写在该目录的 `README.md`
+2. **隐私**：个人数据 gitignore（`<module>/*` + `!<module>/README.md`），schema 文档入库
+3. **交互**：读写走 `.claude/skills/<skill>/SKILL.md`（AGENTS.md 触发表加一行），不直接手写文件
+4. **自动化**（可选）：`scripts/<module>_check.py` 挂 launchd，写**独立日历**（复用 `calendar_sync.upsert_events(calendar_name=...)`），确定性 UID `my-calendar:<module>:...`，state 存独立的 `scripts/<module>_state.json`
+5. **主动提醒**（可选）：待办类信息写进 MISSING.md 复用"会话开始检查"通道
+
+隔离原则：模块间不共享 state 文件、不共享日历、gitignore 各自独立成块；共享的只有 `calendar_sync.py` / `log_setup.py` 这类基础设施和文件命名/frontmatter 风格。
 
 ---
 

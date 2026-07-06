@@ -9,6 +9,8 @@ __pycache__/
 scripts/state.json
 scripts/pr_state.json
 scripts/pr_calendar_state.json
+scripts/health_state.json
+scripts/health_plan_cache.json
 
 # PR-watcher codex runs (raw JSONL transcripts may contain private diffs)
 scripts/pr_logs/
@@ -37,11 +39,18 @@ history/*
 holidays/custom/*
 !holidays/custom/README.md
 
+# Health data is the most sensitive of all — body photos, weight, injuries.
+# Only the schema doc is tracked; everything else stays on this machine.
+health/*
+!health/README.md
+
 # User-specific generated plists (use install_launchd.sh to regenerate)
 com.*.calendar.daily.plist
 com.*.calendar.pr-watcher.plist
+com.*.calendar.health.plist
 !com.calendar.daily.plist.template
 !com.calendar.pr-watcher.plist.template
+!com.calendar.health.plist.template
 
 # OS / editor
 .DS_Store
