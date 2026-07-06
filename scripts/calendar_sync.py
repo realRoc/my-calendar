@@ -45,6 +45,9 @@ class ReminderEvent:
     start_at: datetime | None = None  # if set, event is timed (not all-day) and starts at this instant
     duration_min: int = 15            # only used when start_at is set
     url: str | None = None            # EKEvent.url — Calendar.app surfaces this as a clickable link
+    alarm_offset_min: int | None = None  # if set, alarm fires at start+offset (0 = at event time)
+                                         # instead of the legacy ~10s-after-creation alarm; lets
+                                         # events be created ahead of time without an instant ping
 
 
 # ─── permission ────────────────────────────────────────────────────────────────
@@ -194,9 +197,13 @@ def upsert_events(
             ek_event.setAllDay_(True)
 
         if is_new:
-            # Pop a system notification ~10s after creation. Only on initial create —
-            # re-syncs of an existing event don't re-fire the alarm.
-            ek_event.addAlarm_(_make_immediate_alarm())
+            # Only on initial create — re-syncs of an existing event don't re-add alarms.
+            if e.alarm_offset_min is not None:
+                # Notify relative to the event's start (0 = exactly at event time).
+                ek_event.addAlarm_(EKAlarm.alarmWithRelativeOffset_(e.alarm_offset_min * 60))
+            else:
+                # Legacy behavior: pop a system notification ~10s after creation.
+                ek_event.addAlarm_(_make_immediate_alarm())
 
         ok, err = store.saveEvent_span_error_(ek_event, EKSpanThisEvent, None)
         if not ok:
