@@ -485,6 +485,7 @@ git -C <repo-path> config core.hooksPath .git/hooks
 | key | 默认 | 说明 |
 |---|---|---|
 | `codex_concurrency_cap` | `10` | 全机器同时跑 codex 的最大数量。pr_watcher 用 `locks/codex-slot-{1..N}.lock` 实现 N 个 slot 的信号量；想给小机器/紧预算降并发就把这个数调小（如 `4`）。**调大也不会被拦**，但 codex 同时执行数、CPU/网络和 LLM 调用成本会随之线性上升——自行评估机器和预算能承受。**严格 JSON integer** 校验：`2.5` / `"4"` / `true` / 负数 / 0 都会落回默认 10 + 一行 stderr 警告，不会崩 |
+| `codex_exec` | `"inherit"` | PR 自动 review 调 `codex exec` 时默认不传 `-m` / `-c` 模型参数，直接继承 Codex CLI 的 `$CODEX_HOME/config.toml`（也就是手动 `codex exec` 的默认模型/推理/速度配置）。如果 Codex Desktop 当前选择尚未同步到 CLI config，可在这里显式镜像：`{"model":"gpt-5.6-sol","model_reasoning_effort":"medium","service_tier":"priority"}`。除 `model` 会转成 `-m` 外，其他 scalar key 会按 `-c key=value` 透传给 Codex CLI；复杂对象会被忽略并 warning |
 
 > ⚠️ 已移除：`mycalfix_interactive_claude`。MyCalFix 现在用 osascript 对话框 per-click 选 mode，不再读 config 文件。写在 config.json 里也会被忽略。想跳过对话框（脚本化用途 / sticky preference）请 `export MYCALFIX_MODE=yolo|interactive|cancel` 给 launcher 进程。
 
@@ -492,7 +493,12 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 ```json
 {
-  "codex_concurrency_cap": 4
+  "codex_concurrency_cap": 4,
+  "codex_exec": {
+    "model": "gpt-5.6-sol",
+    "model_reasoning_effort": "medium",
+    "service_tier": "priority"
+  }
 }
 ```
 

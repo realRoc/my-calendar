@@ -94,13 +94,25 @@ CODEX_SLOT_TIMEOUT_SEC = 30 * 60              # max time to wait for a slot befo
 CANCEL_POLL_SEC = 0.5                         # how often the leader checks for the cancel marker
 CANCEL_WAIT_LOCK_TIMEOUT_SEC = 90.0           # how long a --force waits for the prior leader to release the lock after signalling cancel
 
-# User-configurable: cap codex executions in flight across all PRs. Override
-# via ~/.config/my-calendar/config.json, e.g. {"codex_concurrency_cap": 4} to
-# match a smaller machine or tighter budget. Invalid values fall back to 10
-# with a stderr warning. Read once at module import — restart launchd agents
-# (or rerun manually) to pick up a config change.
+# User-configurable knobs for the PR watcher live in
+# ~/.config/my-calendar/config.json. Values are read once at module import;
+# restart launchd agents (or rerun manually) to pick up config changes.
 USER_CONFIG_PATH = Path.home() / ".config" / "my-calendar" / "config.json"
 DEFAULT_CODEX_CONCURRENCY_CAP = 10
+
+
+def _read_user_config(config_path: Path = USER_CONFIG_PATH) -> dict:
+    if not config_path.exists():
+        return {}
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[pr-watcher] warn: cannot read {config_path}: {e}; using defaults", file=sys.stderr)
+        return {}
+    if not isinstance(cfg, dict):
+        print(f"[pr-watcher] warn: {config_path} root is not a JSON object; using defaults", file=sys.stderr)
+        return {}
+    return cfg
 
 
 def _read_codex_cap(config_path: Path = USER_CONFIG_PATH, default: int = DEFAULT_CODEX_CONCURRENCY_CAP) -> int:
@@ -116,13 +128,7 @@ def _read_codex_cap(config_path: Path = USER_CONFIG_PATH, default: int = DEFAULT
     `bool`). `2.5`, `"4"`, and `true` are all rejected — silently coercing
     them would let a typo'd config change codex concurrency / cost without
     the user noticing."""
-    if not config_path.exists():
-        return default
-    try:
-        cfg = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"[pr-watcher] warn: cannot read {config_path}: {e}; using cap={default}", file=sys.stderr)
-        return default
+    cfg = _read_user_config(config_path)
     if not isinstance(cfg, dict) or "codex_concurrency_cap" not in cfg:
         return default
     raw = cfg["codex_concurrency_cap"]
@@ -145,7 +151,70 @@ def _read_codex_cap(config_path: Path = USER_CONFIG_PATH, default: int = DEFAULT
     return raw
 
 
+def _toml_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def _read_codex_exec_config(config_path: Path = USER_CONFIG_PATH) -> list[str]:
+    """Build optional `codex exec` model/config args from user config.
+
+    By default the watcher passes no model overrides, so `codex exec` inherits
+    the normal Codex config (`$CODEX_HOME/config.toml`) exactly like a manual
+    CLI invocation. If a client-side picker is not synced into config.toml,
+    set `codex_exec` in ~/.config/my-calendar/config.json to pin the detached
+    reviewer to the same model/effort/speed selection.
+    """
+    cfg = _read_user_config(config_path)
+    raw = cfg.get("codex_exec")
+    if raw in (None, "inherit"):
+        return []
+    if not isinstance(raw, dict):
+        print(
+            f"[pr-watcher] warn: codex_exec={raw!r} in {config_path} "
+            "is not an object or \"inherit\"; using Codex defaults",
+            file=sys.stderr,
+        )
+        return []
+
+    args: list[str] = []
+    model = raw.get("model")
+    if model is not None:
+        if isinstance(model, str) and model.strip():
+            args.extend(["-m", model.strip()])
+        else:
+            print(
+                f"[pr-watcher] warn: codex_exec.model={model!r} in {config_path} "
+                "is not a non-empty string; ignoring",
+                file=sys.stderr,
+            )
+
+    for key in sorted(k for k in raw.keys() if k != "model"):
+        value = raw[key]
+        if isinstance(value, bool):
+            toml_value = "true" if value else "false"
+        elif type(value) in (int, float):
+            toml_value = str(value)
+        elif isinstance(value, str):
+            if not value:
+                print(
+                    f"[pr-watcher] warn: codex_exec.{key} is empty in {config_path}; ignoring",
+                    file=sys.stderr,
+                )
+                continue
+            toml_value = _toml_string(value)
+        else:
+            print(
+                f"[pr-watcher] warn: codex_exec.{key}={value!r} in {config_path} "
+                "is not a scalar; ignoring",
+                file=sys.stderr,
+            )
+            continue
+        args.extend(["-c", f"{key}={toml_value}"])
+    return args
+
+
 CODEX_CONCURRENCY_CAP = _read_codex_cap()    # max codex executions in flight across all PRs
+CODEX_EXEC_CONFIG_ARGS = _read_codex_exec_config()
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
 NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
@@ -1168,6 +1237,7 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
         "--dangerously-bypass-approvals-and-sandbox",
         "-s", "danger-full-access",
         "--skip-git-repo-check",
+        *CODEX_EXEC_CONFIG_ARGS,
         "-C", str(scratch),
         "-o", str(last_msg_path),
         prompt,

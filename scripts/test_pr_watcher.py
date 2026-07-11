@@ -3511,6 +3511,51 @@ class CodexCapConfigTests(unittest.TestCase):
         self.assertIn("cannot read", err)
 
 
+class CodexExecConfigTests(unittest.TestCase):
+    def _run(self, contents: str | None) -> tuple[list[str], str]:
+        import contextlib
+        import io as _io
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            if contents is not None:
+                cfg.write_text(contents, encoding="utf-8")
+            buf = _io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                result = pr_watcher._read_codex_exec_config(config_path=cfg)
+            return result, buf.getvalue()
+
+    def test_missing_config_inherits_codex_defaults(self):
+        args, err = self._run(contents=None)
+        self.assertEqual(args, [])
+        self.assertEqual(err, "")
+
+    def test_inherit_value_passes_no_model_overrides(self):
+        args, err = self._run('{"codex_exec": "inherit"}')
+        self.assertEqual(args, [])
+        self.assertEqual(err, "")
+
+    def test_model_effort_and_speed_config_emit_codex_args(self):
+        args, err = self._run(json.dumps({
+            "codex_exec": {
+                "model": "gpt-5.6-sol",
+                "model_reasoning_effort": "medium",
+                "service_tier": "priority",
+            }
+        }))
+
+        self.assertEqual(err, "")
+        self.assertIn("-m", args)
+        self.assertEqual(args[args.index("-m") + 1], "gpt-5.6-sol")
+        self.assertIn("-c", args)
+        self.assertIn('model_reasoning_effort="medium"', args)
+        self.assertIn('service_tier="priority"', args)
+
+    def test_bad_codex_exec_value_warns_and_inherits(self):
+        args, err = self._run('{"codex_exec": true}')
+        self.assertEqual(args, [])
+        self.assertIn("codex_exec=True", err)
+
+
 class InstallAppBundleManifestTests(unittest.TestCase):
     """install_app.sh must bundle every runtime helper that launch_fix.sh
     expects to find next to itself (resolved via `$HERE/<name>` inside the
