@@ -9,10 +9,13 @@
 # then starts `pr_watcher.py --force` in the background.
 #
 # Calendar writes are owned by macOS TCC's "responsible app", not just by the
-# binary doing the write. Codex Desktop is often not granted Calendar access,
-# while Terminal is. When this script is launched from Codex Desktop, hand the
-# real work to a Terminal-opened .command file before touching debounce/state;
-# the Terminal child then runs this same script with the bridge disabled.
+# binary doing the write. An app that never declared NSCalendars*UsageDescription
+# in its Info.plist — Claude Desktop is one — is denied silently, with no prompt
+# and no entry in System Settings to toggle, so "codex-only" bridging left every
+# Claude-launched write failing. auto therefore bridges by default and only
+# skips the hop when the enclosing app is known to hold the grant. The work is
+# handed to a Terminal-opened .command file before touching debounce/state; the
+# Terminal child then runs this same script with the bridge disabled.
 
 set -u
 export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -45,6 +48,24 @@ shell_quote() {
     printf '%q' "$1"
 }
 
+# Apps allowed to write Calendar without going through the bridge. Terminal is
+# the bridge target, so re-bridging from there would loop.
+#
+# Codex Desktop is deliberately NOT here. It does declare NSCalendars* keys, so
+# it *can* prompt, but declaring is not being granted — and the pre-existing
+# observation on this machine was that Codex often had no Calendar access, i.e.
+# exactly the silent no-prompt denial this bridge exists to route around. The
+# cost of bridging a fully-authorized app is one extra Terminal window; the cost
+# of exempting an unauthorized one is an invisible write failure. Only move an
+# app in here after confirming a real grant in System Settings → Privacy &
+# Security → Calendar.
+#
+# Duplicated on purpose in pr_record_review_trigger.sh (no shared lib, so each
+# stays runnable when copied into a skill bundle on its own). Change both.
+CALENDAR_CAPABLE_BUNDLE_IDS=(
+    "com.apple.Terminal"
+)
+
 should_bridge_to_terminal() {
     case "${MY_CALENDAR_PR_TERMINAL_BRIDGE:-auto}" in
         0|false|FALSE|off|OFF|no|NO)
@@ -55,7 +76,16 @@ should_bridge_to_terminal() {
             ;;
     esac
 
-    [[ "${__CFBundleIdentifier:-}" == "com.openai.codex" ]]
+    # auto: bridge unless we are already running inside an app that can write
+    # Calendar itself. No enclosing app at all (detached pre-push child, launchd
+    # job) means nobody to ask, so bridge.
+    local bundle_id candidate
+    bundle_id="${__CFBundleIdentifier:-}"
+    [[ -z "$bundle_id" ]] && return 0
+    for candidate in "${CALENDAR_CAPABLE_BUNDLE_IDS[@]}"; do
+        [[ "$bundle_id" == "$candidate" ]] && return 1
+    done
+    return 0
 }
 
 launch_terminal_bridge() {
