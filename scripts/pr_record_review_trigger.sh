@@ -4,10 +4,12 @@
 # Usage:
 #   pr_record_review_trigger.sh [--timeout <seconds>] <pr-url> <comment-url> [origin-cwd]
 #
-# When launched from Codex Desktop, Calendar writes are bridged through
-# Terminal.app so EventKit attributes the write to Terminal's Calendar
-# permission. Unlike the old background review trigger, this operation is
-# short, so the caller waits for a small status file and can report success.
+# Calendar writes are bridged through Terminal.app so EventKit attributes the
+# write to Terminal's Calendar permission. auto bridges from any app that does
+# not itself hold the grant — Claude Desktop declares no NSCalendars* key, so it
+# is denied silently with no prompt and nothing to toggle in System Settings.
+# Unlike the background review trigger, this operation is short, so the caller
+# waits for a small status file and can report success.
 
 set -u
 export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -39,6 +41,23 @@ shell_quote() {
     printf '%q' "$1"
 }
 
+# Apps allowed to write Calendar without going through the bridge. Terminal is
+# the bridge target, so re-bridging from there would loop.
+#
+# Codex Desktop is deliberately NOT here. It does declare NSCalendars* keys, so
+# it *can* prompt, but declaring is not being granted — and the pre-existing
+# observation on this machine was that Codex often had no Calendar access, i.e.
+# exactly the silent no-prompt denial this bridge exists to route around. The
+# cost of bridging a fully-authorized app is one extra Terminal window; the cost
+# of exempting an unauthorized one is an invisible write failure. Only move an
+# app in here after confirming a real grant in System Settings → Privacy &
+# Security → Calendar.
+#
+# Kept in sync by hand with pr_review_trigger.sh. Change both.
+CALENDAR_CAPABLE_BUNDLE_IDS=(
+    "com.apple.Terminal"
+)
+
 should_bridge_to_terminal() {
     case "${MY_CALENDAR_PR_RECORD_TERMINAL_BRIDGE:-auto}" in
         0|false|FALSE|off|OFF|no|NO)
@@ -49,7 +68,16 @@ should_bridge_to_terminal() {
             ;;
     esac
 
-    [[ "${__CFBundleIdentifier:-}" == "com.openai.codex" ]]
+    # auto: bridge unless we are already running inside an app that can write
+    # Calendar itself. No enclosing app at all (detached pre-push child, launchd
+    # job) means nobody to ask, so bridge.
+    local bundle_id candidate
+    bundle_id="${__CFBundleIdentifier:-}"
+    [[ -z "$bundle_id" ]] && return 0
+    for candidate in "${CALENDAR_CAPABLE_BUNDLE_IDS[@]}"; do
+        [[ "$bundle_id" == "$candidate" ]] && return 1
+    done
+    return 0
 }
 
 validate_args() {

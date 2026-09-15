@@ -639,58 +639,172 @@ class PrReviewTriggerTests(unittest.TestCase):
             debounce_dir = home / ".config" / "my-calendar" / "git-hooks" / "review-triggers"
             self.assertFalse(list(debounce_dir.glob("*.stamp")))
 
-    def test_review_trigger_auto_bridges_codex_desktop_bundle_identifier(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            home = tmp / "home"
-            home.mkdir()
-            fake = tmp / "fake-bin"
-            fake.mkdir()
-            open_args = tmp / "open.args"
-            command_copy = tmp / "bridge.command"
-            _write_exe(
-                fake / "open",
+    def _run_auto_bridge_case(self, tmp: Path, *, bundle_id: str | None):
+        """Run pr_review_trigger.sh in auto mode under a given enclosing app.
+
+        The script is copied into a self-contained fake checkout so its PYTHON
+        and WATCHER paths resolve to stubs. Without that, a case that takes the
+        direct path runs past the base check and really spawns
+        `pr_watcher.py --force` — live network calls against a real repo.
+
+        Returns (result, open_args_path, command_copy_path, watcher_log_path).
+        A None bundle_id models a detached pre-push child or a launchd job,
+        neither of which has an enclosing app at all.
+        """
+        root = tmp / "repo"
+        scripts = root / "scripts"
+        venv_bin = root / ".venv" / "bin"
+        scripts.mkdir(parents=True)
+        venv_bin.mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts" / "pr_review_trigger.sh", scripts / "pr_review_trigger.sh")
+        (scripts / "pr_review_trigger.sh").chmod(0o755)
+        (scripts / "pr_watcher.py").write_text("# fake watcher target\n", encoding="utf-8")
+        watcher_log = tmp / "watcher-ran"
+        _write_exe(
+            venv_bin / "python",
+            f'#!/usr/bin/env bash\nprintf "ran\\n" >> {watcher_log!s}\n',
+        )
+
+        home = tmp / "home"
+        home.mkdir()
+        fake = tmp / "fake-bin"
+        fake.mkdir()
+        open_args = tmp / "open.args"
+        command_copy = tmp / "bridge.command"
+        _write_exe(
+            fake / "open",
+            textwrap.dedent("""\
+                #!/usr/bin/env bash
+                last=""
+                for arg in "$@"; do
+                  last="$arg"
+                done
+                printf '%s\\n' "$@" > "$OPEN_ARGS_OUT"
+                cp "$last" "$OPEN_CAPTURE_OUT"
+            """),
+        )
+        # gh/jq stubs so the direct (non-bridged) path can reach its base check.
+        for name, body in (
+            ("gh", "#!/usr/bin/env bash\necho '{}'\n"),
+            (
+                "jq",
                 textwrap.dedent("""\
                     #!/usr/bin/env bash
-                    last=""
-                    for arg in "$@"; do
-                      last="$arg"
-                    done
-                    printf '%s\\n' "$@" > "$OPEN_ARGS_OUT"
-                    cp "$last" "$OPEN_CAPTURE_OUT"
+                    expr="$2"
+                    case "$expr" in
+                      *baseRefName*) echo 'main' ;;
+                      *defaultBranchRef*) echo 'main' ;;
+                      *headRefOid*) echo 'abc123' ;;
+                      *url*) echo https://github.com/realRoc/my-calendar/pull/42 ;;
+                      *) echo "" ;;
+                    esac
                 """),
+            ),
+        ):
+            _write_exe(fake / name, body)
+
+        env = os.environ.copy()
+        env.pop("MY_CALENDAR_PR_TERMINAL_BRIDGE", None)
+        env.pop("__CFBundleIdentifier", None)
+        env["HOME"] = str(home)
+        env["PATH"] = f"{fake}:{env['PATH']}"
+        env["OPEN_ARGS_OUT"] = str(open_args)
+        env["OPEN_CAPTURE_OUT"] = str(command_copy)
+        if bundle_id is not None:
+            env["__CFBundleIdentifier"] = bundle_id
+
+        result = subprocess.run(
+            [
+                "bash",
+                str(scripts / "pr_review_trigger.sh"),
+                "https://github.com/realRoc/my-calendar/pull/42",
+            ],
+            cwd=str(root),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return result, open_args, command_copy, watcher_log
+
+    @staticmethod
+    def _await_file(path: Path, timeout: float = 5.0) -> bool:
+        """The trigger spawns the watcher in the background, so its log appears
+        shortly after the trigger itself returns. Poll instead of racing."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if path.exists():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_review_trigger_auto_bridges_claude_desktop_without_calendar_grant(self):
+        # Claude Desktop declares no NSCalendars*UsageDescription, so EventKit
+        # denies it silently and there is nothing to toggle in System Settings.
+        # auto must bridge on its behalf rather than let the write fail.
+        with tempfile.TemporaryDirectory() as td:
+            result, open_args, command_copy, watcher_log = self._run_auto_bridge_case(
+                Path(td), bundle_id="com.anthropic.claudefordesktop"
             )
-
-            env = os.environ.copy()
-            env.pop("MY_CALENDAR_PR_TERMINAL_BRIDGE", None)
-            env["HOME"] = str(home)
-            env["PATH"] = f"{fake}:{env['PATH']}"
-            env["__CFBundleIdentifier"] = "com.openai.codex"
-            env["OPEN_ARGS_OUT"] = str(open_args)
-            env["OPEN_CAPTURE_OUT"] = str(command_copy)
-
-            result = subprocess.run(
-                [
-                    "bash",
-                    str(ROOT / "scripts" / "pr_review_trigger.sh"),
-                    "https://github.com/realRoc/my-calendar/pull/42",
-                ],
-                cwd=str(ROOT),
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("terminal bridge launched", result.stdout)
             self.assertEqual(
                 open_args.read_text(encoding="utf-8").splitlines()[:3],
                 ["-g", "-a", "Terminal"],
             )
-            command = command_copy.read_text(encoding="utf-8")
-            self.assertIn("--source manual:terminal-bridge", command)
+            self.assertIn("--source manual:terminal-bridge", command_copy.read_text(encoding="utf-8"))
+            self.assertFalse(
+                watcher_log.exists(),
+                "the bridging process must not also run the watcher locally",
+            )
+
+    def test_review_trigger_auto_bridges_when_no_enclosing_app(self):
+        # The pre-push hook spawns its trigger detached, so __CFBundleIdentifier
+        # is empty there. Bridging is the only way that write can land.
+        with tempfile.TemporaryDirectory() as td:
+            result, open_args, _, watcher_log = self._run_auto_bridge_case(Path(td), bundle_id=None)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("terminal bridge launched", result.stdout)
+            self.assertEqual(
+                open_args.read_text(encoding="utf-8").splitlines()[:3],
+                ["-g", "-a", "Terminal"],
+            )
+            self.assertFalse(watcher_log.exists(), "the bridging process must not also run the watcher")
+
+    def test_review_trigger_auto_skips_bridge_only_inside_terminal(self):
+        # Terminal is the bridge target. Any other app bridges, because there is
+        # no reliable way to ask whether it holds the Calendar grant.
+        with tempfile.TemporaryDirectory() as td:
+            result, open_args, _, watcher_log = self._run_auto_bridge_case(
+                Path(td), bundle_id="com.apple.Terminal"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("terminal bridge launched", result.stdout)
+            self.assertFalse(open_args.exists(), "open must not be called")
+            # "did not bridge" alone would still pass if the direct path
+            # returned early for some unrelated reason (e.g. a broken base
+            # check), so also require that it actually reached the watcher.
+            self.assertTrue(
+                self._await_file(watcher_log),
+                "direct path must run the watcher, not just skip the bridge",
+            )
+
+    def test_review_trigger_bridges_codex_desktop_not_exempt(self):
+        # Codex declares NSCalendars* keys but that only makes it eligible to
+        # ask; the pre-existing note in this repo was that Codex often had no
+        # grant. It bridges like any other unverified app.
+        with tempfile.TemporaryDirectory() as td:
+            result, open_args, _, watcher_log = self._run_auto_bridge_case(
+                Path(td), bundle_id="com.openai.codex"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("terminal bridge launched", result.stdout)
+            self.assertEqual(
+                open_args.read_text(encoding="utf-8").splitlines()[:3],
+                ["-g", "-a", "Terminal"],
+            )
+            self.assertFalse(watcher_log.exists(), "must not run the watcher locally")
 
     def test_review_trigger_skips_non_default_base(self):
         with tempfile.TemporaryDirectory() as td:
@@ -940,6 +1054,137 @@ class PrRecordReviewTriggerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def _run_record_auto_case(self, tmp: Path, *, bundle_id: str | None, terminal_writes_status: bool = True):
+        """Run the record trigger in auto mode under a given enclosing app.
+
+        terminal_writes_status=False models the case the caller cannot control:
+        Terminal is slow to start, fails to launch, or the .command dies before
+        writing its status file. The caller must fall out through its timeout
+        branch rather than hang or report success.
+        """
+        root = tmp / "repo"
+        scripts = root / "scripts"
+        venv_bin = root / ".venv" / "bin"
+        scripts.mkdir(parents=True)
+        venv_bin.mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts" / "pr_record_review_trigger.sh", scripts / "pr_record_review_trigger.sh")
+        (scripts / "pr_record_review_trigger.sh").chmod(0o755)
+        (scripts / "pr_session_review.py").write_text("# fake recorder target\n", encoding="utf-8")
+        # Record whether the direct path ran, so "not bridged" is observable
+        # even when the stubbed recorder has nothing real to do.
+        recorder_log = tmp / "direct-ran"
+        _write_exe(
+            venv_bin / "python",
+            f'#!/usr/bin/env bash\nprintf "ran\\n" >> {recorder_log!s}\nexit 0\n',
+        )
+
+        home = tmp / "home"
+        home.mkdir()
+        fake = tmp / "fake-bin"
+        fake.mkdir()
+        open_args = tmp / "open.args"
+        status_block = (
+            """\
+                status="$(awk '/^printf .* > .*\\.status$/ {print $NF; exit}' "$last" 2>/dev/null)"
+                if [[ -n "$status" ]]; then
+                  mkdir -p "$(dirname "$status")"
+                  printf 'rc=0\\n' > "$status"
+                fi"""
+            if terminal_writes_status
+            else "# Terminal accepted the launch but never reports back."
+        )
+        _write_exe(
+            fake / "open",
+            textwrap.dedent(f"""\
+                #!/usr/bin/env bash
+                last=""
+                for arg in "$@"; do
+                  last="$arg"
+                done
+                printf '%s\\n' "$@" > "$OPEN_ARGS_OUT"
+                {status_block}
+            """),
+        )
+
+        env = os.environ.copy()
+        env.pop("MY_CALENDAR_PR_RECORD_TERMINAL_BRIDGE", None)
+        env.pop("__CFBundleIdentifier", None)
+        env["HOME"] = str(home)
+        env["PATH"] = f"{fake}:{env['PATH']}"
+        env["OPEN_ARGS_OUT"] = str(open_args)
+        if bundle_id is not None:
+            env["__CFBundleIdentifier"] = bundle_id
+
+        result = subprocess.run(
+            [
+                "bash",
+                str(scripts / "pr_record_review_trigger.sh"),
+                "--timeout",
+                "2",
+                "https://github.com/realRoc/my-calendar/pull/42",
+                "https://github.com/realRoc/my-calendar/pull/42#issuecomment-123",
+                str(root),
+            ],
+            cwd=str(root),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return result, open_args, recorder_log
+
+    def test_record_auto_bridges_claude_desktop_without_calendar_grant(self):
+        with tempfile.TemporaryDirectory() as td:
+            result, open_args, recorder_log = self._run_record_auto_case(
+                Path(td), bundle_id="com.anthropic.claudefordesktop"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("MY_CALENDAR_RECORD=terminal-bridge:success", result.stdout)
+            self.assertEqual(
+                open_args.read_text(encoding="utf-8").splitlines()[:3],
+                ["-g", "-a", "Terminal"],
+            )
+            self.assertFalse(recorder_log.exists(), "recorder must not run in the denied app")
+
+    def test_record_auto_skips_bridge_only_inside_terminal(self):
+        with tempfile.TemporaryDirectory() as td:
+            result, open_args, recorder_log = self._run_record_auto_case(
+                Path(td), bundle_id="com.apple.Terminal"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("MY_CALENDAR_RECORD=direct:success", result.stdout)
+            self.assertFalse(open_args.exists(), "open must not be called")
+            self.assertTrue(recorder_log.exists(), "recorder must run directly")
+
+    def test_record_auto_bridges_codex_desktop_not_exempt(self):
+        with tempfile.TemporaryDirectory() as td:
+            result, open_args, recorder_log = self._run_record_auto_case(
+                Path(td), bundle_id="com.openai.codex"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("MY_CALENDAR_RECORD=terminal-bridge:success", result.stdout)
+            self.assertEqual(
+                open_args.read_text(encoding="utf-8").splitlines()[:3],
+                ["-g", "-a", "Terminal"],
+            )
+            self.assertFalse(recorder_log.exists(), "recorder must not run in the unverified app")
+
+    def test_record_reports_timeout_when_terminal_never_answers(self):
+        # The bridge hands the write to a GUI process the caller does not
+        # control. If that side never writes a status file, the caller must
+        # surface a distinct timeout result rather than hang or claim success.
+        with tempfile.TemporaryDirectory() as td:
+            result, open_args, recorder_log = self._run_record_auto_case(
+                Path(td),
+                bundle_id="com.anthropic.claudefordesktop",
+                terminal_writes_status=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("MY_CALENDAR_RECORD=terminal-bridge:timeout", result.stdout)
+            self.assertTrue(open_args.exists(), "Terminal was still launched")
+            self.assertFalse(recorder_log.exists(), "recorder must not run in the denied app")
 
 
 if __name__ == "__main__":
