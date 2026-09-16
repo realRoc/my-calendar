@@ -10,7 +10,10 @@ readonly TEAMOROUTER_BASE_URL="https://api.teamorouter.com"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly RENDERER="$SCRIPT_DIR/render_review.py"
 readonly REVIEW_MAX_ATTEMPTS="${REVIEW_MAX_ATTEMPTS:-3}"
-readonly REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-900}"
+# Must accommodate the effort level above. At `high` a ~1300-line diff did not
+# finish inside the previous 900s bound and burned both retries, so the reviewer
+# could never succeed on a large PR. Worst case is MAX_ATTEMPTS x this bound.
+readonly REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-2400}"
 # Reasoning effort for the reviewer. `low` returned an empty findings array on a
 # ~1000-line diff while the Codex reviewer found two real blockers on the same
 # SHA, so the default is deliberately `high`.
