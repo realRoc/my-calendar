@@ -1317,6 +1317,37 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
         self.assertNotIn("--mcp-config", reviewer)
         self.assertIn('--tools ""', reviewer)
 
+    def test_reviewer_bounds_each_attempt_with_a_timeout(self):
+        """A stalled CLI must not block the retry loop forever.
+
+        Observed for real: an MCP child wedged the reviewer for 30 minutes with
+        no output, so REVIEW_GENERATION never returned, no retry ever ran, and
+        the session claim was never released. Each attempt needs a wall-clock
+        bound, and the bound must hold even without coreutils `timeout`.
+        """
+        reviewer = (self.SKILL / "scripts" / "review_with_opus.sh").read_text(encoding="utf-8")
+        self.assertIn("REVIEW_TIMEOUT_SEC", reviewer)
+        self.assertIn("run_with_timeout", reviewer)
+        # The pure-bash watchdog is the fallback when `timeout` is absent.
+        self.assertIn("kill -9", reviewer)
+        self.assertIn("command -v timeout", reviewer)
+
+    def test_poster_rechecks_head_after_claim_and_after_publish(self):
+        """The head can move while the claim or the comment is in flight.
+
+        The preflight SHA check alone is a check-then-act: claiming costs a
+        round trip, so a review could be published for a superseded SHA and
+        still read as the current verdict. Both windows must re-check, and a
+        comment published for a moved head must be retracted rather than left
+        standing as the current conclusion.
+        """
+        poster = (self.SKILL / "scripts" / "review_and_post.sh").read_text(encoding="utf-8")
+        self.assertIn("assert_head_unchanged", poster)
+        self.assertIn('assert_head_unchanged "during claim"', poster)
+        self.assertIn('assert_head_unchanged "during publish"', poster)
+        # Retraction is limited to a comment this run created.
+        self.assertIn("gh api -X DELETE", poster)
+
     def test_skill_documents_the_opus_marker_it_actually_posts(self):
         post = (self.SKILL / "scripts" / "review_and_post.sh").read_text(encoding="utf-8")
         self.assertIn("<!-- pr-review-model: claude-opus-5; provider: teamorouter -->", post)

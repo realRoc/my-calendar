@@ -10,6 +10,7 @@ readonly TEAMOROUTER_BASE_URL="https://api.teamorouter.com"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly RENDERER="$SCRIPT_DIR/render_review.py"
 readonly REVIEW_MAX_ATTEMPTS="${REVIEW_MAX_ATTEMPTS:-3}"
+readonly REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-900}"
 
 PR_URL=""
 OUTPUT_FILE=""
@@ -91,6 +92,34 @@ if [[ ! "$REVIEW_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || [[ "$REVIEW_MAX_ATTEMPTS" 
     echo "ERROR: REVIEW_MAX_ATTEMPTS must be an integer from 1 to 5" >&2
     exit 2
 fi
+if [[ ! "$REVIEW_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: REVIEW_TIMEOUT_SEC must be a positive integer" >&2
+    exit 2
+fi
+
+# Run "$@" under a wall-clock limit, then report the child's exit status.
+# coreutils `timeout` is preferred; the pure-bash watchdog keeps the limit in
+# force on a host without it, because running unbounded is the failure mode
+# this guards against.
+run_with_timeout() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --kill-after=10s "$REVIEW_TIMEOUT_SEC" "$@"
+        return $?
+    fi
+
+    local pid watchdog rc
+    "$@" &
+    pid=$!
+    ( sleep "$REVIEW_TIMEOUT_SEC"; kill -9 "$pid" 2>/dev/null ) &
+    watchdog=$!
+    # Capture rather than let a non-zero status trip `set -e`, which would exit
+    # before the watchdog is reaped.
+    rc=0
+    wait "$pid" || rc=$?
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    return "$rc"
+}
 
 claude_config_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 claude_settings="$claude_config_root/settings.json"
@@ -243,7 +272,12 @@ run_reviewer() {
     if [[ -n "$review_auth_token" ]]; then
         export ANTHROPIC_AUTH_TOKEN="$review_auth_token"
     fi
-    claude --print \
+    # Bound each attempt. Without a wall-clock limit a stalled CLI (provider
+    # hang, wedged child) blocks forever: the retry loop never advances, the
+    # claim is never released, and the run leaves no artifact. A timeout is
+    # reported like any other failed attempt so the loop can retry.
+    run_with_timeout \
+        claude --print \
         --model "$REVIEW_MODEL" \
         --effort low \
         --output-format json \

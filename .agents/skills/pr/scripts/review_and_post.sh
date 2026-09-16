@@ -149,6 +149,25 @@ if [[ "$pr_state" != "OPEN" || -z "$head_sha" || -z "$pr_number" || -z "$owner_r
     exit 1
 fi
 
+current_head_sha() {
+    gh pr view "$PR_URL" --json headRefOid --jq .headRefOid
+}
+
+# The preflight check above runs before the claim, and claiming costs a network
+# round trip, so the head can move in between. Re-checking closes that window:
+# a review published against a superseded SHA reads as the current verdict to
+# every later reader, including anything scanning the SHA marker.
+assert_head_unchanged() {
+    local where="$1"
+    local now_sha
+    now_sha="$(current_head_sha)"
+    if [[ "$now_sha" != "$review_head_sha" ]]; then
+        echo "ERROR: PR head moved $where (${review_head_sha:0:8} → ${now_sha:0:8}); rerun against the new SHA" >&2
+        return 1
+    fi
+    return 0
+}
+
 find_existing_comment() {
     gh api --paginate "repos/$owner_repo/issues/$pr_number/comments?per_page=100" \
         | jq -sr --arg head "<!-- pr-watcher-head-sha: $head_sha -->" \
@@ -200,6 +219,9 @@ else
         claim_acquired=1
     fi
 
+    # Claiming is a network round trip; the head may have moved since preflight.
+    assert_head_unchanged "during claim" || exit 1
+
     COMMENT_FILE="$(mktemp "${TMPDIR:-/tmp}/pr-comment.XXXXXX")"
     {
         printf '%s\n' '> 🤖 由 Codex 自动生成'
@@ -224,6 +246,21 @@ else
     fi
     comment_exists=1
     comment_action="posted"
+
+    # Publishing is another round trip, so re-check once more. A comment that
+    # landed for a superseded SHA still carries this SHA's marker, so it looks
+    # authoritative to every later reader; retract it instead of leaving a
+    # stale verdict standing. Only a comment created by this run is retracted —
+    # an idempotently reused one predates the claim and is not ours to delete.
+    if ! assert_head_unchanged "during publish"; then
+        if gh api -X DELETE "repos/$owner_repo/issues/comments/${comment_url##*issuecomment-}" >/dev/null 2>&1; then
+            echo "retracted stale review comment: $comment_url" >&2
+        else
+            echo "ERROR: could not retract stale review comment: $comment_url" >&2
+        fi
+        comment_exists=0
+        exit 1
+    fi
 fi
 
 comment_id="${comment_url##*issuecomment-}"
