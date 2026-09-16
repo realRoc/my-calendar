@@ -1253,5 +1253,62 @@ class PrRecordReviewTriggerTests(unittest.TestCase):
             self.assertFalse(recorder_log.exists(), "recorder must not run in the denied app")
 
 
+class PrSkillReviewerConsolidationTests(unittest.TestCase):
+    """Lock the /pr skill onto the single claude-opus-5 reviewer.
+
+    Three divergent copies of this skill previously existed on this machine
+    (~/.agents, ~/.claude, ~/.codex) and only ~/.agents held the Opus lineage,
+    so `/pr` loaded the stale Fable copy and ran the wrong reviewer. These
+    assertions keep the repo the single source of truth.
+    """
+
+    SKILL = ROOT / ".agents" / "skills" / "pr"
+    EXPECTED_SCRIPTS = (
+        "light_pr.sh",
+        "review_with_opus.sh",
+        "review_and_post.sh",
+        "render_review.py",
+        "release_current_session_claim.py",
+    )
+
+    def test_skill_ships_only_the_opus_reviewer(self):
+        scripts = self.SKILL / "scripts"
+        self.assertFalse(
+            (scripts / "review_with_fable.sh").exists(),
+            "the Fable reviewer script must not ship in the skill",
+        )
+        for name in self.EXPECTED_SCRIPTS:
+            self.assertTrue((scripts / name).exists(), f"missing skill script: {name}")
+
+    def test_no_fable_instruction_remains_in_the_skill(self):
+        for path in sorted(self.SKILL.rglob("*")):
+            if not path.is_file():
+                continue
+            blob = path.read_text(encoding="utf-8", errors="replace").lower()
+            self.assertNotIn("fable", blob, f"stale Fable reference in {path}")
+
+    def test_installer_chmods_the_opus_scripts_and_not_fable(self):
+        installer = (ROOT / "scripts" / "install_pr_skill.sh").read_text(encoding="utf-8")
+        self.assertNotIn("review_with_fable.sh", installer)
+        self.assertIn("review_with_opus.sh", installer)
+        self.assertIn("review_and_post.sh", installer)
+
+    def test_reviewer_rejects_a_host_injected_base_url(self):
+        """A host-managed session exports its own ANTHROPIC_BASE_URL with no token.
+
+        The reviewer must prefer the user settings file over that ambient value,
+        otherwise check-config fails outright and the child reports "Not logged in".
+        """
+        reviewer = (self.SKILL / "scripts" / "review_with_opus.sh").read_text(encoding="utf-8")
+        self.assertIn("settings_base_url", reviewer)
+        self.assertIn("review_auth_token", reviewer)
+        # The credential is exported for the child, never passed as argv.
+        self.assertNotIn('env ANTHROPIC_AUTH_TOKEN=', reviewer)
+
+    def test_skill_documents_the_opus_marker_it_actually_posts(self):
+        post = (self.SKILL / "scripts" / "review_and_post.sh").read_text(encoding="utf-8")
+        self.assertIn("<!-- pr-review-model: claude-opus-5; provider: teamorouter -->", post)
+
+
 if __name__ == "__main__":
     unittest.main()

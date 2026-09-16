@@ -356,14 +356,15 @@ my-calendar = 多个互相独立的模块（节日 / PR 监控 / health / 未来
 - 解决 `/ship` 先 push、后创建 PR，PR 创建晚于 pre-push 轮询窗口导致漏 review 的场景
 - 如果任一即时触发链路从 Codex Desktop 发起，`pr_review_trigger.sh` 会先用 `open -g -a Terminal <tmp.command>` 把真正的 `pr_watcher.py --force` 交给 Terminal 跑；这样 EventKit 写入归属到已授权的 Terminal，而不是没有 Calendar 权限的 Codex app。可用 `MY_CALENDAR_PR_TERMINAL_BRIDGE=0` 禁用，或设为 `1` 强制走桥接。
 
-**轻量 `/pr` 通道 — 当前 session review（默认）**
+**轻量 `/pr` 通道 — 当前 session 编排 Opus review（默认）**
 
 - `.agents/skills/pr/scripts/light_pr.sh` 创建/更新 PR 时默认不再触发后台 `pr_watcher.py --force`
 - helper 只在本次 `git push` 上设置 `MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW=1`，让全局 pre-push hook 保留 repo-local `pre-push.local` 安全检查，但跳过 detached review 触发
 - PR 创建/更新后，helper 调 `scripts/pr_session_review.py --claim` 把当前 head SHA 标为 `pending_review_source=current-session`，避免 launchd 兜底在当前 Codex/Claude session review 期间抢跑
-- 当前 session 自己读取 PR diff、发带 AI 共著标记和 `pr-watcher-head-sha` 的 GitHub 评论
-- 评论发出后，调用 `scripts/pr_record_review_trigger.sh <pr-url> <comment-url> <origin-cwd>`；如果调用方是 Codex Desktop，该脚本会用 Terminal bridge 执行 `scripts/pr_session_review.py --record`，只负责验证评论 marker、写 "PR 监控" 日历、缓存评论 body、写 `.meta.json` 和推进 `pr_state.json`
-- 老的异步路径仍保留：`light_pr.sh --trigger-async-review` / `--trigger-only`、普通 `git push`、外部工具调用 `pr-created`、launchd 兜底都继续走 `pr_watcher.py`
+- 当前 session 调 `.agents/skills/pr/scripts/review_with_opus.sh`，由 Teamorouter 路由到 `claude-opus-5` 做无工具、无会话持久化的只读 diff review。该脚本要求结构化 JSON-Schema 输出，由 `render_review.py` 确定性地渲染成评论正文并本地推导结论；非法响应最多重试 3 次
+- 评论由 `scripts/review_and_post.sh` 发布：它复验 PR SHA、复用已存在的同 SHA 评论避免重复、校验发出内容，再调 `scripts/pr_record_review_trigger.sh <pr-url> <comment-url> <origin-cwd>` 写 "PR 监控" 日历。如果调用方是 Codex Desktop，后者会用 Terminal bridge 执行 `scripts/pr_session_review.py --record`
+- reviewer 子进程的凭据由 `review_with_opus.sh` 显式从 `~/.claude/settings.json` 解析并 export。宿主（如 Claude Desktop，`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`）可能只注入自己的 `ANTHROPIC_BASE_URL` 而不下发 token，此时若照搬环境变量，config 检查会直接失败、或子进程报 `Not logged in`
+- 老的异步路径仍保留：`light_pr.sh --trigger-async-review` / `--trigger-only`、普通 `git push`、外部工具调用 `pr-created`、launchd 兜底都继续走 Codex 驱动的 `pr_watcher.py`，不使用 Opus
 
 **兜底通道 — launchd 10 min 轮询**
 
