@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Claim and record PR reviews performed by the current agent session.
+"""Claim and record PR reviews orchestrated by the current agent session.
 
 The legacy pr_watcher path launches a detached `codex exec` process, waits for
 that process to post a GitHub comment, then writes Calendar/state. This helper
-is the smaller path used by the `/pr` skill: the active Codex/Claude session
-does the review and posts the comment; this script only reserves the SHA and
-records the already-posted comment into my-calendar.
+is the smaller path used by the `/pr` skill: the active session delegates the
+review to Claude Opus 5 through Teamorouter and posts the result; this script
+only reserves the SHA and records the already-posted comment into my-calendar.
 """
 
 from __future__ import annotations
