@@ -149,6 +149,18 @@ if [[ "$pr_state" != "OPEN" || -z "$head_sha" || -z "$pr_number" || -z "$owner_r
     exit 1
 fi
 
+# Idempotency keys on "a review this account already published for this SHA".
+# The markers alone cannot carry that meaning: they are plain text in a comment
+# body, so anyone able to comment on the PR can paste a head-SHA marker and have
+# their own text adopted as this session's review and written into my-calendar.
+# The author is what actually distinguishes our comment, so resolve it and match
+# on it rather than trusting the markers by themselves.
+current_login="$(gh api user --jq .login)"
+if [[ -z "$current_login" ]]; then
+    echo "ERROR: could not resolve the authenticated GitHub login" >&2
+    exit 1
+fi
+
 current_head_sha() {
     gh pr view "$PR_URL" --json headRefOid --jq .headRefOid
 }
@@ -168,12 +180,23 @@ assert_head_unchanged() {
     return 0
 }
 
+# Match only comments authored by the authenticated account, keyed on the
+# canonical orchestrator marker plus the head SHA.
+#
+# The model marker is deliberately NOT part of the key. It records which
+# reviewer produced a comment, not whether the comment is ours, and requiring it
+# makes a canonical comment from the Codex watcher invisible — which is exactly
+# how a second review for the same SHA got posted and then rejected at the record
+# step. Including it here would reintroduce that duplicate.
 find_existing_comment() {
     gh api --paginate "repos/$owner_repo/issues/$pr_number/comments?per_page=100" \
         | jq -sr --arg head "<!-- pr-watcher-head-sha: $head_sha -->" \
             --arg marker '<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->' \
-            --arg review_marker '<!-- pr-review-model: claude-opus-5; provider: teamorouter -->' '
-                [.[][] | select((.body // "") | contains($head) and contains($marker) and contains($review_marker))]
+            --arg login "$current_login" '
+                [.[][] | select(
+                    (.user.login // "") == $login
+                    and ((.body // "") | contains($head) and contains($marker))
+                )]
                 | sort_by(.created_at) | last | .html_url // empty
             '
 }
@@ -264,11 +287,29 @@ else
 fi
 
 comment_id="${comment_url##*issuecomment-}"
-comment_body="$(gh api "repos/$owner_repo/issues/comments/$comment_id" --jq .body)"
+comment_meta="$(gh api "repos/$owner_repo/issues/comments/$comment_id" --jq '{author: .user.login, body: .body}')"
+comment_body="$(jq -r '.body // ""' <<<"$comment_meta")"
+comment_author="$(jq -r '.author // ""' <<<"$comment_meta")"
+# Verify identity, provenance, and shape before treating the comment as ours.
+# The author check is the load-bearing one: markers are forgeable text, a login
+# is not. Only the head-SHA and coauthor markers are required — the model marker
+# records which reviewer ran and is absent from comments the Codex watcher
+# published for the same SHA, which are still valid canonical reviews.
+if [[ "$comment_author" != "$current_login" ]]; then
+    echo "ERROR: comment $comment_url is authored by '$comment_author', not '$current_login'" >&2
+    exit 1
+fi
 if [[ "$comment_body" != *"<!-- pr-watcher-head-sha: $head_sha -->"* ]] \
-    || [[ "$comment_body" != *'<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->'* ]] \
-    || [[ "$comment_body" != *'<!-- pr-review-model: claude-opus-5; provider: teamorouter -->'* ]]; then
+    || [[ "$comment_body" != *'<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->'* ]]; then
     echo "ERROR: posted GitHub comment failed canonical marker verification" >&2
+    exit 1
+fi
+# An adopted body must still read as a review, so a comment that merely carries
+# the markers cannot be recorded as this session's verdict.
+published_conclusions="$(printf '%s\n' "$comment_body" | rg -c '^结论：(✅ 可以合并|❌ 暂不可合并)$' || true)"
+published_last="$(printf '%s\n' "$comment_body" | awk 'NF { line=$0 } END { print line }')"
+if [[ "$published_conclusions" != "1" ]] || [[ ! "$published_last" =~ ^结论：(✅\ 可以合并|❌\ 暂不可合并)$ ]]; then
+    echo "ERROR: comment $comment_url carries the markers but no canonical conclusion" >&2
     exit 1
 fi
 
@@ -283,7 +324,10 @@ fi
 
 record_output="$(bash "$record_script" "$PR_URL" "$comment_url" "$REPO_ROOT")"
 printf '%s\n' "$record_output"
-verdict="$(awk 'NF { line=$0 } END { print line }' "$REVIEW_FILE")"
+# Report the verdict that is actually published. On the reuse path the comment
+# predates this run, so reading our own freshly generated file would announce a
+# verdict that does not match what a reader (or the recorded entry) sees.
+verdict="$published_last"
 
 echo "PR_URL=$PR_URL"
 echo "HEAD_SHA=$head_sha"
