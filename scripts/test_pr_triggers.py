@@ -639,6 +639,72 @@ class PrReviewTriggerTests(unittest.TestCase):
             debounce_dir = home / ".config" / "my-calendar" / "git-hooks" / "review-triggers"
             self.assertFalse(list(debounce_dir.glob("*.stamp")))
 
+    def test_review_bridge_renders_auto_close_for_successful_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            home.mkdir()
+            origin = tmp / "checkout"
+            origin.mkdir()
+            fake = tmp / "fake-bin"
+            fake.mkdir()
+            command_copy = tmp / "bridge.command"
+            _write_exe(
+                fake / "open",
+                textwrap.dedent("""\
+                    #!/usr/bin/env bash
+                    last=""
+                    for arg in "$@"; do
+                      last="$arg"
+                    done
+                    cp "$last" "$OPEN_CAPTURE_OUT"
+                """),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env["PATH"] = f"{fake}:{env['PATH']}"
+            env["MY_CALENDAR_PR_TERMINAL_BRIDGE"] = "1"
+            env["OPEN_CAPTURE_OUT"] = str(command_copy)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts" / "pr_review_trigger.sh"),
+                    "--source",
+                    "pre-push",
+                    "https://github.com/realRoc/my-calendar/pull/42",
+                    str(origin),
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            command = command_copy.read_text(encoding="utf-8")
+            self.assertIn('LAUNCH_TTY="$(tty', command)
+            self.assertIn('MY_CALENDAR_PR_TERMINAL_AUTO_CLOSE:-1', command)
+            self.assertIn('auto_close_terminal_bridge_if_success "$rc" "$LAUNCH_TTY"', command)
+            self.assertIn('[[ "$rc" -eq 0 ]] || return 0', command)
+            self.assertIn("if (count of tabs of w) is 1 then", command)
+            self.assertIn("close w saving no", command)
+            # The window must survive long enough to close itself: `exec` would
+            # replace the shell running the auto-close call.
+            self.assertNotIn("exec bash", command)
+            self.assertIn("set +e", command)
+            syntax = subprocess.run(
+                ["bash", "-n", str(command_copy)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
     def _run_auto_bridge_case(self, tmp: Path, *, bundle_id: str | None):
         """Run pr_review_trigger.sh in auto mode under a given enclosing app.
 

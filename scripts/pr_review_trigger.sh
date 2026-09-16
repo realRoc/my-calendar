@@ -110,12 +110,55 @@ launch_terminal_bridge() {
         printf '#!/usr/bin/env bash\n'
         printf 'set -euo pipefail\n'
         printf 'rm -f "$0"\n'
+        printf 'LAUNCH_TTY="$(tty 2>/dev/null || echo not-a-tty)"\n'
         printf 'mkdir -p "$HOME/.config/my-calendar/git-hooks/logs"\n'
         printf 'exec >> "$HOME/.config/my-calendar/git-hooks/logs/trigger.log" 2>&1\n'
         printf 'printf '"'"'[%%s] terminal bridge executing for %%s (source=%%s)\\n'"'"' "$(date '"'"'+%%Y-%%m-%%d %%H:%%M:%%S'"'"')" %s %s\n' \
             "$(shell_quote "$PR_URL")" "$(shell_quote "$SOURCE")"
+        cat <<'BRIDGE_SCRIPT'
+# Close this window once the bridge has handed off. The review itself keeps
+# running in a detached child (pr_review_trigger.sh backgrounds pr_watcher.py),
+# so the window would otherwise sit open for the full multi-minute codex run
+# with nothing left to show. Mirrors pr_record_review_trigger.sh.
+auto_close_terminal_bridge_if_success() {
+    local rc="$1"
+    local tty_name="$2"
+
+    [[ "$rc" -eq 0 ]] || return 0
+    case "${MY_CALENDAR_PR_TERMINAL_AUTO_CLOSE:-1}" in
+        0|false|FALSE|off|OFF|no|NO)
+            return 0
+            ;;
+    esac
+
+    [[ -n "$tty_name" && "$tty_name" != "not-a-tty" ]] || return 0
+
+    /usr/bin/nohup /usr/bin/osascript - "$tty_name" >/dev/null 2>&1 <<'APPLESCRIPT' &
+on run argv
+    delay 0.3
+    set targetTty to item 1 of argv
+    tell application "Terminal"
+        repeat with w in windows
+            repeat with t in tabs of w
+                if (tty of t as text) is targetTty then
+                    if (count of tabs of w) is 1 then
+                        close w saving no
+                    end if
+                    return
+                end if
+            end repeat
+        end repeat
+    end tell
+end run
+APPLESCRIPT
+}
+BRIDGE_SCRIPT
         printf 'cd %s\n' "$(shell_quote "$ROOT")"
         printf 'export MY_CALENDAR_PR_TERMINAL_BRIDGE=0\n'
+        # Not `exec`: the bridge must regain control to close its own window.
+        # set +e keeps a non-zero trigger status reportable instead of killing
+        # the script before the auto-close call.
+        printf 'set +e\n'
         printf 'bash %s --source %s %s' \
             "$(shell_quote "$ROOT/scripts/pr_review_trigger.sh")" \
             "$(shell_quote "$bridge_source")" \
@@ -124,6 +167,9 @@ launch_terminal_bridge() {
             printf ' %s' "$(shell_quote "$ORIGIN_CWD")"
         fi
         printf '\n'
+        printf 'rc=$?\n'
+        printf 'auto_close_terminal_bridge_if_success "$rc" "$LAUNCH_TTY"\n'
+        printf 'exit "$rc"\n'
     } > "$command_file"
     chmod 700 "$command_file"
 
