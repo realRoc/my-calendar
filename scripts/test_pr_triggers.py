@@ -1332,6 +1332,19 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
         self.assertIn("kill -9", reviewer)
         self.assertIn("command -v timeout", reviewer)
 
+    def test_reviewer_reasons_at_high_effort_by_default(self):
+        """`--effort low` reviewed ~1000 lines and returned no findings at all.
+
+        The Codex reviewer found two real blockers on that same SHA, so the
+        default is `high` and the level is overridable; an unknown level must
+        fail loudly instead of letting the CLI fall back silently.
+        """
+        reviewer = (self.SKILL / "scripts" / "review_with_opus.sh").read_text(encoding="utf-8")
+        self.assertIn('REVIEW_EFFORT="${REVIEW_EFFORT:-high}"', reviewer)
+        self.assertIn('--effort "$REVIEW_EFFORT"', reviewer)
+        self.assertNotIn("--effort low", reviewer)
+        self.assertIn("REVIEW_EFFORT must be one of", reviewer)
+
     def test_poster_rechecks_head_after_claim_and_after_publish(self):
         """The head can move while the claim or the comment is in flight.
 

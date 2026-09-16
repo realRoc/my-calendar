@@ -11,6 +11,11 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly RENDERER="$SCRIPT_DIR/render_review.py"
 readonly REVIEW_MAX_ATTEMPTS="${REVIEW_MAX_ATTEMPTS:-3}"
 readonly REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-900}"
+# Reasoning effort for the reviewer. `low` returned an empty findings array on a
+# ~1000-line diff while the Codex reviewer found two real blockers on the same
+# SHA, so the default is deliberately `high`.
+readonly REVIEW_EFFORT="${REVIEW_EFFORT:-high}"
+readonly REVIEW_EFFORT_ALLOWED="low medium high xhigh max"
 
 PR_URL=""
 OUTPUT_FILE=""
@@ -94,6 +99,12 @@ if [[ ! "$REVIEW_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || [[ "$REVIEW_MAX_ATTEMPTS" 
 fi
 if [[ ! "$REVIEW_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: REVIEW_TIMEOUT_SEC must be a positive integer" >&2
+    exit 2
+fi
+# Reject an unknown level rather than letting the CLI fall back silently: a typo
+# would otherwise downgrade the review without any signal.
+if [[ " $REVIEW_EFFORT_ALLOWED " != *" $REVIEW_EFFORT "* ]]; then
+    echo "ERROR: REVIEW_EFFORT must be one of: $REVIEW_EFFORT_ALLOWED" >&2
     exit 2
 fi
 
@@ -279,7 +290,7 @@ run_reviewer() {
     run_with_timeout \
         claude --print \
         --model "$REVIEW_MODEL" \
-        --effort low \
+        --effort "$REVIEW_EFFORT" \
         --output-format json \
         --json-schema "$review_schema" \
         --permission-mode plan \

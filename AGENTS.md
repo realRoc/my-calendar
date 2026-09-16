@@ -361,7 +361,7 @@ my-calendar = 多个互相独立的模块（节日 / PR 监控 / health / 未来
 - `.agents/skills/pr/scripts/light_pr.sh` 创建/更新 PR 时默认不再触发后台 `pr_watcher.py --force`
 - helper 只在本次 `git push` 上设置 `MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW=1`，让全局 pre-push hook 保留 repo-local `pre-push.local` 安全检查，但跳过 detached review 触发
 - PR 创建/更新后，helper 调 `scripts/pr_session_review.py --claim` 把当前 head SHA 标为 `pending_review_source=current-session`，避免 launchd 兜底在当前 Codex/Claude session review 期间抢跑
-- 当前 session 调 `.agents/skills/pr/scripts/review_with_opus.sh`，由 Teamorouter 路由到 `claude-opus-5` 做无工具、无会话持久化的只读 diff review。该脚本要求结构化 JSON-Schema 输出，由 `render_review.py` 确定性地渲染成评论正文并本地推导结论；非法响应最多重试 3 次
+- 当前 session 调 `.agents/skills/pr/scripts/review_with_opus.sh`，由 Teamorouter 路由到 `claude-opus-5`，**默认 `--effort high`**（可用 `REVIEW_EFFORT` 覆盖为 low/medium/high/xhigh/max，非法值直接报错退出），做无工具、无会话持久化的只读 diff review。该脚本要求结构化 JSON-Schema 输出，由 `render_review.py` 确定性地渲染成评论正文并本地推导结论；非法响应最多重试 3 次，每次调用有 `REVIEW_TIMEOUT_SEC`（默认 900s）的 wall-clock 上限。**注意**：早期用 `--effort low` 时，opus reviewer 在约 1000 行的 diff 上返回空 findings，而同一 SHA 的 codex reviewer 找到 2 个真 blocker——所以默认值定为 `high`
 - 评论由 `scripts/review_and_post.sh` 发布：它复验 PR SHA、复用已存在的同 SHA 评论避免重复、校验发出内容，再调 `scripts/pr_record_review_trigger.sh <pr-url> <comment-url> <origin-cwd>` 写 "PR 监控" 日历。如果调用方是 Codex Desktop，后者会用 Terminal bridge 执行 `scripts/pr_session_review.py --record`
 - reviewer 子进程的凭据由 `review_with_opus.sh` 显式从 `~/.claude/settings.json` 解析并 export。宿主（如 Claude Desktop，`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`）可能只注入自己的 `ANTHROPIC_BASE_URL` 而不下发 token，此时若照搬环境变量，config 检查会直接失败、或子进程报 `Not logged in`
 - 老的异步路径仍保留：`light_pr.sh --trigger-async-review` / `--trigger-only`、普通 `git push`、外部工具调用 `pr-created`、launchd 兜底都继续走 Codex 驱动的 `pr_watcher.py`，不使用 Opus
