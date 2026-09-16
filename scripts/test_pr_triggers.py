@@ -1305,6 +1305,18 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
         # The credential is exported for the child, never passed as argv.
         self.assertNotIn('env ANTHROPIC_AUTH_TOKEN=', reviewer)
 
+    def test_reviewer_skips_host_mcp_servers(self):
+        """`--tools ""` disables built-in tools but still starts MCP servers.
+
+        A user-scope server (chrome-devtools) then blocks the one-shot reviewer
+        indefinitely, so the review never returns. --strict-mcp-config with no
+        --mcp-config loads none of them.
+        """
+        reviewer = (self.SKILL / "scripts" / "review_with_opus.sh").read_text(encoding="utf-8")
+        self.assertIn("--strict-mcp-config", reviewer)
+        self.assertNotIn("--mcp-config", reviewer)
+        self.assertIn('--tools ""', reviewer)
+
     def test_skill_documents_the_opus_marker_it_actually_posts(self):
         post = (self.SKILL / "scripts" / "review_and_post.sh").read_text(encoding="utf-8")
         self.assertIn("<!-- pr-review-model: claude-opus-5; provider: teamorouter -->", post)

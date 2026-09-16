@@ -250,6 +250,7 @@ run_reviewer() {
         --json-schema "$review_schema" \
         --permission-mode plan \
         --tools "" \
+        --strict-mcp-config \
         --disable-slash-commands \
         --no-session-persistence \
         --setting-sources user \
