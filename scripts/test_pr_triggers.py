@@ -1332,19 +1332,25 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
         self.assertIn("kill -9", reviewer)
         self.assertIn("command -v timeout", reviewer)
 
-    def test_reviewer_defaults_above_low_effort(self):
-        """`--effort low` reviewed ~1000 lines and returned no findings at all.
+    def test_reviewer_defaults_to_low_effort_for_completion(self):
+        """The default is pick-the-one-that-finishes, not the deepest.
 
-        The Codex reviewer found two real blockers on that same SHA. `high` is
-        also unusable — on the same diff it never emitted structured output and
-        burned every retry — so the default is `medium`, overridable, with an
-        unknown level failing loudly instead of silently downgrading.
+        Measured on this repo's ~1300-line PR #48 diff: `low` returned in
+        ~450s, `medium` exceeded 1800s, and `high` never emitted
+        structured_output. Only `low` completes on a diff that size.
+
+        The accepted cost: on that same diff `low` returned an empty findings
+        array while the Codex reviewer found two real blockers. A clean low
+        verdict on a large PR is therefore weak evidence, not clearance.
         """
         reviewer = (self.SKILL / "scripts" / "review_with_opus.sh").read_text(encoding="utf-8")
-        self.assertIn('REVIEW_EFFORT="${REVIEW_EFFORT:-medium}"', reviewer)
+        self.assertIn('REVIEW_EFFORT="${REVIEW_EFFORT:-low}"', reviewer)
+        # Level is still passed through the variable, so the override works and
+        # an unknown level is rejected rather than silently downgraded.
         self.assertIn('--effort "$REVIEW_EFFORT"', reviewer)
-        self.assertNotIn("--effort low", reviewer)
         self.assertIn("REVIEW_EFFORT must be one of", reviewer)
+        # The bound must fit the default level, or every run fails on timeout.
+        self.assertIn('REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-900}"', reviewer)
 
     def test_poster_rechecks_head_after_claim_and_after_publish(self):
         """The head can move while the claim or the comment is in flight.

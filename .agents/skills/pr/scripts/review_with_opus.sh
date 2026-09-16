@@ -12,14 +12,16 @@ readonly RENDERER="$SCRIPT_DIR/render_review.py"
 readonly REVIEW_MAX_ATTEMPTS="${REVIEW_MAX_ATTEMPTS:-3}"
 # Must accommodate the effort level below. Measured on this repo's own ~1300-line
 # PR #48 diff: `low` finished in ~450s, `medium` exceeded 1200s, and `high` never
-# produced structured output at all. Worst case is MAX_ATTEMPTS x this bound, so
-# lower it (or REVIEW_MAX_ATTEMPTS) to cap cost.
-readonly REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-1800}"
-# Reasoning effort for the reviewer. `low` returned an empty findings array on a
-# ~1000-line diff while the Codex reviewer found two real blockers on the same
-# SHA, so the default is above `low`. `high` is not usable here: on that same
-# diff it never produced structured output, so it burned every retry and failed.
-readonly REVIEW_EFFORT="${REVIEW_EFFORT:-medium}"
+# produced structured output at all. 900s keeps ~2x headroom over the only level
+# that completes on a diff that size.
+readonly REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-900}"
+# Reasoning effort for the reviewer. Chosen for completion, not depth: on a
+# ~1300-line diff `low` is the only level that reliably returns, and both
+# `medium` (>1800s) and `high` (no structured_output at all) failed there. The
+# trade-off is real and accepted — on that same diff `low` returned an empty
+# findings array while the Codex reviewer found two real blockers, so treat a
+# clean `low` verdict on a large PR as weak evidence rather than clearance.
+readonly REVIEW_EFFORT="${REVIEW_EFFORT:-low}"
 readonly REVIEW_EFFORT_ALLOWED="low medium high xhigh max"
 
 PR_URL=""
