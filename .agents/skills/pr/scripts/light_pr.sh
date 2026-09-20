@@ -15,6 +15,7 @@ DRAFT=0
 TITLE=""
 BODY_FILE=""
 TRIGGER_ONLY=0
+CLAIM_ONLY=0
 PR_URL_ARG=""
 ALLOW_DIRTY=0
 AUTO_BODY_FILE=""
@@ -33,12 +34,14 @@ usage() {
     cat <<'EOF'
 Usage:
   light_pr.sh [--base <branch>] [--draft] [--title <title>] [--body-file <file>] [--allow-dirty] [--trigger-async-review]
+  light_pr.sh --claim-only <github-pr-url>
   light_pr.sh --trigger-only <github-pr-url>
 
 Creates a new GitHub PR or updates an existing OPEN PR for the current branch.
 By default, it reserves the PR for the current agent session's review and does
 not launch the background codex watcher. MERGED/CLOSED PRs are never reused as
-the current handoff.
+the current handoff. --claim-only reserves an existing OPEN PR without pushing
+or editing it.
 EOF
 }
 
@@ -73,6 +76,11 @@ while [[ $# -gt 0 ]]; do
             PR_URL_ARG="${2:-}"
             shift 2
             ;;
+        --claim-only)
+            CLAIM_ONLY=1
+            PR_URL_ARG="${2:-}"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -84,6 +92,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$TRIGGER_ONLY" -eq 1 && "$CLAIM_ONLY" -eq 1 ]]; then
+    echo "ERROR: --trigger-only and --claim-only are mutually exclusive" >&2
+    exit 2
+fi
 
 need_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -194,7 +207,7 @@ ensure_pr_text() {
     fi
 
     BODY_SOURCE="generated"
-    AUTO_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/light-pr-body.XXXXXX.md")"
+    AUTO_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/light-pr-body.XXXXXX")"
     BODY_FILE="$AUTO_BODY_FILE"
 
     if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
@@ -241,6 +254,22 @@ if [[ "$TRIGGER_ONLY" -eq 1 ]]; then
     fi
     echo "PR_URL=$PR_URL_ARG"
     trigger_my_calendar "$PR_URL_ARG" "$repo_root"
+    exit 0
+fi
+
+if [[ "$CLAIM_ONLY" -eq 1 ]]; then
+    if [[ ! "$PR_URL_ARG" =~ ^https://github\.com/[^/]+/[^/]+/pull/[0-9]+$ ]]; then
+        echo "ERROR: --claim-only requires a GitHub PR URL" >&2
+        exit 2
+    fi
+    need_cmd gh
+    pr_state="$(gh pr view "$PR_URL_ARG" --json state --jq .state)"
+    if [[ "$pr_state" != "OPEN" ]]; then
+        echo "ERROR: refusing to claim a non-open PR: state=${pr_state:-unknown}" >&2
+        exit 1
+    fi
+    echo "PR_URL=$PR_URL_ARG"
+    claim_current_session_review "$PR_URL_ARG" "$repo_root"
     exit 0
 fi
 

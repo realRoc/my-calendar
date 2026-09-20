@@ -1,157 +1,157 @@
 ---
 name: pr
-description: Lightweight GitHub PR shipping workflow that creates a new PR or updates an existing OPEN PR with a clear title/body, never reuses merged/closed PRs, then performs the PR review in the current agent session and records that review into my-calendar. Use when the user says "/pr", "create a PR", "open a PR", "light ship", "走 my-calendar 检查", "发个 PR 让日历 review", "别跑完整 ship", or otherwise wants a quick PR handoff instead of the full release /ship flow.
+description: Create or update a lightweight GitHub PR, review an open PR with Claude Opus 5 through Teamorouter, post a deterministic code-review comment, and record it in my-calendar. Use for /pr, create/open/update PR, quick PR handoff, rerun code review, or my-calendar review requests.
 ---
 
 # PR
 
-Create or update a GitHub PR with a clear title/body, then review it in this same agent session. After posting the GitHub PR comment, ask my-calendar to record that already-posted comment into the "PR 监控" calendar.
+Create or update a GitHub PR, delegate review to `claude-opus-5` through Teamorouter, post the validated result, and record the comment in my-calendar. Never merge the PR.
 
-This is the light path. Do not run the full `/ship` ceremony: no version bump, no CHANGELOG, no TODOS sweep, no review army, no release promotion.
+Do not run `/ship`: no version bump, changelog, release promotion, or review army.
 
-Why current-session review: Codex Desktop may not have Calendar permission and detached background Codex sessions are harder to surface back into the active thread. The helper reserves the PR SHA so launchd will not race the current review, while Terminal handles the short Calendar write if macOS TCC requires it.
+## Reliability contract
 
-## Workflow
+- Use `scripts/review_with_opus.sh`; never ask the current model to replace Opus.
+- Opus returns JSON-Schema-validated findings only. `scripts/render_review.py` renders the publishable Markdown and derives the conclusion locally.
+- Ignore Claude's free-form `result`; only `structured_output` may reach the renderer. This prevents analysis drafts and format instructions from leaking into GitHub.
+- Retry invalid/API responses up to three fresh, non-persistent Opus calls.
+- Use `scripts/review_and_post.sh` for posting. Do not construct or submit the GitHub comment manually.
+- The posting helper rechecks the PR SHA, uses canonical markers, reuses an existing same-SHA comment, verifies the posted body, and records it in my-calendar.
+- In review-only mode, claim my-calendar only after a valid review exists. A pre-comment failure releases the current-session claim automatically.
+- Never delete or rewrite an existing review comment.
 
-1. Preflight the repo.
+## Severity policy
 
-   ```bash
-   git rev-parse --show-toplevel
-   git branch --show-current
-   git remote get-url origin
-   git status --short
-   gh auth status
-   ```
+- `P0`: concrete reachable defect with severe production impact: exploitable security/permission failure, material data loss/corruption, widespread outage, or critically wrong financial/business results. Any P0 blocks merge.
+- `P1`: real low-impact bug that is safe to merge and may be fixed later. P1 never blocks merge.
+- Do not report P2/P3, style nits, speculative hardening, rare edge cases, or missing tests unless they directly prove a P0.
 
-   Abort if the current branch is the PR base/default branch, if the remote is not GitHub, or if `gh` is not authenticated.
+The deterministic renderer emits exactly one final line:
 
-2. Understand the diff and run a narrow verification.
-
-   Use the repository's existing instructions first (`AGENTS.md`, `README`, package scripts, Makefile, CI config). Prefer the smallest check that reasonably covers the changed surface. Do not invent a release checklist.
-
-   If no obvious check exists, say that and continue only if the change is documentation/config-only or the user explicitly asked for a quick PR.
-
-3. Commit local changes if needed.
-
-   Stage files deliberately. Do not use `git add -A` unless the repository explicitly allows it and the status is clean of generated/local files. Preserve any unrelated user changes.
-
-   Follow the repo's commit style. If the commit is AI-authored and the repo has an AI coauthor convention, include the appropriate trailer.
-
-4. Prepare the PR title and description.
-
-   Always write an intentional PR title and description before invoking the helper. Do not rely on GitHub's default `--fill` text except as a last-resort fallback.
-
-   Title:
-   - Use the repository's commit/PR style when obvious.
-   - Name the user-visible or operator-visible outcome, not just the edited file.
-   - For fix PRs, prefer `fix(scope): concise problem/outcome`.
-
-   Description must include:
-   - `解决什么问题`: what broke, who saw it, and why this PR exists.
-   - `实现方式`: the concrete technical approach and important tradeoffs.
-   - `验证`: the focused checks that passed, or what was intentionally skipped and why.
-
-   Keep it concise, but make it useful to a reviewer opening the PR cold.
-
-5. Run the helper from this skill directory.
-
-   Resolve the path relative to the `SKILL.md` you loaded:
-
-   ```bash
-   SKILL_DIR=/path/to/pr
-   bash "$SKILL_DIR/scripts/light_pr.sh" --title "fix(scope): clear outcome" --body-file /path/to/pr-body.md
-   ```
-
-   The helper will:
-   - detect the repo root, current branch, GitHub repo, and default branch
-   - push `HEAD` to `origin/<branch>` without force, setting `MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW=1` only for that push so the global pre-push hook does not start a detached background review
-   - inspect existing PRs for the current branch and target base
-   - reuse only an existing `OPEN` PR, then update its title and description
-   - create a new PR when the previous PR for that branch is `MERGED` or `CLOSED`
-   - mark the current PR SHA as `pending_review_source=current-session` in my-calendar state, which prevents the 10-minute launchd fallback from racing this session; if the same SHA is already reviewed or owned by an in-flight watcher, the helper aborts before this session posts a duplicate review
-
-6. Review the PR in the current session.
-
-   Fetch the final PR metadata and diff after the helper returns:
-
-   ```bash
-   gh pr view <pr-url> --json url,number,title,baseRefName,headRefName,headRefOid
-   gh pr diff <pr-url>
-   ```
-
-   Treat this as a code review: prioritize bugs, behavioral regressions, missing tests, security/data risks, and operational hazards. Keep style nits out unless they hide a real defect. If the diff is too large for a reliable review, say so in the comment and use the `❌ 暂不可合并` conclusion.
-
-   Before posting, re-read `headRefOid`; the hidden SHA marker must match the current head.
-
-7. Post the review comment.
-
-   The comment body must start exactly with the AI attribution block and current head SHA marker:
-
-   ```markdown
-   > 🤖 由 Codex 自动生成
-   <!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->
-   <!-- pr-watcher-head-sha: <head_sha> -->
-
-   ```
-
-   Then write concise findings. End with exactly one conclusion line using one of:
-
-   ```markdown
-   结论：✅ 可以合并
-   结论：⚠️ 修正后可合并
-   结论：❌ 暂不可合并
-   ```
-
-   Post with `gh pr comment <pr-url> --body-file <comment-file>`, then capture the returned or latest comment URL.
-
-8. Record the posted comment into my-calendar.
-
-   From the my-calendar checkout, run:
-
-   ```bash
-   bash scripts/pr_record_review_trigger.sh <pr-url> <comment-url> <repo-root>
-   ```
-
-   If the current app lacks Calendar permission, this trigger opens a short Terminal `.command`, waits for its status file, and prints `MY_CALENDAR_RECORD=terminal-bridge:success` on success. The recorder validates that the comment contains the canonical AI marker and the current `head_sha`, then writes Calendar/state and clears the current-session pending marker.
-
-9. Report only the essentials.
-
-   Return the PR URL, the review verdict, whether my-calendar recording succeeded, and any verification command that passed or was skipped.
-
-## Helper Options
-
-Use these only when the user or repo context calls for them:
-
-```bash
-bash "$SKILL_DIR/scripts/light_pr.sh" --base <branch>
-bash "$SKILL_DIR/scripts/light_pr.sh" --draft
-bash "$SKILL_DIR/scripts/light_pr.sh" --title "PR title"
-bash "$SKILL_DIR/scripts/light_pr.sh" --body-file /path/to/body.md
-bash "$SKILL_DIR/scripts/light_pr.sh" --allow-dirty
-bash "$SKILL_DIR/scripts/light_pr.sh" --trigger-async-review
-bash "$SKILL_DIR/scripts/light_pr.sh" --trigger-only <pr-url>
+```text
+结论：✅ 可以合并
 ```
 
-`--trigger-async-review` keeps the old behavior: after PR create/update, call my-calendar's `pr-created` hook so detached `pr_watcher.py --force` launches a background Codex review.
+or, only when a P0 exists:
 
-`--trigger-only` skips push and PR creation and just hands an existing GitHub PR URL to the old asynchronous my-calendar path.
+```text
+结论：❌ 暂不可合并
+```
 
-Use `--allow-dirty` only after you have listed the remaining local changes and confirmed they are unrelated user-owned work that must not be included in this PR.
+## 1. Select mode and preflight
 
-If you are supplementing an existing PR, first inspect that PR's state. If it is `OPEN`, continue on the same branch, append commits, and let the helper update the PR title/body. If it is `MERGED` or `CLOSED`, use a fresh branch or allow the helper to create a fresh PR for the current branch; do not treat a non-open PR as the active handoff.
+Use handoff mode when creating/updating a PR from the current branch. Use review-only mode when reviewing an existing PR URL without changing its branch or metadata.
 
-## Safety Rules
+Run:
 
-- Never force-push.
-- Never use `--no-verify`.
-- Never push from the base/default branch.
-- Never target a non-default base unless the user explicitly asks.
-- If tests fail, stop before pushing unless the user explicitly requested a WIP/draft PR.
-- If using `--allow-dirty`, explicitly report which local changes were left out.
-- Never reuse a merged or closed PR as the current handoff. New code after a merged/closed PR needs a new open PR.
-- For an open existing PR, update the PR title and description to match the final branch contents before reviewing.
-- If the my-calendar hook is missing, still report the PR URL, then tell the user to run `bash scripts/install_git_hook.sh` from their my-calendar checkout.
+```bash
+git rev-parse --show-toplevel
+git branch --show-current
+git remote get-url origin
+git status --short
+gh auth status
+bash "$SKILL_DIR/scripts/review_with_opus.sh" --check-config
+```
 
-## Boundary With Other Skills
+Confirm the PR is `OPEN`. In handoff mode, abort on the default/base branch, a non-GitHub origin, failed tests, or uncommitted changes that are not explicitly allowed. In review-only mode, do not switch/push/edit the user's branch or PR metadata.
 
-Use `/ship` for production/default-branch release promotion and heavyweight release checks. Use `/ship-dev` for a repository-specific direct-to-dev deployment workflow. Use this `pr` skill for the fast PR loop where the active agent session performs the review and my-calendar records the result.
+## 2. Understand and verify
+
+Read repository instructions and the changed diff. Run the smallest existing check that covers the changed surface. Do not invent a release checklist.
+
+In handoff mode, commit only intended files and prepare an intentional title and body containing:
+
+- `解决什么问题`
+- `实现方式`
+- `验证`
+
+## 3. Create or reserve the PR
+
+Handoff mode:
+
+```bash
+bash "$SKILL_DIR/scripts/light_pr.sh" \
+  --title "fix(scope): clear outcome" \
+  --body-file /path/to/pr-body.md
+```
+
+The helper pushes without force, creates or updates only an `OPEN` PR to the default branch, and reserves its current SHA in my-calendar. Never reuse a merged/closed PR.
+
+Review-only mode: do not claim yet. Review first so a malformed/provider failure cannot leave a stale pending marker.
+
+## 4. Generate and inspect the review
+
+```bash
+REVIEW_FILE="$(mktemp "${TMPDIR:-/tmp}/pr-review.XXXXXX")"
+REVIEW_STATUS="$(bash "$SKILL_DIR/scripts/review_with_opus.sh" \
+  --pr-url <pr-url> \
+  --output "$REVIEW_FILE")"
+printf '%s\n' "$REVIEW_STATUS"
+REVIEW_HEAD_SHA="$(awk -F= '$1 == "REVIEW_HEAD_SHA" { print $2 }' <<<"$REVIEW_STATUS" | tail -1)"
+```
+
+Require all of:
+
+- `REVIEW_MODEL=claude-opus-5`
+- `REVIEW_PROVIDER=teamorouter`
+- `REVIEW_TRANSPORT=json-schema`
+- `REVIEW_GENERATION=ok`
+- one final canonical conclusion line
+
+Inspect each finding against the visible diff. If a finding is materially unsupported, write factual feedback and run exactly one replacement review:
+
+```bash
+FEEDBACK_FILE="$(mktemp "${TMPDIR:-/tmp}/pr-review-feedback.XXXXXX")"
+CORRECTED_FILE="$(mktemp "${TMPDIR:-/tmp}/pr-review-corrected.XXXXXX")"
+bash "$SKILL_DIR/scripts/review_with_opus.sh" \
+  --pr-url <pr-url> \
+  --output "$CORRECTED_FILE" \
+  --validation-feedback-file "$FEEDBACK_FILE"
+```
+
+Use the corrected file unchanged when it validates. Never manually edit, delete, reorder, or change Opus findings or verdicts.
+
+## 5. Post, verify, and record
+
+Review-only mode:
+
+```bash
+bash "$SKILL_DIR/scripts/review_and_post.sh" \
+  --pr-url <pr-url> \
+  --repo-root <repo-root> \
+  --review-file "$REVIEW_FILE" \
+  --review-head-sha "$REVIEW_HEAD_SHA"
+```
+
+Handoff mode passes the claim created by `light_pr.sh`:
+
+```bash
+bash "$SKILL_DIR/scripts/review_and_post.sh" \
+  --pr-url <pr-url> \
+  --repo-root <repo-root> \
+  --review-file "$REVIEW_FILE" \
+  --review-head-sha "$REVIEW_HEAD_SHA" \
+  --already-claimed
+```
+
+Require:
+
+- `GITHUB_COMMENT=posted` or `GITHUB_COMMENT=reused`
+- a canonical `REVIEW_COMMENT_URL`
+- `MY_CALENDAR_RECORD=...success`
+- `REVIEW_AND_POST=ok`
+
+If GitHub returns an ambiguous failure, the helper queries the canonical SHA marker before retrying, preventing duplicate comments. If posting fails before a comment exists, it safely releases only the matching `current-session` claim.
+
+## 6. Report
+
+Return only the PR URL, review verdict, comment URL, my-calendar result, and focused verification. Do not merge.
+
+## Safety
+
+- Never force-push or use `--no-verify`.
+- Never post a review for a stale SHA.
+- Never target a non-default base unless explicitly requested.
+- Never reuse merged/closed PRs.
+- Preserve unrelated local changes.
+- If my-calendar is unavailable, keep the verified GitHub comment and report the recording failure; do not post a duplicate.

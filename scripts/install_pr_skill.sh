@@ -45,7 +45,12 @@ install_one() {
     fi
 
     cp -R "$SOURCE" "$target"
-    chmod +x "$target/scripts/light_pr.sh"
+    chmod +x \
+        "$target/scripts/light_pr.sh" \
+        "$target/scripts/review_with_opus.sh" \
+        "$target/scripts/review_and_post.sh" \
+        "$target/scripts/release_current_session_claim.py" \
+        "$target/scripts/render_review.py"
     echo "Installed $target"
 }
 

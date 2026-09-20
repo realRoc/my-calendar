@@ -48,6 +48,7 @@ Every artifact that is "AI-generated, no human in the loop" carries a machine-de
 | hand-typed human PR / comment | none |
 
 The blockquote is the human-visible signal; the HTML comment is the stable grep key for scanners. Prompt templates hard-enforce both, and `scripts/test_pr_watcher.py` locks the canonical strings so an edit that mangles them turns the tests red.
+The lightweight `/pr` path keeps that canonical orchestrator marker for compatibility and additionally emits `<!-- pr-review-model: claude-opus-5; provider: teamorouter -->` so the delegated reviewer is explicit.
 
 ---
 
@@ -114,7 +115,7 @@ bash scripts/install_pr_skill.sh
 bash scripts/install_app.sh                       # builds + installs MyCalFix.app, registers mycalfix:// scheme
 ```
 
-After that, every ordinary local `git push` kicks off a background codex review (comment + calendar event) within a couple of seconds, without blocking the push. In Claude Code or Codex, say `/pr` when you want the light PR path: focused checks, push/create PR, current-session review/comment, then my-calendar records that comment into Calendar.
+After that, every ordinary local `git push` kicks off a background codex review (comment + calendar event) within a couple of seconds, without blocking the push. In Claude Code or Codex, say `/pr` when you want the light PR path: focused checks, push/create PR, a read-only `claude-opus-5` review routed through Teamorouter, then the current session posts and records that comment into Calendar. The Opus path expects Claude Code user settings with `ANTHROPIC_BASE_URL=https://api.teamorouter.com` and a Teamorouter credential.
 
 > If a repo already has its own `.git/hooks/pre-push` (CI checks etc.), rename it to `.git/hooks/pre-push.local` — the global hook execs it first, then triggers the watcher. To opt a repo out entirely: `git -C <repo> config core.hooksPath .git/hooks`.
 
