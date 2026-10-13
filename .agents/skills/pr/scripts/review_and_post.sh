@@ -250,7 +250,7 @@ else
         printf '%s\n' '> 🤖 由 Codex 自动生成'
         printf '%s\n' '<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->'
         printf '<!-- pr-watcher-head-sha: %s -->\n' "$head_sha"
-        printf '%s\n' '<!-- pr-review-model: claude-opus-5; provider: teamorouter -->'
+        printf '%s\n' '<!-- pr-review-model: claude-opus-5-5; provider: teamorouter -->'
         printf '\n'
         command cat "$REVIEW_FILE"
     } > "$COMMENT_FILE"
