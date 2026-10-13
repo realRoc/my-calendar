@@ -1,11 +1,11 @@
 ---
 name: pr
-description: Create or update a lightweight GitHub PR, review an open PR with Claude Opus 5 through Teamorouter, post a deterministic code-review comment, and record it in my-calendar. Use for /pr, create/open/update PR, quick PR handoff, rerun code review, or my-calendar review requests.
+description: Create or update a lightweight GitHub PR, review an open PR with Claude Opus 5.5 through Teamorouter, post a deterministic code-review comment, and record it in my-calendar. Use for /pr, create/open/update PR, quick PR handoff, rerun code review, or my-calendar review requests.
 ---
 
 # PR
 
-Create or update a GitHub PR, delegate review to `claude-opus-5` through Teamorouter, post the validated result, and record the comment in my-calendar. Never merge the PR.
+Create or update a GitHub PR, delegate review to `claude-opus-5-5` through Teamorouter, post the validated result, and record the comment in my-calendar. Never merge the PR.
 
 Do not run `/ship`: no version bump, changelog, release promotion, or review army.
 
@@ -92,7 +92,7 @@ REVIEW_HEAD_SHA="$(awk -F= '$1 == "REVIEW_HEAD_SHA" { print $2 }' <<<"$REVIEW_ST
 
 Require all of:
 
-- `REVIEW_MODEL=claude-opus-5`
+- `REVIEW_MODEL=claude-opus-5-5`
 - `REVIEW_PROVIDER=teamorouter`
 - `REVIEW_TRANSPORT=json-schema`
 - `REVIEW_GENERATION=ok`

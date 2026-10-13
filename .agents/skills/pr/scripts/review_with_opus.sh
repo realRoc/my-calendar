@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Generate a deterministic, read-only PR review with Claude Opus 5 through Teamorouter.
+# Generate a deterministic, read-only PR review with Claude Opus 5.5 through Teamorouter.
 
 set -euo pipefail
 export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-readonly REVIEW_MODEL="claude-opus-5"
+readonly REVIEW_MODEL="claude-opus-5-5"
 readonly REVIEW_PROVIDER="teamorouter"
 readonly TEAMOROUTER_BASE_URL="https://api.teamorouter.com"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,7 +48,7 @@ Usage:
   review_with_opus.sh --check-config
   review_with_opus.sh --pr-url <github-pr-url> --output <review-file> [--validation-feedback-file <file>]
 
-Fetch PR metadata and diff with gh, ask Claude Opus 5 for JSON-Schema-validated
+Fetch PR metadata and diff with gh, ask Claude Opus 5.5 for JSON-Schema-validated
 findings, then render deterministic publishable Markdown locally. Free-form model
 text is never copied into the review comment.
 EOF
