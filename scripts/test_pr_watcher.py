@@ -29,6 +29,34 @@ import pr_watcher  # noqa: E402
 import calendar_sync  # noqa: E402
 
 
+_MODULE_PATCHES: list = []
+_REAL_LAUNCH_AUTO_FIX = pr_watcher._launch_auto_fix
+
+
+def setUpModule():
+    """Keep the auto-fix loop and the Opus fallback inert unless a test opts in.
+
+    A ❌ verdict on the success path would otherwise spawn launch_fix.sh (a
+    real Terminal + yolo claude session), and a failed Codex draft would run
+    the real review_with_opus.sh against GitHub.
+    """
+    _MODULE_PATCHES[:] = [
+        mock.patch.object(pr_watcher, "AUTO_FIX_CONFIG", {"enabled": False, "max_review_rounds": 5}),
+        mock.patch.object(pr_watcher, "REVIEW_FALLBACK_CONFIG", {"enabled": False, "opus_script": Path("/nonexistent")}),
+        mock.patch.object(
+            pr_watcher, "_launch_auto_fix",
+            lambda url: (_ for _ in ()).throw(AssertionError(f"test tried to launch a real fix: {url}")),
+        ),
+    ]
+    for p in _MODULE_PATCHES:
+        p.start()
+
+
+def tearDownModule():
+    for p in reversed(_MODULE_PATCHES):
+        p.stop()
+
+
 class CalendarRemoveEventTests(unittest.TestCase):
     def test_remove_event_keeps_state_when_eventkit_delete_fails(self):
         saved_states: list[dict] = []
@@ -1323,14 +1351,14 @@ class ProcessPrCancelShortCircuitTests(unittest.TestCase):
 
 
 class ProcessPrMissingAICommentTests(unittest.TestCase):
-    """A clean codex exit is not enough to mark a SHA reviewed.
+    """A clean codex exit without a usable draft is not a review.
 
-    pr_watcher's durable completion boundary is the GitHub AI-marker comment:
-    without it, calendar/state/meta writes would falsely suppress future
-    review attempts for a commit that never received review feedback.
+    Codex only drafts the body now; when the draft is unusable and the Opus
+    fallback is unavailable, nothing may be persisted, and the run's pending
+    claim must be released immediately (not left for the stale timer).
     """
 
-    def test_missing_ai_comment_keeps_pending_and_skips_persist(self):
+    def test_unusable_draft_without_fallback_releases_pending_and_skips_persist(self):
         pr = pr_watcher.PRSnap(
             url="https://github.com/realRoc/my-calendar/pull/64",
             number=64, title="missing comment boundary", is_draft=False,
@@ -1382,18 +1410,23 @@ class ProcessPrMissingAICommentTests(unittest.TestCase):
                         "fetch_latest_ai_comment_since",
                         lambda repo, number, since, **kw: pr_watcher.AICommentLookup("absent"),
                     ), \
+                    mock.patch.object(pr_watcher, "publish_review_comment",
+                                      lambda *a, **kw: self.fail("an unusable draft must not be published")), \
                     mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None):
                 ret = pr_watcher.process_pr(pr, state, dry_run=False)
 
-            self.assertIn("review comment missing", ret)
+            self.assertIn("review failed", ret)
             self.assertEqual(upsert_calls, [], "calendar events require a confirmed AI comment")
             self.assertFalse(meta_path.exists(), "sidecar must not exist without a confirmed AI comment")
             entry = state["prs"][pr.url]
             self.assertEqual(entry["last_commented_sha"], "oldsha")
-            self.assertEqual(entry["pending_review_sha"], pr.head_sha)
-            self.assertEqual(entry["pending_review_source"], "force")
+            self.assertNotIn("pending_review_sha", entry, "a failed run must release its claim at once")
+            self.assertEqual(entry["review_failed_sha"], pr.head_sha)
+            self.assertEqual(entry["review_failed_attempts"], 1)
             self.assertFalse(scratch.exists(), "scratch dir should still be cleaned up")
-            self.assertIn("_review_comment_missing", jsonl_path.read_text(encoding="utf-8"))
+            log = jsonl_path.read_text(encoding="utf-8")
+            self.assertIn("_codex_review_failed", log)
+            self.assertIn("_review_failed", log)
 
 
 class ProcessPrHeadMovedRevalidationTests(unittest.TestCase):
@@ -4013,59 +4046,51 @@ class AICoAuthorMarkerContractTests(unittest.TestCase):
     PR_HEAD_SHA_METADATA_MARKER = "<!-- pr-watcher-head-sha: {head_sha} -->"
     FIX_COAUTHOR_TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
 
-    def test_pr_prompt_requires_blockquote_marker_on_first_line(self):
-        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
-        self.assertIn(
-            self.PR_BLOCKQUOTE_MARKER, body,
-            "pr_prompt.md lost the canonical AI-coauthor blockquote marker — "
-            "PR comments would stop being machine-identifiable as AI-generated",
+    def _rendered(self, sha: str = "abc123", **kw) -> str:
+        return pr_watcher.render_review_comment(sha, "## 建议\n\n- 暂无额外建议\n\n结论：✅ 可以合并", **kw)
+
+    def test_published_comment_starts_with_blockquote_marker(self):
+        # The watcher (not the model) publishes, so the contract now lives in
+        # render_review_comment rather than in the prompt text.
+        self.assertTrue(
+            self._rendered().startswith(self.PR_BLOCKQUOTE_MARKER + "\n"),
+            "published review lost the canonical AI-coauthor blockquote marker",
         )
 
-    def test_pr_prompt_requires_html_metadata_marker(self):
-        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
-        self.assertIn(
-            self.PR_HTML_METADATA_MARKER, body,
-            "pr_prompt.md lost the HTML metadata marker — scanner parseability lost",
-        )
-
-    def test_pr_prompt_requires_head_sha_metadata_marker(self):
-        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
-        self.assertIn(
-            self.PR_HEAD_SHA_METADATA_MARKER, body,
-            "pr_prompt.md lost the head-sha marker — watcher completion could "
-            "reuse an AI comment for the wrong commit",
-        )
+    def test_published_comment_carries_html_and_head_sha_metadata(self):
+        lines = self._rendered("abc123").splitlines()
+        self.assertEqual(lines[1], self.PR_HTML_METADATA_MARKER)
+        self.assertEqual(lines[2], self.PR_HEAD_SHA_METADATA_MARKER.format(head_sha="abc123"))
 
     def test_runtime_recovery_marker_matches_prompt_contract(self):
         self.assertEqual(pr_watcher.AI_COAUTHOR_METADATA_MARKER, self.PR_HTML_METADATA_MARKER)
+        self.assertEqual(pr_watcher.AI_COAUTHOR_BLOCKQUOTE_MARKER, self.PR_BLOCKQUOTE_MARKER)
         self.assertEqual(
             pr_watcher.head_sha_metadata_marker("abc123"),
             "<!-- pr-watcher-head-sha: abc123 -->",
         )
 
-    def test_pr_prompt_marker_appears_before_section_headers(self):
-        # The marker must instruct codex to put it FIRST. If it ended up
-        # mentioned only deep in the file after the section list, codex
-        # might position it at the bottom instead. Use position of "## Blocker"
-        # in the prompt's example as a structural anchor.
-        body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
-        marker_pos = body.find(self.PR_BLOCKQUOTE_MARKER)
-        # `## Blocker` is referenced in the formatting rules below the marker
-        # block. Marker must appear before the rules that describe what comes
-        # after it.
-        first_blocker_ref = body.find("## Blocker")
-        self.assertGreater(marker_pos, 0)
-        self.assertLess(
-            marker_pos, first_blocker_ref,
-            "Marker must be described before the section rules it precedes",
-        )
+    def test_published_comment_markers_precede_body_and_label_the_commit(self):
+        out = self._rendered("abcdef1234567890", model_marker="<!-- pr-review-model: m; provider: claude-subscription -->")
+        self.assertLess(out.find(self.PR_HTML_METADATA_MARKER), out.find("## 建议"))
+        self.assertLess(out.find("pr-review-model"), out.find("## 建议"))
+        # Visible label: a review of a superseded commit must say which commit it covers.
+        self.assertIn("**评审 commit**：`abcdef12`", out)
+        self.assertTrue(out.rstrip().endswith("结论：✅ 可以合并"))
 
-    def test_pr_prompt_requires_same_sha_dedupe_before_commenting(self):
+    def test_pr_prompt_forbids_the_model_posting_or_deleting_comments(self):
+        """askmanyai#613: Codex posted a malformed review, deleted it, then died.
+
+        The prompt must make the model a drafter only: no posting, no delete /
+        edit, final reply = body ending in the conclusion line.
+        """
         body = self.PR_PROMPT_PATH.read_text(encoding="utf-8")
-        self.assertIn("发布前去重", body)
-        self.assertIn(self.PR_HTML_METADATA_MARKER, body)
-        self.assertIn(self.PR_HEAD_SHA_METADATA_MARKER, body)
-        self.assertIn("不要再发新评论", body)
+        self.assertIn("不要自己发评论", body)
+        self.assertIn("**不要**调用 `gh pr comment`", body)
+        self.assertIn("**不要**删除或编辑任何评论", body)
+        self.assertIn("最终回复 = 评论正文", body)
+        self.assertIn("结论：❌ 暂不可合并（存在 blocker）", body)
+        self.assertNotIn("用 `gh pr comment {pr_link}", body)
 
     def test_pr_prompt_requires_boundary_condition_review_checklist(self):
         """Keep the PR reviewer looking for recovery/timing edge cases."""
@@ -4997,6 +5022,529 @@ class FixPromptUsesLocalCommentBodyTests(unittest.TestCase):
         body = self.FIX_PROMPT.read_text(encoding="utf-8")
         self.assertIn("gh api", body)
         self.assertIn("/issues/comments/", body)
+
+
+# ─── askmanyai#613 regression: one review per SHA, fallback, release, fix loop ─
+
+
+def _snap613(sha: str = "e955e3b7c541df08", **kw) -> pr_watcher.PRSnap:
+    base = dict(
+        url="https://github.com/floatmiracle/askmanyai/pull/613",
+        number=613, title="ama-model-launch skill", is_draft=False,
+        repo="floatmiracle/askmanyai", base="main", default_branch="main",
+        head_sha=sha, created_at="2026-11-13T07:00:00Z",
+        head_branch="claude/ama-model-launch-skill", head_repo="floatmiracle/askmanyai",
+    )
+    base.update(kw)
+    return pr_watcher.PRSnap(**base)
+
+
+CODEX_DRAFT_BLOCKER = (
+    "## Blocker / 必须修正\n\n- backend/skills/x/SKILL.md:30 fetch 不检查 HTTP 状态\n\n"
+    "## 建议\n\n- 暂无额外建议\n\n结论：❌ 暂不可合并（存在 blocker）"
+)
+OPUS_DRAFT_PASS = "未发现 P0/P1 级别问题。\n\n结论：✅ 可以合并"
+
+
+class _ProcessPrHarness:
+    """Run process_pr with GitHub, Codex, Opus and EventKit faked out."""
+
+    def __init__(self, test: unittest.TestCase, tmp: Path, pr: pr_watcher.PRSnap):
+        self.test = test
+        self.tmp = tmp
+        self.pr = pr
+        self.scratch = tmp / "scratch"
+        self.scratch.mkdir()
+        self.jsonl = tmp / "20261113-154239__floatmiracle_askmanyai_pull_613.jsonl"
+        self.jsonl.write_text('{"type":"thread.started","thread_id":"t1"}\n', encoding="utf-8")
+        self.posted: list[dict] = []
+        self.upserts: list = []
+        self.fallback_calls = 0
+        self.notifications: list[str] = []
+        self.launched: list[str] = []
+        # GitHub comments for this PR: list of (head_sha, url, body)
+        self.github_comments: list[tuple[str, str, str]] = []
+
+    def codex(self, *, exit_code=0, last_message="", failed_with: str | None = None) -> pr_watcher.CodexResult:
+        if failed_with:
+            with self.jsonl.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "error", "message": failed_with}) + "\n")
+                f.write(json.dumps({"type": "turn.failed", "error": {"message": failed_with}}) + "\n")
+        return pr_watcher.CodexResult(
+            thread_id="t1", last_message=last_message, exit_code=exit_code,
+            jsonl_path=self.jsonl, scratch_dir=self.scratch, cancelled=False,
+        )
+
+    def lookup(self, repo, number, since, *, head_sha=None):
+        for sha, url, body in self.github_comments:
+            if sha == head_sha:
+                return pr_watcher.AICommentLookup("found", comment_url=url, comment_body=body)
+        return pr_watcher.AICommentLookup("absent")
+
+    def publish(self, pr, body, *, model_marker=None):
+        existing = self.lookup(pr.repo, pr.number, None, head_sha=pr.head_sha)
+        if existing.status == "found":
+            return existing, "reused"
+        rendered = pr_watcher.render_review_comment(pr.head_sha, body, model_marker=model_marker)
+        url = f"{pr.url}#issuecomment-{1000 + len(self.posted)}"
+        self.posted.append({"sha": pr.head_sha, "body": rendered, "model_marker": model_marker})
+        self.github_comments.append((pr.head_sha, url, rendered))
+        return pr_watcher.AICommentLookup("found", comment_url=url, comment_body=rendered), "posted"
+
+    def run(self, state: dict, result: pr_watcher.CodexResult, *, fallback=None, auto_fix=None):
+        def fake_fallback(pr, *, work_dir):
+            self.fallback_calls += 1
+            if fallback is None:
+                return pr_watcher.FallbackReview(reason="no fallback configured in test")
+            return fallback
+
+        def fake_upsert(events, *a, **kw):
+            self.upserts.extend(events)
+            return {e.key: "created" for e in events}
+
+        patches = [
+            mock.patch.object(pr_watcher, "LOCK_DIR", self.tmp / "locks"),
+            mock.patch.object(pr_watcher, "PROMPT_PATH",
+                              mock.MagicMock(read_text=lambda encoding=None: "review {pr_link} {head_sha}")),
+            mock.patch.object(pr_watcher, "run_codex", lambda prompt, pr: result),
+            mock.patch.object(pr_watcher, "notify",
+                              lambda *, title="", **kw: self.notifications.append(title)),
+            mock.patch.object(pr_watcher, "_gh_view_force_pr", lambda url: self.pr),
+            mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", self.lookup),
+            mock.patch.object(pr_watcher, "publish_review_comment", self.publish),
+            mock.patch.object(pr_watcher, "run_opus_fallback_review", fake_fallback),
+            mock.patch.object(pr_watcher, "cache_comment_body", lambda *a, **kw: None),
+            mock.patch.object(pr_watcher, "load_state", lambda: state),
+            mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None),
+            mock.patch.object(pr_watcher, "upsert_events", fake_upsert),
+            mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None),
+            mock.patch.object(pr_watcher, "_launch_auto_fix", lambda url: self.launched.append(url)),
+        ]
+        if auto_fix is not None:
+            patches.append(mock.patch.object(pr_watcher, "AUTO_FIX_CONFIG", auto_fix))
+        for p in patches:
+            p.start()
+        try:
+            return pr_watcher.process_pr(self.pr, state, dry_run=False)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+
+def _pending_state(pr: pr_watcher.PRSnap, **extra) -> dict:
+    entry = {
+        "repo": pr.repo, "number": pr.number,
+        "last_commented_sha": "c07e2271", "last_seen_sha": "c07e2271",
+        "pending_review_sha": pr.head_sha,
+        "pending_review_started_at": "2026-11-13T15:51:44",
+        "pending_review_source": "force",
+    }
+    entry.update(extra)
+    return {"_meta": {"installed_at": "2026-05-22T00:00:00+00:00"}, "prs": {pr.url: entry}}
+
+
+class ReviewFallbackAndReleaseTests(unittest.TestCase):
+    """Codex at capacity must not leave a head SHA without a review."""
+
+    def test_capacity_failure_falls_back_to_opus_and_publishes_exactly_once(self):
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            h = _ProcessPrHarness(self, Path(td), pr)
+            state = _pending_state(pr)
+            result = h.codex(exit_code=1, failed_with="Selected model is at capacity. Please try a different model.")
+            ret = h.run(state, result, fallback=pr_watcher.FallbackReview(
+                body=OPUS_DRAFT_PASS, verdict="✅",
+                model_marker="<!-- pr-review-model: claude-opus-5-5; provider: claude-subscription -->",
+            ))
+
+            self.assertEqual(h.fallback_calls, 1, "the same run must fall back to Opus")
+            self.assertEqual(len(h.posted), 1, "exactly one review comment for the head SHA")
+            self.assertIn("provider: claude-subscription", h.posted[0]["body"])
+            self.assertIn(pr_watcher.head_sha_metadata_marker(pr.head_sha), h.posted[0]["body"])
+            self.assertEqual(len(h.upserts), 1)
+            entry = state["prs"][pr.url]
+            self.assertEqual(entry["last_commented_sha"], pr.head_sha)
+            self.assertNotIn("pending_review_sha", entry)
+            self.assertIn("calendar=created", ret)
+            self.assertIn("capacity", h.jsonl.read_text(encoding="utf-8"))
+
+    def test_capacity_and_fallback_failure_releases_pending_immediately(self):
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            h = _ProcessPrHarness(self, Path(td), pr)
+            state = _pending_state(pr)
+            result = h.codex(exit_code=1, failed_with="Selected model is at capacity. Please try a different model.")
+            ret = h.run(state, result, fallback=pr_watcher.FallbackReview(reason="opus reviewer failed (exit=1)"))
+
+            self.assertIn("review failed", ret)
+            self.assertEqual(h.posted, [])
+            self.assertEqual(h.upserts, [])
+            entry = state["prs"][pr.url]
+            self.assertNotIn("pending_review_sha", entry, "no dangling pending after a failed run")
+            self.assertIn("capacity", entry["review_failed_reason"])
+            self.assertIn("opus reviewer failed", entry["review_failed_reason"])
+            self.assertIn("⚠️ PR review 失败，稍后自动重试", h.notifications)
+
+            # The `/pr` path (or the next tick) can take the SHA right away.
+            with mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since",
+                                   lambda *a, **kw: pr_watcher.AICommentLookup("absent")):
+                action, _changed = pr_watcher._same_sha_review_guard(pr, state, datetime_now())
+            self.assertIsNone(action)
+
+    def test_clean_codex_draft_is_published_by_the_watcher_without_fallback(self):
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            h = _ProcessPrHarness(self, Path(td), pr)
+            state = _pending_state(pr)
+            ret = h.run(state, h.codex(last_message=CODEX_DRAFT_BLOCKER))
+
+            self.assertEqual(h.fallback_calls, 0)
+            self.assertEqual(len(h.posted), 1)
+            self.assertIsNone(h.posted[0]["model_marker"])
+            self.assertTrue(h.posted[0]["body"].startswith(pr_watcher.AI_COAUTHOR_BLOCKQUOTE_MARKER))
+            self.assertEqual(state["prs"][pr.url]["last_commented_sha"], pr.head_sha)
+            self.assertIn("codex ran", ret)
+
+    def test_same_sha_comment_already_on_github_is_reused_not_reposted(self):
+        """Codex disobeying the prompt, or the `/pr` path, already posted."""
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            h = _ProcessPrHarness(self, Path(td), pr)
+            existing = pr_watcher.render_review_comment(pr.head_sha, OPUS_DRAFT_PASS)
+            h.github_comments.append((pr.head_sha, f"{pr.url}#issuecomment-6847470083", existing))
+            state = _pending_state(pr)
+            h.run(state, h.codex(last_message=CODEX_DRAFT_BLOCKER))
+
+            self.assertEqual(h.posted, [], "a SHA that has a review must not get a second one")
+            self.assertEqual(h.fallback_calls, 0)
+            self.assertEqual(state["prs"][pr.url]["last_comment_url"], f"{pr.url}#issuecomment-6847470083")
+
+    def test_cancel_marker_before_publish_drops_the_stale_draft(self):
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            h = _ProcessPrHarness(self, tmp, pr)
+            (tmp / "locks").mkdir()
+            with mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"):
+                pr_watcher._pr_cancel_path(pr.url).touch()
+            state = _pending_state(pr)
+            ret = h.run(state, h.codex(last_message=CODEX_DRAFT_BLOCKER))
+
+            self.assertIn("cancelled", ret)
+            self.assertEqual(h.posted, [])
+            self.assertEqual(h.upserts, [])
+
+
+def datetime_now():
+    from datetime import datetime
+    return datetime.now()
+
+
+class PublishReviewCommentTests(unittest.TestCase):
+    def _run(self, lookups: list, gh_output: str = ""):
+        pr = _snap613()
+        calls: list[list[str]] = []
+        seq = list(lookups)
+
+        def fake_lookup(*a, **kw):
+            return seq.pop(0)
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(list(cmd))
+            if "--body-file" in cmd:
+                calls.append(["BODY", Path(cmd[cmd.index("--body-file") + 1]).read_text(encoding="utf-8")])
+            return subprocess.CompletedProcess(cmd, 0, stdout=gh_output, stderr="")
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(pr_watcher, "LOG_DIR", Path(td)), \
+                mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", fake_lookup), \
+                mock.patch.object(pr_watcher.subprocess, "run", fake_run):
+            out = pr_watcher.publish_review_comment(pr, OPUS_DRAFT_PASS)
+            leftovers = list(Path(td).iterdir())
+        return pr, out, calls, leftovers
+
+    def test_existing_same_sha_review_is_reused_without_posting(self):
+        found = pr_watcher.AICommentLookup("found", comment_url="https://x#issuecomment-1", comment_body="b")
+        _pr, (lookup, action), calls, _ = self._run([found])
+        self.assertEqual(action, "reused")
+        self.assertEqual(lookup.comment_url, "https://x#issuecomment-1")
+        self.assertEqual(calls, [])
+
+    def test_absent_review_is_posted_once_and_never_deleted(self):
+        pr = _snap613()
+        posted = pr_watcher.AICommentLookup("found", comment_url=f"{pr.url}#issuecomment-7", comment_body="b")
+        _pr, (lookup, action), calls, leftovers = self._run(
+            [pr_watcher.AICommentLookup("absent"), posted], gh_output=f"{pr.url}#issuecomment-7\n",
+        )
+        self.assertEqual(action, "posted")
+        gh_calls = [c for c in calls if c[0] == "gh"]
+        self.assertEqual(len(gh_calls), 1)
+        self.assertEqual(gh_calls[0][:3], ["gh", "pr", "comment"])
+        self.assertFalse(any("DELETE" in " ".join(c) or "PATCH" in " ".join(c) for c in calls))
+        body = next(c[1] for c in calls if c[0] == "BODY")
+        self.assertTrue(body.startswith(pr_watcher.AI_COAUTHOR_BLOCKQUOTE_MARKER))
+        self.assertIn(pr_watcher.head_sha_metadata_marker(_pr.head_sha), body)
+        self.assertEqual(leftovers, [], "temporary body file must be removed")
+
+    def test_unverifiable_dedup_refuses_to_post(self):
+        _pr, (lookup, action), calls, _ = self._run([pr_watcher.AICommentLookup("failed")])
+        self.assertEqual(action, "failed")
+        self.assertEqual(calls, [], "never post when we cannot prove the SHA has no review yet")
+
+
+class NormalizeReviewBodyTests(unittest.TestCase):
+    SHA = "e955e3b7c541df08"
+
+    def test_plain_body_is_accepted(self):
+        body, verdict = pr_watcher.normalize_review_body(CODEX_DRAFT_BLOCKER, self.SHA)
+        self.assertEqual(verdict, "❌")
+        self.assertTrue(body.startswith("## Blocker"))
+
+    def test_fence_and_copied_header_are_stripped(self):
+        text = "```markdown\n" + pr_watcher.render_review_comment(self.SHA, OPUS_DRAFT_PASS) + "```"
+        body, verdict = pr_watcher.normalize_review_body(text, self.SHA)
+        self.assertEqual(verdict, "✅")
+        self.assertNotIn("ai-coauthor", body)
+        self.assertNotIn("评审 commit", body)
+
+    def test_rejects_missing_or_non_final_conclusion(self):
+        self.assertIsNone(pr_watcher.normalize_review_body("https://github.com/o/r/pull/1#issuecomment-1", self.SHA))
+        self.assertIsNone(pr_watcher.normalize_review_body("结论：✅ 可以合并\n\n多写了一段", self.SHA))
+        self.assertIsNone(pr_watcher.normalize_review_body("", self.SHA))
+
+    def test_rejects_a_draft_for_another_sha(self):
+        text = pr_watcher.render_review_comment("c07e22714d32fd76", OPUS_DRAFT_PASS)
+        self.assertIsNone(pr_watcher.normalize_review_body(text, self.SHA))
+
+
+class PendingLivenessTests(unittest.TestCase):
+    def test_watcher_owned_pending_is_dead_once_the_flock_is_ours(self):
+        now = datetime_now()
+        for source in sorted(pr_watcher.WATCHER_PENDING_SOURCES):
+            with self.subTest(source=source):
+                entry = {"pending_review_started_at": now.isoformat(timespec="seconds"),
+                         "pending_review_source": source}
+                self.assertTrue(pr_watcher._pending_is_stale(entry, now))
+
+    def test_fresh_current_session_claim_still_blocks(self):
+        now = datetime_now()
+        entry = {"pending_review_started_at": now.isoformat(timespec="seconds"),
+                 "pending_review_source": "current-session"}
+        self.assertFalse(pr_watcher._pending_is_stale(entry, now))
+
+
+class TickFailedReviewRetryTests(unittest.TestCase):
+    def _tick(self, state: dict, pr: pr_watcher.PRSnap) -> list[str]:
+        process_calls: list[str] = []
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(sys, "argv", ["pr_watcher.py"]), \
+                    mock.patch.object(pr_watcher, "redirect_stdio_to_log", lambda: None), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", Path(td) / "locks"), \
+                    mock.patch.object(pr_watcher, "load_state", lambda: state), \
+                    mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None), \
+                    mock.patch.object(pr_watcher, "acquire_pr_lock_nb", lambda url: 1001), \
+                    mock.patch.object(pr_watcher, "release_lock_fd", lambda fd: None), \
+                    mock.patch.object(pr_watcher, "fetch_open_prs", lambda: [pr]), \
+                    mock.patch.object(pr_watcher, "process_pr",
+                                      lambda pr, st, dry_run: process_calls.append(pr.head_sha) or "x"):
+                self.assertEqual(pr_watcher.main(), 0)
+        return process_calls
+
+    def test_failed_sha_is_retried_even_when_baseline_matches(self):
+        pr = _snap613()
+        state = {"_meta": {"installed_at": "2026-05-22T00:00:00+00:00"}, "prs": {pr.url: {
+            "last_seen_sha": pr.head_sha, "last_commented_sha": None,
+            "review_failed_sha": pr.head_sha, "review_failed_attempts": 1,
+        }}}
+        self.assertEqual(self._tick(state, pr), [pr.head_sha])
+
+    def test_failed_sha_stops_after_max_attempts(self):
+        pr = _snap613()
+        state = {"_meta": {"installed_at": "2026-05-22T00:00:00+00:00"}, "prs": {pr.url: {
+            "last_seen_sha": "older", "last_commented_sha": "older",
+            "review_failed_sha": pr.head_sha,
+            "review_failed_attempts": pr_watcher.MAX_REVIEW_ATTEMPTS_PER_SHA,
+        }}}
+        self.assertEqual(self._tick(state, pr), [])
+
+    def test_dead_watcher_pending_does_not_block_the_next_tick(self):
+        """The #613 state: fresh `force` pending, watcher process gone."""
+        pr = _snap613()
+        state = {"_meta": {"installed_at": "2026-05-22T00:00:00+00:00"}, "prs": {pr.url: {
+            "last_seen_sha": "c07e2271", "last_commented_sha": "c07e2271",
+            "pending_review_sha": pr.head_sha,
+            "pending_review_started_at": datetime_now().isoformat(timespec="seconds"),
+            "pending_review_source": "force",
+        }}}
+        with mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since",
+                               lambda *a, **kw: pr_watcher.AICommentLookup("absent")):
+            self.assertEqual(self._tick(state, pr), [pr.head_sha])
+
+
+class AutoFixLoopTests(unittest.TestCase):
+    CFG = {"enabled": True, "max_review_rounds": 5}
+
+    def _start(self, entry: dict, pr=None, *, verdict="❌", origin_cwd="/tmp/askmanyai", cfg=None):
+        pr = pr or _snap613()
+        state = {"prs": {pr.url: entry}}
+        launched: list[str] = []
+        notes: list[str] = []
+        with mock.patch.object(pr_watcher, "AUTO_FIX_CONFIG", cfg or self.CFG), \
+                mock.patch.object(pr_watcher, "_launch_auto_fix", lambda url: launched.append(url)), \
+                mock.patch.object(pr_watcher, "notify", lambda *, title="", **kw: notes.append(title)):
+            action = pr_watcher.maybe_start_auto_fix(
+                state, pr, verdict=verdict,
+                comment_url=f"{pr.url}#issuecomment-1", origin_cwd=origin_cwd, now=datetime_now(),
+            )
+        return action, launched, notes, state["prs"][pr.url]
+
+    def test_round_counter_counts_each_sha_once_and_resets_on_pass(self):
+        entry: dict = {}
+        pr_watcher.record_review_round(entry, "s1", "❌")
+        pr_watcher.record_review_round(entry, "s1", "❌")
+        pr_watcher.record_review_round(entry, "s2", "⚠️")
+        self.assertEqual(entry["review_rounds_without_pass"], 2)
+        entry["needs_human_sha"] = "s2"
+        pr_watcher.record_review_round(entry, "s3", "✅")
+        self.assertEqual(entry["review_rounds_without_pass"], 0)
+        self.assertNotIn("needs_human_sha", entry)
+
+    def test_failing_review_launches_mycalfix_once_per_sha(self):
+        action, launched, notes, entry = self._start({"review_rounds_without_pass": 1})
+        self.assertIn("launched", action)
+        self.assertEqual(len(launched), 1)
+        self.assertTrue(launched[0].startswith("mycalfix://fix?"))
+        self.assertIn("origin_cwd=%2Ftmp%2Faskmanyai", launched[0])
+        self.assertIn("🛠 PR 自动修复已启动", notes)
+        again, launched2, _, _ = self._start(entry)
+        self.assertIn("already launched", again)
+        self.assertEqual(launched2, [])
+
+    def test_fifth_failing_round_hands_off_to_a_human_and_stops(self):
+        action, launched, notes, entry = self._start({"review_rounds_without_pass": 5})
+        self.assertIn("needs human", action)
+        self.assertEqual(launched, [])
+        self.assertIn("🙋 PR 需要人工介入", notes)
+        self.assertEqual(entry["needs_human_sha"], _snap613().head_sha)
+        # Notified once per SHA, not on every recovery/tick.
+        _, _, notes2, _ = self._start(entry)
+        self.assertEqual(notes2, [])
+
+    def test_four_failing_rounds_still_fix(self):
+        _action, launched, _notes, _entry = self._start({"review_rounds_without_pass": 4})
+        self.assertEqual(len(launched), 1)
+
+    def test_no_fix_for_pass_disabled_fork_or_unknown_checkout(self):
+        cases = [
+            dict(verdict="✅"),
+            dict(cfg={"enabled": False, "max_review_rounds": 5}),
+            dict(pr=_snap613(head_repo="someone/fork")),
+            dict(origin_cwd=None),
+        ]
+        for kw in cases:
+            with self.subTest(**{k: str(v) for k, v in kw.items()}):
+                _action, launched, _notes, _entry = self._start({"review_rounds_without_pass": 1}, **kw)
+                self.assertEqual(launched, [])
+
+    def test_launch_uses_mycalfix_launcher_in_yolo_mode_without_blocking(self):
+        seen = {}
+
+        class FakePopen:
+            def __init__(self, cmd, **kw):
+                seen["cmd"] = cmd
+                seen["kw"] = kw
+
+        # The module-level guard replaced _launch_auto_fix; exercise the real
+        # helper with Popen faked so nothing is actually spawned.
+        with mock.patch.object(pr_watcher.subprocess, "Popen", FakePopen):
+            _REAL_LAUNCH_AUTO_FIX("mycalfix://fix?x=1")
+        self.assertEqual(seen["cmd"][1], str(pr_watcher.HERE / "launch_fix.sh"))
+        self.assertEqual(seen["cmd"][2], "mycalfix://fix?x=1")
+        self.assertEqual(seen["kw"]["env"]["MYCALFIX_MODE"], "yolo")
+        self.assertTrue(seen["kw"]["start_new_session"])
+
+    def test_process_pr_failing_verdict_starts_the_next_fix_round(self):
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            h = _ProcessPrHarness(self, Path(td), pr)
+            state = _pending_state(pr, origin_cwd="/tmp/askmanyai", review_rounds_without_pass=0)
+            ret = h.run(state, h.codex(last_message=CODEX_DRAFT_BLOCKER), auto_fix=self.CFG)
+            entry = state["prs"][pr.url]
+            self.assertEqual(entry["review_rounds_without_pass"], 1)
+            self.assertEqual(len(h.launched), 1)
+            self.assertEqual(entry["auto_fix_launched_sha"], pr.head_sha)
+            self.assertIn("auto-fix: launched (round 1/5)", ret)
+
+
+class OpusFallbackRunnerTests(unittest.TestCase):
+    """run_opus_fallback_review against a stand-in review_with_opus.sh."""
+
+    def _script(self, tmp: Path, *, provider="claude-subscription", head_sha=None, body=OPUS_DRAFT_PASS,
+                exit_code=0, sleep=0) -> Path:
+        script = tmp / "review_with_opus.sh"
+        out_body = body.replace("'", "'\\''")
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            f'readonly REVIEW_PROVIDER="{provider}"\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in --output) OUT="$2"; shift 2;; *) shift;; esac; done\n'
+            f"sleep {sleep}\n"
+            'git rev-parse --show-toplevel >/dev/null || exit 9\n'
+            f"printf '%s\\n' '{out_body}' > \"$OUT\"\n"
+            'echo "REVIEW_MODEL=claude-opus-5-5"\n'
+            f'echo "REVIEW_PROVIDER={provider}"\n'
+            f'echo "REVIEW_HEAD_SHA={head_sha}"\n'
+            'echo "REVIEW_GENERATION=ok"\n'
+            f"exit {exit_code}\n",
+            encoding="utf-8",
+        )
+        return script
+
+    def _run(self, tmp: Path, script: Path, pr=None):
+        pr = pr or _snap613()
+        work = tmp / "work"
+        work.mkdir()
+        with mock.patch.object(pr_watcher, "REVIEW_FALLBACK_CONFIG", {"enabled": True, "opus_script": script}), \
+                mock.patch.object(pr_watcher, "LOG_DIR", tmp / "logs"), \
+                mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"):
+            return pr_watcher.run_opus_fallback_review(pr, work_dir=work)
+
+    def test_successful_subscription_review_is_returned_with_model_marker(self):
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            out = self._run(tmp, self._script(tmp, head_sha=pr.head_sha))
+        self.assertEqual(out.verdict, "✅", out.reason)
+        self.assertEqual(out.body, OPUS_DRAFT_PASS)
+        self.assertEqual(out.model_marker, "<!-- pr-review-model: claude-opus-5-5; provider: claude-subscription -->")
+
+    def test_refuses_a_reviewer_that_does_not_bill_the_subscription(self):
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            out = self._run(tmp, self._script(tmp, provider="teamorouter", head_sha=pr.head_sha))
+        self.assertIsNone(out.body)
+        self.assertIn("subscription", out.reason)
+
+    def test_refuses_a_review_of_another_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            out = self._run(tmp, self._script(tmp, head_sha="c07e22714d32fd76"))
+        self.assertIsNone(out.body)
+        self.assertIn("reviewed sha", out.reason)
+
+    def test_cancel_marker_kills_the_reviewer(self):
+        pr = _snap613()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            script = self._script(tmp, head_sha=pr.head_sha, sleep=30)
+            (tmp / "locks").mkdir()
+            marker = tmp / "locks" / f"{pr_watcher._pr_safe_id(pr.url)}.cancel"
+            threading.Timer(0.5, marker.touch).start()
+            t0 = time.time()
+            out = self._run(tmp, script, pr)
+            self.assertTrue(out.cancelled)
+            self.assertLess(time.time() - t0, 10)
+            self.assertFalse(marker.exists(), "the consumed cancel marker is removed")
 
 
 if __name__ == "__main__":

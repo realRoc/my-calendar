@@ -362,7 +362,7 @@ my-calendar = 多个互相独立的模块（节日 / PR 监控 / health / 未来
 - helper 只在本次 `git push` 上设置 `MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW=1`，让全局 pre-push hook 保留 repo-local `pre-push.local` 安全检查，但跳过 detached review 触发
 - PR 创建/更新后，helper 调 `scripts/pr_session_review.py --claim` 把当前 head SHA 标为 `pending_review_source=current-session`，避免 launchd 兜底在当前 Codex/Claude session review 期间抢跑
 - 当前 session 调 `.agents/skills/pr/scripts/review_with_opus.sh`，由 Teamorouter 路由到 `claude-opus-5`，**默认 `--effort low`**（可用 `REVIEW_EFFORT` 覆盖为 low/medium/high/xhigh/max，非法值直接报错退出），做无工具、无会话持久化的只读 diff review。该脚本要求结构化 JSON-Schema 输出，由 `render_review.py` 确定性地渲染成评论正文并本地推导结论；非法响应最多重试 3 次，每次调用有 `REVIEW_TIMEOUT_SEC`（默认 900s）的 wall-clock 上限。**effort 默认值的实测依据**（约 1300 行 diff 的 PR #48）：`low` 约 450s 返回；`medium` 超过 1800s；`high` 跑满两次 900s 仍未产出 `structured_output`。也就是说这个规模下**只有 `low` 能跑完**，所以默认取 low + 900s 上限。**代价必须知道**：同一 SHA 上 `low` 返回的 findings 为空，而 codex reviewer 找到 2 个真 blocker——大 PR 上一个干净的 low 结论是弱证据，不等于"没问题"
-- 评论由 `scripts/review_and_post.sh` 发布：它复验 PR SHA（claim 前 / claim 后 / 发布后各一次，发布后才发现 head 移动会撤回刚发的评论）、按**当前登录账号 + canonical AI marker + head SHA** 复用已存在的同 SHA 评论避免重复、校验发出内容，再调 `scripts/pr_record_review_trigger.sh <pr-url> <comment-url> <origin-cwd>` 写 "PR 监控" 日历。如果调用方是 Codex Desktop，后者会用 Terminal bridge 执行 `scripts/pr_session_review.py --record`。**注意**：复用判定**必须**带作者校验（`gh api user --jq .login`）——marker 只是评论正文里的纯文本，任何能评论该 PR 的账号都能照抄 `pr-watcher-head-sha` 和 model marker，只按 marker 匹配就会把攻击者控制的正文当成本次 review 写进日历。同时**不要**把 `pr-review-model` marker 纳入复用判定：codex watcher 发的 canonical 评论没有这个 marker，要求它会漏掉它，导致同一 SHA 重复发评论、然后在 record 阶段被拒
+- 评论由 `scripts/review_and_post.sh` 发布：它复验 PR SHA（claim 前 / claim 后 / 发布后各一次；发布后才发现 head 移动时**保留**刚发的评论——它带 SHA 标记和可见"评审 commit"行，是对那个 commit 的有效评审——只是不记录、退出非 0，新 head 由 push 触发自己的评审。不再 DELETE：发了又删会让 SHA 没有评审）、按**当前登录账号 + canonical AI marker + head SHA** 复用已存在的同 SHA 评论避免重复、校验发出内容，再调 `scripts/pr_record_review_trigger.sh <pr-url> <comment-url> <origin-cwd>` 写 "PR 监控" 日历。如果调用方是 Codex Desktop，后者会用 Terminal bridge 执行 `scripts/pr_session_review.py --record`。**注意**：复用判定**必须**带作者校验（`gh api user --jq .login`）——marker 只是评论正文里的纯文本，任何能评论该 PR 的账号都能照抄 `pr-watcher-head-sha` 和 model marker，只按 marker 匹配就会把攻击者控制的正文当成本次 review 写进日历。同时**不要**把 `pr-review-model` marker 纳入复用判定：codex watcher 发的 canonical 评论没有这个 marker，要求它会漏掉它，导致同一 SHA 重复发评论、然后在 record 阶段被拒
 - reviewer 子进程的凭据由 `review_with_opus.sh` 显式从 `~/.claude/settings.json` 解析并 export。宿主（如 Claude Desktop，`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`）可能只注入自己的 `ANTHROPIC_BASE_URL` 而不下发 token，此时若照搬环境变量，config 检查会直接失败、或子进程报 `Not logged in`
 - 老的异步路径仍保留：`light_pr.sh --trigger-async-review` / `--trigger-only`、普通 `git push`、外部工具调用 `pr-created`、launchd 兜底都继续走 Codex 驱动的 `pr_watcher.py`，不使用 Opus
 
@@ -393,12 +393,25 @@ my-calendar = 多个互相独立的模块（节日 / PR 监控 / health / 未来
    - 首次见到且 PR 创建时间 / 最新 head commit 时间 / PR updatedAt 晚于 watcher `installed_at` → 标记 pending 并触发 codex
    - head_sha 未变 → 跳过
    - head_sha 变了 → 触发 codex
-   - stale `pending_review_sha` → 先查 GitHub 是否已有本 watcher 的 AI 评论；查到则推进 state 防重复，确认没有才清 pending 并重试，查询失败则保留 pending 等下轮
+   - 失效的 `pending_review_sha` → 先查 GitHub 是否已有本 watcher 的 AI 评论；查到则推进 state 防重复，确认没有才清 pending 并重试，查询失败则保留 pending 等下轮。**watcher 自己的 pending（source=`poll` / `poll-first-seen` / `force` / `*-head-moved`）只在持 per-PR flock 的进程活着时有效**：谁拿到了 flock 就说明 owner 已退出，立即按失效处理，不等 35 分钟；只有 `/pr` 的 `current-session` claim（claim 后会放开 flock）才走 `PENDING_REVIEW_STALE_SEC` 计时
+   - 上一次评审失败（`review_failed_sha == head`）→ 即使 baseline 没变也重试；同一 SHA 失败满 `MAX_REVIEW_ATTEMPTS_PER_SHA`（3）次后 tick 不再重试、通知人工，`--force` 仍可重试
 4. codex 调用：`codex exec --json --dangerously-bypass-approvals-and-sandbox -s danger-full-access --skip-git-repo-check -C /tmp/codex-pr-runs/<uuid> "<prompt>"`，用 `start_new_session=True` 起独立进程组以便 cancel 时能 `killpg` 整片
 5. 从 JSONL 第一行抓 `thread_id`（用于 `codex resume`）
 6. codex 退出后先重新 `gh pr view` 校验当前 `headRefOid`；进入 persist 锁临界区、真正写日历 / `.meta` / state 之前再复验一次；本地 artifact 写完后还会最后复验一次。如果 head 已经变了，即使没收到 cancel marker，也丢弃或回滚旧 run 的日历 / `.meta` / state 写入，标记最新 SHA 为 pending，并在同一 per-PR 串行上下文里重启 review。
-7. codex 自己用 `gh pr comment` 发评论；watcher 只接受本次 review 启动后出现、且同时包含 AI coauthor marker 与当前 `head_sha` 隐藏 marker 的 pr_watcher 评论作为完成边界。没找到就保留 `pending_review_sha`，不写日历 / `.meta` / `last_commented_sha`，等 stale recovery 先查 GitHub 再恢复或重试。
+7. **codex 只起草、不发评论**：`pr_prompt.md` 要求 codex 把评论正文作为最终回复（`-o last.txt`），禁止 `gh pr comment` / 删除 / 编辑评论。由 watcher 统一发布（`publish_review_comment`）：先按"当前登录账号 + AI marker + 当前 head SHA marker"查 GitHub，已有就复用（同 SHA 只一条）；查询失败就不发（无法证明没有重复）；否则 `gh pr comment --body-file` 发一条，正文前由 `render_review_comment` 加 AI 共著标记 + head SHA 标记 + 可见的"评审 commit：`<sha8>`"行。**永不删除 / 编辑已发评论**——旧 SHA 的评论留着，靠 SHA 标记和可见行说明它只针对那个 commit（askmanyai#613 11-13 15:42：codex 先发了格式坏的评论、自己 DELETE、再撞 capacity 失败，该 SHA 最终没有评审）。
+   - **同轮兜底**：codex 没给出可用草稿（非 0 退出、`turn.failed` 如 "Selected model is at capacity"、超时、正文缺结论行）→ 同一次运行里改用 `/pr` 的 Opus 评审 `~/.claude/skills/pr/scripts/review_with_opus.sh`（在 scratch 里 `git init` 的临时仓库跑，不依赖 origin_cwd；脚本必须声明 `REVIEW_PROVIDER="claude-subscription"` 且输出同值，否则拒用——**只走 Claude 订阅，不用 Teamorouter key**）。兜底期间新 commit 的 cancel marker 同样会杀掉它；兜底结束后再复验 head。评论带 `<!-- pr-review-model: claude-opus-5-5; provider: claude-subscription -->`。
+   - **失败立即释放**：codex 和 Opus 都没出评审（或发布 / dedup 查询失败）→ 立刻清掉本次 `pending_review_sha`、记 `review_failed_*`、发"⚠️ PR review 失败，稍后自动重试"通知；下一轮 tick / `/pr` 可以马上接手。
 8. EventKit 写到独立日历 **"PR 监控"**，UID = `my-calendar:pr-comment:<pr_url>:<sha>`
+9. **自动修复循环**（见下节）：结论 ❌ / ⚠️ → 启动下一轮修复；✅ → 计数清零
+
+### 自动修复循环（默认开启）
+
+- 每次评审落盘（watcher 路径与 `/pr` record 路径共用 `record_review_round`）都计一轮：同一 SHA 只计一次，❌/⚠️ 让 `review_rounds_without_pass` +1，✅ 清零
+- watcher 路径落盘 ❌/⚠️ 后 `maybe_start_auto_fix`：复用 MyCalFix —— 用 `MYCALFIX_MODE=yolo bash scripts/launch_fix.sh '<mycalfix://...>'` 起修复（建临时 worktree → `fix_prompt.md` → `git push origin HEAD:<branch>`），push 经 pre-push hook 触发新 SHA 的评审，循环直到 ✅
+- **同一 PR 第 5 轮评审仍未通过**（`auto_fix.max_review_rounds`，默认 5）→ 发"🙋 PR 需要人工介入"通知、记 `needs_human_*`、不再自动修；人工接手后 `pr_watcher.py --reset-auto-fix <pr-url>` 清零
+- 同一 SHA 只起一次修复（`auto_fix_launched_sha`）；fork PR、`origin_cwd` 未知（launchd 首评、没本地 push 过）不自动修，后者发通知提示
+- `/pr` 路径只计轮数、不自动起修复：当前会话本身就在负责修
+- **风险**：yolo 模式下 claude 无审批执行，review 正文和 PR 内容里的注入指令会被直接执行（见 MyCalFix 设计取舍）。范围只有 `author:@me` 的 PR；不想要就在 config 里 `"auto_fix": {"enabled": false}`
 
 ### 进行中收到新 commit：cancel + restart（issue #26）
 
@@ -467,6 +480,9 @@ bash scripts/install_launchd.sh          # 节日 daily + PR 兜底 launchd
 
 # 忽略夜间节流，立即执行
 .venv/bin/python scripts/pr_watcher.py --ignore-throttle
+
+# 人工接手修完后，清掉某 PR 的自动修复轮数 / 需人工标记
+.venv/bin/python scripts/pr_watcher.py --reset-auto-fix https://github.com/<owner>/<repo>/pull/<n>
 ```
 
 ### per-repo opt-out
@@ -486,6 +502,8 @@ git -C <repo-path> config core.hooksPath .git/hooks
 | key | 默认 | 说明 |
 |---|---|---|
 | `codex_concurrency_cap` | `10` | 全机器同时跑 codex 的最大数量。pr_watcher 用 `locks/codex-slot-{1..N}.lock` 实现 N 个 slot 的信号量；想给小机器/紧预算降并发就把这个数调小（如 `4`）。**调大也不会被拦**，但 codex 同时执行数、CPU/网络和 LLM 调用成本会随之线性上升——自行评估机器和预算能承受。**严格 JSON integer** 校验：`2.5` / `"4"` / `true` / 负数 / 0 都会落回默认 10 + 一行 stderr 警告，不会崩 |
+| `review_fallback` | `{"enabled": true, "opus_script": "~/.claude/skills/pr/scripts/review_with_opus.sh"}` | codex 没出评审时同轮改用 Opus（Claude 订阅）。脚本不是订阅版（没有 `REVIEW_PROVIDER="claude-subscription"`）会被拒用并记失败 |
+| `auto_fix` | `{"enabled": true, "max_review_rounds": 5}` | ❌/⚠️ 后自动起 MyCalFix yolo 修复；同一 PR 第 `max_review_rounds` 轮仍未通过就停下叫人。`max_review_rounds` 严格正整数 |
 | `codex_exec` | `"inherit"` | PR 自动 review 调 `codex exec` 时默认不传 `-m` / `-c` 模型参数，直接继承 Codex CLI 的 `$CODEX_HOME/config.toml`（也就是手动 `codex exec` 的默认模型/推理/速度配置）。如果 Codex Desktop 当前选择尚未同步到 CLI config，可在这里显式镜像：`{"model":"gpt-5.6-sol","model_reasoning_effort":"medium","service_tier":"priority"}`。除 `model` 会转成 `-m` 外，其他 scalar key 会按 `-c key=value` 透传给 Codex CLI；复杂对象会被忽略并 warning |
 
 > ⚠️ 已移除：`mycalfix_interactive_claude`。MyCalFix 现在用 osascript 对话框 per-click 选 mode，不再读 config 文件。写在 config.json 里也会被忽略。想跳过对话框（脚本化用途 / sticky preference）请 `export MYCALFIX_MODE=yolo|interactive|cancel` 给 launcher 进程。
@@ -531,7 +549,7 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 | 产物 | 标记位置 | 规范文本 |
 |---|---|---|
-| codex 通过 pr_watcher 发的 PR review 评论 | 评论 body **开头** | <pre>> 🤖 由 Codex 自动生成<br>&lt;!-- ai-coauthor: codex; agent: pr_watcher; mode: automated --&gt;<br>&lt;!-- pr-watcher-head-sha: &lt;head_sha&gt; --&gt;</pre> |
+| pr_watcher / `/pr` 发的 PR review 评论（codex 或 Opus 起草） | 评论 body **开头** | <pre>> 🤖 由 Codex 自动生成<br>&lt;!-- ai-coauthor: codex; agent: pr_watcher; mode: automated --&gt;<br>&lt;!-- pr-watcher-head-sha: &lt;head_sha&gt; --&gt;</pre>（Opus 起草的再加一行 `pr-review-model` 注释；随后是可见的 `**评审 commit**：\`<sha8>\`` 行） |
 | claude 通过 MyCalFix 起的修复 commit | commit message body | `Co-Authored-By: Claude <noreply@anthropic.com>`（Claude Code 默认自动加，fix_prompt.md 强制保留） |
 | 手敲的、纯人类 PR / 评论 | 无标记 | — |
 
@@ -549,12 +567,12 @@ git -C <repo-path> config core.hooksPath .git/hooks
 
 ### prompt 模板的硬约束
 
-- `scripts/pr_prompt.md` 第 4 步要求 codex 在评论 body **开头** emit AI 标记 + 当前 head SHA 隐藏标记（原样照抄，包括 HTML 注释），下面才允许空一行 + 正文
+- 评论标记不再靠 prompt：codex 只起草正文，`pr_watcher.render_review_comment` 在发布时统一加 AI 标记 + 当前 head SHA 隐藏标记 + 可见"评审 commit"行；`review_and_post.sh` 加同样的头。`scripts/pr_prompt.md` 第 4–5 步要求 codex 不发 / 不删 / 不改评论、不自带标记、最终回复就是以结论行结尾的正文
 - `scripts/fix_prompt.md` 第 4 步要求 commit message body 同时包含 `Reviewed-Comment:` 和 `Co-Authored-By: Claude` 两条 trailer，并解释这是与 pr_prompt.md 镜像的同一套约定
 
 ### 测试守门
 
-`scripts/test_pr_watcher.py::AICoAuthorMarkerContractTests` 锁住两个 prompt 文件的 canonical 字符串：blockquote、HTML metadata、head SHA metadata、`Co-Authored-By:` trailer、以及 pr_prompt.md 里"marker 必须先于 section 规则出现"的结构断言。任何编辑 prompt 时把这些字符串拼错或挪到末尾，测试都会红。
+`scripts/test_pr_watcher.py::AICoAuthorMarkerContractTests` 锁住发布出去的评论头（`render_review_comment` 输出的 blockquote、HTML metadata、head SHA metadata 依次在正文之前、可见"评审 commit"行）、pr_prompt.md 的"不发 / 不删评论、最终回复即正文"约束，以及 fix_prompt.md 的 `Co-Authored-By:` trailer。任何改动把这些字符串拼错或挪位置，测试都会红。
 
 ### 老评论怎么办
 
@@ -695,7 +713,7 @@ launchd 兜底路径触发的评论（比如安装后新 PR 的首次漏网 revi
    - **E：预取 codex review comment body 到本地缓存**。pr_watcher 在写完日历事件之前调 `cache_comment_body()`，把 codex 的整段 review body 写到 `~/.cache/my-calendar/fix-comments/<comment_id>.md`。launch_fix.sh 把这个路径作为 `{comment_body_path}` 渲染进 fix_prompt.md，claude 用 Read 工具读它而不是 `gh api` 跑网络拉一遍。两个效果：(a) Interactive 模式的 Approve 对话框会显示具体被读的文件名，用户能看出 claude 想读什么，而不是看到一条 prompt 注入可以重定向的 `gh api ...` shell 命令；(b) comment 内容在 review 完成时被冻结到磁盘——上面的 GitHub 评论后来被人编辑加了 prompt-injection payload 也污染不到这次会话。缓存缺失时（老日历事件 / 缓存被清）fix_prompt.md 有 `gh api` 兜底，老 URL 仍能用。
    - **剩余的风险，必须承认**：Yolo 按钮还在，被点了就还是无审批执行。`git worktree` 只隔离 git checkout 不限制 Claude Code 读 `~/.ssh` / `~/.config` 或改写 worktree 外文件，`fix_prompt.md` 的约束不是安全边界。option C 的设计选择：让 yolo 是**显式 per-session 决定**而不是默认值，把"你是否真的想给这次会话无审批"这个问题摆到每次点击的 critical path 上。
    - **辅助工程边界（任何模式都成立）**：(a) worktree 一次性隔离在 `~/.cache/my-calendar/worktrees/`，改坏一删就回去；(b) `.command` 在 fetch/worktree-add 之前已经校验 `git remote get-url origin` 与 URL 的 repo 一致，push 推不到错的 remote；(c) `fix_prompt.md` 硬约束 diff >1000 行 abort、只改 review 点名处、不 --force push。
-- **不自动跑修复**：只写日历、塞 URL，由人决定要不要点。修复也是普通的 claude 会话，受用户监督
+- **自动修复循环默认开启（2026-11 起，用户明确要求"默认持续自动修复直到通过"）**：watcher 在 ❌/⚠️ 后以 `MYCALFIX_MODE=yolo` 调同一个 `launch_fix.sh`，修复会话在新 Terminal 窗口里跑、可随时看 / 停；同一 PR 第 5 轮评审仍未通过就停下叫人（见"PR 监控 → 自动修复循环"）。日历里的 MyCalFix 链接仍是人工入口，点击时照旧弹 Yolo / Interactive / Cancel
 - **默认 Terminal 不侦测 iTerm2**：减少配置面；用户用 iTerm2 想接管，改 launch_fix.sh 末尾的 `open -a Terminal` 为 `open -a iTerm` 即可（记得改完重装 .app）
 - **用 `.command` 文件 + `open -a Terminal`，不用 `osascript do script Terminal`**：osascript do script 走 AppleEvents (Automation TCC)，未签名 osacompile 应用经常被静默拒绝 -1743 errAEEventNotPermitted，连授权对话框都不弹。`.command` 是 LaunchServices 文档打开，没有 TCC 门槛，第一次点链接就能用。.command 文件首行 `rm -f $0` 自删避免堆积
 - **`launch_fix.sh` 不做 `git rev-parse` 校验 origin_cwd**：launcher 跑在 .app 的 TCC 沙箱里，`git -C ~/Desktop/<repo>` 会 EPERM（即使 Info.plist 声明了 `NSDesktopFolderUsageDescription`，一旦 TCC 库记下 deny 就不再弹框，重装 .app 也不清）。校验会把每次点击都打去 picker，违背"URL 里给的路径应该被用上"的语义。URL 来源是本地 pre-push hook，攻击面≈0，直接信任。路径错了在 Terminal 里 `git -C <wrong> fetch` 失败，用户能看到

@@ -110,6 +110,9 @@ def claim_review(pr_url: str, origin_cwd: str | None) -> dict:
             )
 
         if entry.get("pending_review_sha") == pr.head_sha:
+            # We hold the per-PR flock here, so a watcher-owned claim is dead
+            # (its process exited) and _pending_is_stale says so at once; only
+            # another live `/pr` claim still blocks us.
             if not pr_watcher._pending_is_stale(entry, now):
                 source = entry.get("pending_review_source") or "unknown"
                 raise ValueError(
@@ -260,6 +263,12 @@ def record_review(
             if resolved_origin:
                 fresh_entry["origin_cwd"] = resolved_origin
             pr_watcher._clear_pending_review(fresh_entry)
+            pr_watcher._clear_review_failures(fresh_entry)
+            # Same per-PR round budget as the watcher path: a `/pr` review
+            # counts toward the "N rounds without a pass → human" limit.
+            pr_watcher.record_review_round(
+                fresh_entry, pr.head_sha, pr_watcher.parse_verdict(comment_body),
+            )
             pr_watcher.save_state(fresh_state, touched_prs={pr.url})
         finally:
             pr_watcher.release_lock_fd(persist_fd)

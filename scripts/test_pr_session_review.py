@@ -102,26 +102,84 @@ class CurrentSessionReviewTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "already recorded"):
                     pr_session_review.claim_review(pr.url, origin_cwd=None)
 
-    def test_claim_review_rejects_non_stale_pending_same_sha(self):
+    def _write_state(self, entry: dict, pr) -> None:
+        pr_watcher.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        pr_watcher.STATE_PATH.write_text(json.dumps({"_meta": {}, "prs": {pr.url: entry}}), encoding="utf-8")
+
+    def test_claim_review_rejects_live_current_session_pending_same_sha(self):
+        """Another `/pr` session's fresh claim still owns the SHA."""
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             pr = self._pr()
 
             with self._patch_paths(tmp), \
                     mock.patch.object(pr_session_review, "fetch_pr", return_value=pr):
-                pr_watcher.STATE_PATH.write_text(json.dumps({
-                    "_meta": {},
-                    "prs": {
-                        pr.url: {
-                            "pending_review_sha": pr.head_sha,
-                            "pending_review_started_at": "2999-01-01T00:00:00",
-                            "pending_review_source": "poll",
-                        }
-                    },
-                }), encoding="utf-8")
+                self._write_state({
+                    "pending_review_sha": pr.head_sha,
+                    "pending_review_started_at": "2999-01-01T00:00:00",
+                    "pending_review_source": "current-session",
+                }, pr)
 
                 with self.assertRaisesRegex(ValueError, "already pending"):
                     pr_session_review.claim_review(pr.url, origin_cwd=None)
+
+    def test_claim_review_takes_over_dead_watcher_pending_immediately(self):
+        """askmanyai#613: a watcher run failed and left a fresh pending claim.
+
+        The watcher holds the per-PR flock for as long as its claim is alive,
+        so once `/pr` can take the flock the claim is dead. `/pr` must not be
+        told "review already pending ... source=force" for 35 minutes; after
+        confirming no review comment exists for the SHA it takes the claim.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pr = self._pr()
+            lookups = []
+
+            def fake_lookup(repo, number, since, *, head_sha=None):
+                lookups.append(head_sha)
+                return pr_watcher.AICommentLookup("absent")
+
+            with self._patch_paths(tmp), \
+                    mock.patch.object(pr_session_review, "fetch_pr", return_value=pr), \
+                    mock.patch.object(pr_watcher, "fetch_latest_ai_comment_since", fake_lookup):
+                self._write_state({
+                    "pending_review_sha": pr.head_sha,
+                    "pending_review_started_at": "2999-01-01T00:00:00",
+                    "pending_review_source": "force",
+                }, pr)
+                result = pr_session_review.claim_review(pr.url, origin_cwd=None)
+
+            self.assertEqual(result["status"], "claimed")
+            self.assertEqual(lookups, [pr.head_sha], "must check GitHub for an existing same-SHA review first")
+            entry = json.loads((tmp / "pr_state.json").read_text(encoding="utf-8"))["prs"][pr.url]
+            self.assertEqual(entry["pending_review_source"], "current-session")
+
+    def test_claim_review_refuses_when_dead_watcher_already_posted(self):
+        """A dead watcher claim whose comment did land must not get a second review."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pr = self._pr()
+            url = f"{pr.url}#issuecomment-9"
+
+            with self._patch_paths(tmp), \
+                    mock.patch.object(pr_session_review, "fetch_pr", return_value=pr), \
+                    mock.patch.object(pr_watcher, "cache_comment_body", lambda *a, **kw: None), \
+                    mock.patch.object(
+                        pr_watcher, "fetch_latest_ai_comment_since",
+                        lambda *a, **kw: pr_watcher.AICommentLookup("found", comment_url=url, comment_body="b"),
+                    ):
+                self._write_state({
+                    "pending_review_sha": pr.head_sha,
+                    "pending_review_started_at": "2999-01-01T00:00:00",
+                    "pending_review_source": "poll",
+                }, pr)
+                with self.assertRaisesRegex(ValueError, "recovered existing AI comment"):
+                    pr_session_review.claim_review(pr.url, origin_cwd=None)
+
+            entry = json.loads((tmp / "pr_state.json").read_text(encoding="utf-8"))["prs"][pr.url]
+            self.assertEqual(entry["last_commented_sha"], pr.head_sha)
+            self.assertEqual(entry["last_comment_url"], url)
 
     def test_record_review_writes_event_sidecar_and_clears_pending(self):
         with tempfile.TemporaryDirectory() as td:
@@ -155,6 +213,9 @@ class CurrentSessionReviewTests(unittest.TestCase):
                         pr.url: {
                             "pending_review_sha": pr.head_sha,
                             "pending_review_source": "current-session",
+                            "review_failed_sha": pr.head_sha,
+                            "review_failed_attempts": 1,
+                            "review_rounds_without_pass": 3,
                         }
                     },
                 }), encoding="utf-8")
@@ -178,6 +239,10 @@ class CurrentSessionReviewTests(unittest.TestCase):
             self.assertEqual(entry["last_comment_url"], comment_url)
             self.assertNotIn("pending_review_sha", entry)
             self.assertTrue(Path(result["meta_path"]).exists())
+            # Shared per-PR bookkeeping with the watcher path.
+            self.assertNotIn("review_failed_sha", entry)
+            self.assertEqual(entry["review_rounds_without_pass"], 0, "a ✅ resets the round budget")
+            self.assertEqual(entry["review_round_sha"], pr.head_sha)
 
     def test_record_review_rejects_missing_current_head_marker(self):
         pr = self._pr()

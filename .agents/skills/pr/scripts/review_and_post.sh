@@ -252,6 +252,10 @@ else
         printf '<!-- pr-watcher-head-sha: %s -->\n' "$head_sha"
         printf '%s\n' '<!-- pr-review-model: claude-opus-5-5; provider: teamorouter -->'
         printf '\n'
+        # Visible label so a review of a superseded commit never reads as the
+        # verdict on the PR's current head. Same line pr_watcher publishes.
+        printf '**评审 commit**：`%s`（只针对这个 commit；PR 之后有新 commit 时以新 commit 的评审为准）\n' "${head_sha:0:8}"
+        printf '\n'
         command cat "$REVIEW_FILE"
     } > "$COMMENT_FILE"
 
@@ -270,17 +274,14 @@ else
     comment_exists=1
     comment_action="posted"
 
-    # Publishing is another round trip, so re-check once more. A comment that
-    # landed for a superseded SHA still carries this SHA's marker, so it looks
-    # authoritative to every later reader; retract it instead of leaving a
-    # stale verdict standing. Only a comment created by this run is retracted —
-    # an idempotently reused one predates the claim and is not ours to delete.
+    # Publishing is another round trip, so re-check once more. A review is
+    # never deleted once published: it is a valid review of the commit it
+    # names (head-SHA marker plus the visible "评审 commit" line), and the new
+    # head gets its own review from the push that moved it. Deleting here is
+    # how a SHA ended up with no review at all (askmanyai#613). Stop before
+    # recording, since the recorded entry must describe the current head.
     if ! assert_head_unchanged "during publish"; then
-        if gh api -X DELETE "repos/$owner_repo/issues/comments/${comment_url##*issuecomment-}" >/dev/null 2>&1; then
-            echo "retracted stale review comment: $comment_url" >&2
-        else
-            echo "ERROR: could not retract stale review comment: $comment_url" >&2
-        fi
+        echo "left published review for superseded ${head_sha:0:8} in place: $comment_url" >&2
         comment_exists=0
         exit 1
     fi
