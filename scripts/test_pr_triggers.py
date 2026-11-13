@@ -1358,16 +1358,17 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
 
         The preflight SHA check alone is a check-then-act: claiming costs a
         round trip, so a review could be published for a superseded SHA and
-        still read as the current verdict. Both windows must re-check, and a
-        comment published for a moved head must be retracted rather than left
-        standing as the current conclusion.
+        still read as the current verdict. Both windows must re-check. A
+        comment published for a moved head is NOT deleted (askmanyai#613: a
+        published-then-deleted review left the SHA with none): it stays,
+        labelled with the commit it covers, and the run stops before recording.
         """
         poster = (self.SKILL / "scripts" / "review_and_post.sh").read_text(encoding="utf-8")
         self.assertIn("assert_head_unchanged", poster)
         self.assertIn('assert_head_unchanged "during claim"', poster)
         self.assertIn('assert_head_unchanged "during publish"', poster)
-        # Retraction is limited to a comment this run created.
-        self.assertIn("gh api -X DELETE", poster)
+        self.assertNotIn("-X DELETE", poster)
+        self.assertIn("**评审 commit**", poster)
 
     def test_skill_documents_the_opus_marker_it_actually_posts(self):
         post = (self.SKILL / "scripts" / "review_and_post.sh").read_text(encoding="utf-8")

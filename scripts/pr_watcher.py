@@ -213,8 +213,76 @@ def _read_codex_exec_config(config_path: Path = USER_CONFIG_PATH) -> list[str]:
     return args
 
 
+DEFAULT_OPUS_REVIEW_SCRIPT = Path.home() / ".claude" / "skills" / "pr" / "scripts" / "review_with_opus.sh"
+DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS = 5
+
+
+def _read_review_fallback_config(config_path: Path = USER_CONFIG_PATH) -> dict:
+    """Load the Opus fallback reviewer settings.
+
+    When Codex fails to produce a review (model at capacity, crash, timeout,
+    malformed output), the watcher falls back to the `/pr` skill's Opus
+    reviewer in the same run instead of leaving the SHA without a review.
+    `review_fallback: {"enabled": false}` turns that off; `opus_script`
+    points at a different copy of review_with_opus.sh.
+    """
+    out = {"enabled": True, "opus_script": DEFAULT_OPUS_REVIEW_SCRIPT}
+    raw = _read_user_config(config_path).get("review_fallback")
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        print(f"[pr-watcher] warn: review_fallback={raw!r} in {config_path} is not an object; using defaults", file=sys.stderr)
+        return out
+    enabled = raw.get("enabled", True)
+    if isinstance(enabled, bool):
+        out["enabled"] = enabled
+    else:
+        print(f"[pr-watcher] warn: review_fallback.enabled={enabled!r} is not a boolean; using true", file=sys.stderr)
+    script = raw.get("opus_script")
+    if script is not None:
+        if isinstance(script, str) and script.strip():
+            out["opus_script"] = Path(script.strip()).expanduser()
+        else:
+            print(f"[pr-watcher] warn: review_fallback.opus_script={script!r} is not a non-empty string; ignoring", file=sys.stderr)
+    return out
+
+
+def _read_auto_fix_config(config_path: Path = USER_CONFIG_PATH) -> dict:
+    """Load the auto-fix loop settings.
+
+    A ❌/⚠️ review launches MyCalFix (launch_fix.sh, yolo mode) on the PR
+    branch; the fix push triggers the next review. After
+    `max_review_rounds` reviews on one PR that still do not pass, the loop
+    stops and asks a human. `auto_fix: {"enabled": false}` disables it.
+    """
+    out = {"enabled": True, "max_review_rounds": DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS}
+    raw = _read_user_config(config_path).get("auto_fix")
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        print(f"[pr-watcher] warn: auto_fix={raw!r} in {config_path} is not an object; using defaults", file=sys.stderr)
+        return out
+    enabled = raw.get("enabled", True)
+    if isinstance(enabled, bool):
+        out["enabled"] = enabled
+    else:
+        print(f"[pr-watcher] warn: auto_fix.enabled={enabled!r} is not a boolean; using true", file=sys.stderr)
+    rounds = raw.get("max_review_rounds", DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS)
+    if type(rounds) is int and rounds >= 1:
+        out["max_review_rounds"] = rounds
+    else:
+        print(
+            f"[pr-watcher] warn: auto_fix.max_review_rounds={rounds!r} is not a positive JSON integer; "
+            f"using {DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS}",
+            file=sys.stderr,
+        )
+    return out
+
+
 CODEX_CONCURRENCY_CAP = _read_codex_cap()    # max codex executions in flight across all PRs
 CODEX_EXEC_CONFIG_ARGS = _read_codex_exec_config()
+REVIEW_FALLBACK_CONFIG = _read_review_fallback_config()
+AUTO_FIX_CONFIG = _read_auto_fix_config()
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
 NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
@@ -227,8 +295,33 @@ MAX_RUNTIME_PER_TICK_SEC = 25 * 60   # 单次 tick 最长跑 25 分钟，防止�
 SEARCH_QUERY = "is:pr author:@me state:open archived:false"
 PENDING_REVIEW_RECOVERY_GRACE_SEC = 10 * 60  # Give GitHub comment listing one fallback tick to settle.
 PENDING_REVIEW_STALE_SEC = MAX_RUNTIME_PER_TICK_SEC + PENDING_REVIEW_RECOVERY_GRACE_SEC
+AI_COAUTHOR_BLOCKQUOTE_MARKER = "> 🤖 由 Codex 自动生成"
 AI_COAUTHOR_METADATA_MARKER = "<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->"
 HEAD_SHA_METADATA_PREFIX = "<!-- pr-watcher-head-sha:"
+REVIEW_MODEL_METADATA_PREFIX = "<!-- pr-review-model:"
+# The Opus fallback must bill the Claude subscription, never a Teamorouter key.
+OPUS_FALLBACK_REQUIRED_PROVIDER = "claude-subscription"
+# The fallback runs after Codex already spent its time, inside a tick that
+# reviews PRs one by one, so cap it: 2 reviewer attempts × 900s + gh round
+# trips (REVIEW_MAX_ATTEMPTS in the environment still wins).
+OPUS_FALLBACK_MAX_ATTEMPTS = "2"
+OPUS_FALLBACK_TIMEOUT_SEC = 35 * 60
+# A watcher-owned pending claim (poll / force / restart) is held together with
+# the per-PR flock for the whole run. Anyone who can take the flock therefore
+# knows the owner is gone and must not wait PENDING_REVIEW_STALE_SEC for it.
+# Only the `/pr` current-session claim outlives the flock and keeps the timer.
+WATCHER_PENDING_SOURCES = frozenset({
+    "poll",
+    "poll-first-seen",
+    "force",
+    "post-review-head-moved",
+    "persist-head-moved",
+})
+# Failed review attempts (Codex and Opus both failed) per head SHA before the
+# launchd tick stops retrying that SHA and asks a human. --force still retries.
+MAX_REVIEW_ATTEMPTS_PER_SHA = 3
+CONCLUSION_LINE_RE = re.compile(r"^结论[：:]\s*(✅|⚠️|⚠|❌)")
+GITHUB_COMMENT_URL_RE = re.compile(r"https://github\.com/[^\s]+#issuecomment-[0-9]+")
 
 GRAPHQL_QUERY = """
 query($q: String!) {
@@ -960,6 +1053,19 @@ def _pending_age_seconds(entry: dict, now: datetime) -> float | None:
 
 
 def _pending_is_stale(entry: dict, now: datetime) -> bool:
+    """Is the pending claim on this entry abandoned?
+
+    PRECONDITION: the caller holds the per-PR flock. Every caller
+    (_same_sha_review_guard from the tick / --force, and the `/pr` claim)
+    does. A watcher-owned claim lives exactly as long as its process holds
+    that flock, so if we hold it the owner has exited (finished, failed, or
+    crashed) and the claim is dead right now — waiting the stale timer is what
+    left askmanyai#613's head unreviewed for 35 minutes. The `/pr`
+    current-session claim is released between claim and publish, so it keeps
+    the timer.
+    """
+    if (entry.get("pending_review_source") or "") in WATCHER_PENDING_SOURCES:
+        return True
     age = _pending_age_seconds(entry, now)
     return age is None or age >= PENDING_REVIEW_STALE_SEC
 
@@ -985,6 +1091,8 @@ def _complete_recovered_pending(
         "recovered_from_pending_at": now.isoformat(timespec="seconds"),
     })
     _clear_pending_review(entry)
+    _clear_review_failures(entry)
+    record_review_round(entry, pr.head_sha, parse_verdict(comment_body))
     cache_comment_body(comment_url, comment_body)
 
 
@@ -1642,6 +1750,461 @@ def build_event(
     )
 
 
+# ─── review publishing (single publisher per SHA) ──────────────────────────────
+#
+# The watcher, not the reviewer model, posts the PR comment. Codex (and the
+# Opus fallback) only draft the body. That is what makes "exactly one review
+# comment per head SHA, never posted-then-deleted" enforceable: the model can no
+# longer post a malformed comment, delete it and then die at capacity
+# (askmanyai#613 at 15:42), and the post happens under the per-PR flock right
+# after a same-author same-SHA dedup lookup.
+
+
+def render_review_comment(head_sha: str, body: str, *, model_marker: str | None = None) -> str:
+    """Wrap a drafted review body in the canonical AI co-author header.
+
+    The visible `评审 commit` line keeps a review of a superseded commit from
+    reading as the verdict on the PR's current head: it stays on the PR (it is
+    a valid review of that commit) but says which commit it covers.
+    """
+    lines = [
+        AI_COAUTHOR_BLOCKQUOTE_MARKER,
+        AI_COAUTHOR_METADATA_MARKER,
+        head_sha_metadata_marker(head_sha),
+    ]
+    if model_marker:
+        lines.append(model_marker)
+    lines.append("")
+    lines.append(f"**评审 commit**：`{head_sha[:8]}`（只针对这个 commit；PR 之后有新 commit 时以新 commit 的评审为准）")
+    lines.append("")
+    lines.append(body.strip())
+    return "\n".join(lines) + "\n"
+
+
+def normalize_review_body(text: str | None, head_sha: str) -> tuple[str, str] | None:
+    """Validate a drafted review body; return (body, verdict) or None.
+
+    Accepts what Codex prints as its final reply: optional surrounding code
+    fence, optional copy of the canonical header (stripped — the publisher adds
+    its own). Rejects anything whose last non-empty line is not a canonical
+    `结论：` line, and anything that names a different head SHA.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+            s = "\n".join(lines[1:-1]).strip()
+    if HEAD_SHA_METADATA_PREFIX in s and head_sha_metadata_marker(head_sha) not in s:
+        return None
+    kept: list[str] = []
+    for line in s.splitlines():
+        stripped = line.strip()
+        if stripped == AI_COAUTHOR_BLOCKQUOTE_MARKER or stripped.startswith(AI_COAUTHOR_BLOCKQUOTE_MARKER):
+            continue
+        if stripped.startswith(("<!-- ai-coauthor:", HEAD_SHA_METADATA_PREFIX, REVIEW_MODEL_METADATA_PREFIX)):
+            continue
+        if stripped.startswith("**评审 commit**"):
+            continue
+        kept.append(line)
+    body = "\n".join(kept).strip()
+    if not body:
+        return None
+    last = [ln for ln in body.splitlines() if ln.strip()][-1].strip()
+    if not CONCLUSION_LINE_RE.match(last):
+        return None
+    verdict = parse_verdict(last)
+    if verdict not in ("✅", "⚠️", "❌"):
+        return None
+    return body, verdict
+
+
+def _codex_failure_reason(result: CodexResult) -> str:
+    """Short human-readable reason why a Codex run produced no usable review."""
+    reason = ""
+    try:
+        for raw in result.jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = raw.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            t = obj.get("type")
+            if t == "turn.failed":
+                reason = ((obj.get("error") or {}).get("message") or "turn.failed")
+            elif t == "error" and not reason:
+                reason = obj.get("message") or "error"
+            elif t == "_killed_by_watcher" and obj.get("reason") == "timeout":
+                reason = "timeout"
+    except OSError:
+        pass
+    if reason:
+        return reason[:200]
+    if result.exit_code != 0:
+        return f"codex exit={result.exit_code}"
+    if not result.last_message:
+        return "codex produced no final message"
+    return "codex final message is not a canonical review body"
+
+
+def _append_jsonl(path: Path, obj: dict) -> None:
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def publish_review_comment(
+    pr: PRSnap,
+    body: str,
+    *,
+    model_marker: str | None = None,
+) -> tuple[AICommentLookup, str]:
+    """Post the one review comment for pr.head_sha, or reuse the existing one.
+
+    Returns (lookup, action) with action in {"reused", "posted", "failed"}.
+    Never deletes or edits a comment. A lookup failure refuses to post: an
+    unverifiable dedup is how a SHA ends up with two reviews.
+    """
+    existing = fetch_latest_ai_comment_since(pr.repo, pr.number, None, head_sha=pr.head_sha)
+    if existing.status == "found" and existing.comment_url:
+        return existing, "reused"
+    if existing.status != "absent":
+        return AICommentLookup("failed"), "failed"
+
+    comment = render_review_comment(pr.head_sha, body, model_marker=model_marker)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    body_path = LOG_DIR / f".publish-{_pr_safe_id(pr.url)}-{uuid.uuid4().hex[:8]}.md"
+    output = ""
+    try:
+        body_path.write_text(comment, encoding="utf-8")
+        proc = subprocess.run(
+            ["gh", "pr", "comment", pr.url, "--body-file", str(body_path)],
+            capture_output=True, text=True, check=False,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+    except OSError as e:
+        output = str(e)
+    finally:
+        try:
+            body_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Whatever gh reported, the authoritative answer is what GitHub now holds:
+    # a post that "failed" on a network blip may still have landed.
+    after = fetch_latest_ai_comment_since(pr.repo, pr.number, None, head_sha=pr.head_sha)
+    if after.status == "found" and after.comment_url:
+        return after, "posted"
+    m = GITHUB_COMMENT_URL_RE.findall(output)
+    if after.status == "failed" and m:
+        return AICommentLookup("found", comment_url=m[-1], comment_body=comment), "posted"
+    print(f"      warn: gh pr comment did not produce a review comment: {output.strip()[:300]}", flush=True)
+    return AICommentLookup("failed"), "failed"
+
+
+@dataclass
+class FallbackReview:
+    body: str | None = None
+    verdict: str | None = None
+    model_marker: str | None = None
+    reason: str = ""
+    cancelled: bool = False
+
+
+def _run_cancellable(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict,
+    cancel_marker: Path,
+    timeout_sec: float,
+    log_path: Path,
+) -> tuple[int, str, str]:
+    """Run cmd, killing its process group on a cancel marker or timeout.
+
+    Returns (returncode, stdout, outcome) where outcome is "ok", "cancelled"
+    or "timeout". A consumed cancel marker is unlinked, same contract as
+    run_codex's watcher thread.
+    """
+    with log_path.open("w", encoding="utf-8") as logf:
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=logf,
+            text=True, start_new_session=True,
+        )
+        out_chunks: list[str] = []
+
+        def _reader() -> None:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                out_chunks.append(line)
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + timeout_sec
+        outcome = "ok"
+        while proc.poll() is None:
+            try:
+                marker = cancel_marker.exists()
+            except OSError:
+                marker = False
+            if marker:
+                try:
+                    cancel_marker.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                outcome = "cancelled"
+            elif time.monotonic() > deadline:
+                outcome = "timeout"
+            if outcome != "ok":
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                break
+            time.sleep(CANCEL_POLL_SEC)
+        proc.wait()
+        reader.join(timeout=5)
+        stdout = "".join(out_chunks)
+        logf.write("\n--- stdout ---\n" + stdout)
+    return proc.returncode, stdout, outcome
+
+
+def run_opus_fallback_review(pr: PRSnap, *, work_dir: Path) -> FallbackReview:
+    """Draft the review with the `/pr` skill's Opus reviewer (Claude subscription).
+
+    Used in the same run when Codex produced no review. Never posts: the
+    caller publishes through publish_review_comment like a Codex draft.
+    """
+    cfg = REVIEW_FALLBACK_CONFIG
+    if not cfg.get("enabled", True):
+        return FallbackReview(reason="opus fallback disabled in config")
+    script = Path(cfg.get("opus_script") or DEFAULT_OPUS_REVIEW_SCRIPT)
+    try:
+        script_text = script.read_text(encoding="utf-8")
+    except OSError as e:
+        return FallbackReview(reason=f"opus reviewer missing: {script} ({e})")
+    if f'REVIEW_PROVIDER="{OPUS_FALLBACK_REQUIRED_PROVIDER}"' not in script_text:
+        return FallbackReview(
+            reason=f"opus reviewer {script} does not bill the Claude subscription; refusing to use it",
+        )
+
+    # review_with_opus.sh only needs *a* git work tree to cd into (it reads the
+    # PR through `gh pr view/diff <url>`), so a throwaway repo avoids depending
+    # on origin_cwd, which the launchd path often does not know.
+    repo_dir = work_dir / "opus-fallback-repo"
+    out_file = work_dir / "opus-fallback-review.md"
+    log_path = LOG_DIR / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}__{_pr_safe_id(pr.url)}.opus-fallback.log"
+    try:
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(repo_dir)], check=True, capture_output=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        return FallbackReview(reason=f"cannot prepare opus fallback work dir: {e}")
+
+    env = os.environ.copy()
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
+    env.setdefault("REVIEW_MAX_ATTEMPTS", OPUS_FALLBACK_MAX_ATTEMPTS)
+    try:
+        code, stdout, outcome = _run_cancellable(
+            ["bash", str(script), "--pr-url", pr.url, "--output", str(out_file)],
+            cwd=repo_dir,
+            env=env,
+            cancel_marker=_pr_cancel_path(pr.url),
+            timeout_sec=OPUS_FALLBACK_TIMEOUT_SEC,
+            log_path=log_path,
+        )
+    except OSError as e:
+        return FallbackReview(reason=f"cannot start opus reviewer: {e}")
+    if outcome == "cancelled":
+        return FallbackReview(reason="cancelled by new commit", cancelled=True)
+    if outcome == "timeout":
+        return FallbackReview(reason=f"opus reviewer timed out after {int(OPUS_FALLBACK_TIMEOUT_SEC)}s")
+
+    fields: dict[str, str] = {}
+    for line in stdout.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            fields[k.strip()] = v.strip()
+    if code != 0 or fields.get("REVIEW_GENERATION") != "ok":
+        return FallbackReview(reason=f"opus reviewer failed (exit={code}); see {log_path.name}")
+    if fields.get("REVIEW_PROVIDER") != OPUS_FALLBACK_REQUIRED_PROVIDER:
+        return FallbackReview(reason=f"opus reviewer reported provider={fields.get('REVIEW_PROVIDER')!r}; refusing")
+    if fields.get("REVIEW_HEAD_SHA") != pr.head_sha:
+        return FallbackReview(
+            reason=f"opus reviewed sha={fields.get('REVIEW_HEAD_SHA', '')[:8]} but run is for {pr.head_sha[:8]}",
+        )
+    try:
+        drafted = out_file.read_text(encoding="utf-8")
+    except OSError as e:
+        return FallbackReview(reason=f"opus review output unreadable: {e}")
+    normalized = normalize_review_body(drafted, pr.head_sha)
+    if normalized is None:
+        return FallbackReview(reason="opus review output is not a canonical review body")
+    model = fields.get("REVIEW_MODEL") or "claude-opus"
+    return FallbackReview(
+        body=normalized[0],
+        verdict=normalized[1],
+        model_marker=f"{REVIEW_MODEL_METADATA_PREFIX} {model}; provider: {OPUS_FALLBACK_REQUIRED_PROVIDER} -->",
+    )
+
+
+def _clear_review_failures(entry: dict) -> None:
+    for key in ("review_failed_sha", "review_failed_attempts", "review_failed_reason", "review_failed_at"):
+        entry.pop(key, None)
+
+
+def _review_attempts_exhausted(entry: dict, head_sha: str) -> bool:
+    return (
+        entry.get("review_failed_sha") == head_sha
+        and int(entry.get("review_failed_attempts") or 0) >= MAX_REVIEW_ATTEMPTS_PER_SHA
+    )
+
+
+def _record_review_failure(state: dict, pr: PRSnap, *, reason: str, now: datetime) -> int:
+    """Release this run's pending claim and count the failed attempt.
+
+    Returns the attempt count for this SHA. Called the moment a run knows it
+    will not publish, so the `/pr` path or the next tick can take the SHA
+    immediately instead of waiting out PENDING_REVIEW_STALE_SEC.
+    """
+    entry = state.setdefault("prs", {}).setdefault(pr.url, {})
+    entry.setdefault("repo", pr.repo)
+    entry.setdefault("number", pr.number)
+    if entry.get("pending_review_sha") == pr.head_sha:
+        _clear_pending_review(entry)
+    if entry.get("review_failed_sha") == pr.head_sha:
+        attempts = int(entry.get("review_failed_attempts") or 0) + 1
+    else:
+        attempts = 1
+    entry.update({
+        "review_failed_sha": pr.head_sha,
+        "review_failed_attempts": attempts,
+        "review_failed_reason": reason[:300],
+        "review_failed_at": now.isoformat(timespec="seconds"),
+    })
+    return attempts
+
+
+# ─── auto-fix loop (review ❌/⚠️ → MyCalFix fix → push → next review) ──────────
+
+
+def record_review_round(entry: dict, head_sha: str, verdict: str) -> None:
+    """Count a recorded review toward the per-PR auto-fix round budget.
+
+    Shared by both review entrypoints (watcher and `/pr` record) so the
+    5-round limit counts every review of the PR, whoever produced it. One SHA
+    counts once. A pass resets the budget.
+    """
+    if verdict not in ("✅", "⚠️", "❌"):
+        return
+    if entry.get("review_round_sha") == head_sha:
+        return
+    entry["review_round_sha"] = head_sha
+    if verdict == "✅":
+        entry["review_rounds_without_pass"] = 0
+        for key in ("needs_human_sha", "needs_human_at", "needs_human_reason"):
+            entry.pop(key, None)
+    else:
+        entry["review_rounds_without_pass"] = int(entry.get("review_rounds_without_pass") or 0) + 1
+
+
+def _launch_auto_fix(fix_url: str) -> None:
+    """Start MyCalFix in yolo mode without blocking the watcher.
+
+    Same launcher as the calendar link (worktree + fix_prompt.md + push to
+    the PR branch); MYCALFIX_MODE=yolo skips the per-click dialog because
+    nobody is clicking. Its push re-enters the review via the pre-push hook.
+    """
+    env = os.environ.copy()
+    env["MYCALFIX_MODE"] = "yolo"
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
+    subprocess.Popen(
+        ["bash", str(HERE / "launch_fix.sh"), fix_url],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def maybe_start_auto_fix(
+    state: dict,
+    pr: PRSnap,
+    *,
+    verdict: str,
+    comment_url: str | None,
+    origin_cwd: str | None,
+    now: datetime,
+) -> str:
+    """After a recorded review: launch the next fix round or hand off to a human."""
+    entry = state.setdefault("prs", {}).setdefault(pr.url, {})
+    cfg = AUTO_FIX_CONFIG
+    if verdict not in ("⚠️", "❌"):
+        return "auto-fix: not needed"
+    if not cfg.get("enabled", True):
+        return "auto-fix: disabled"
+    max_rounds = int(cfg.get("max_review_rounds") or DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS)
+    rounds = int(entry.get("review_rounds_without_pass") or 0)
+    group = f"pr-watcher:{pr.url}"
+    if rounds >= max_rounds:
+        if entry.get("needs_human_sha") != pr.head_sha:
+            entry.update({
+                "needs_human_sha": pr.head_sha,
+                "needs_human_at": now.isoformat(timespec="seconds"),
+                "needs_human_reason": f"{rounds} 轮评审仍未通过",
+            })
+            notify(
+                title="🙋 PR 需要人工介入",
+                subtitle=pr.repo,
+                message=f"#{pr.number} 已 {rounds} 轮评审仍未通过，自动修复已停止",
+                open_url=comment_url or pr.url,
+                group=group,
+            )
+        return f"auto-fix: stopped after {rounds} rounds, needs human"
+    if entry.get("auto_fix_launched_sha") == pr.head_sha:
+        return "auto-fix: already launched for this sha"
+    if _is_fork_pr(pr):
+        return "auto-fix: skipped (fork PR)"
+    if not origin_cwd:
+        notify(
+            title="⚠️ PR 无法自动修复",
+            subtitle=pr.repo,
+            message=f"#{pr.number} 不知道本地仓库路径；本地 push 一次或用日历里的 MyCalFix 链接",
+            open_url=comment_url or pr.url,
+            group=group,
+        )
+        return "auto-fix: skipped (origin_cwd unknown)"
+    fix_url = _build_fix_url(pr=pr, comment_url=comment_url, origin_cwd=origin_cwd)
+    if not fix_url:
+        return "auto-fix: skipped (no fix url)"
+    try:
+        _launch_auto_fix(fix_url)
+    except OSError as e:
+        print(f"      warn: auto-fix launch failed: {e}", flush=True)
+        return f"auto-fix: launch failed ({e})"
+    entry.update({
+        "auto_fix_launched_sha": pr.head_sha,
+        "auto_fix_launched_at": now.isoformat(timespec="seconds"),
+    })
+    notify(
+        title="🛠 PR 自动修复已启动",
+        subtitle=pr.repo,
+        message=f"#{pr.number} 第 {rounds}/{max_rounds} 轮评审未通过，正在自动修复",
+        open_url=comment_url or pr.url,
+        group=group,
+    )
+    return f"auto-fix: launched (round {rounds}/{max_rounds})"
+
+
 # ─── main flow ─────────────────────────────────────────────────────────────────
 
 
@@ -1759,6 +2322,9 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
             shutil.rmtree(result.scratch_dir, ignore_errors=True)
         except Exception:
             pass
+        # Nothing was published by this run (Codex only drafts), so release
+        # the claim now instead of leaving it for the stale timer.
+        _record_review_failure(state, pr, reason=f"cannot revalidate head after codex: {e}", now=datetime.now())
         _refresh_dashboard(reason="head-revalidation-failed")
         return f"head revalidation failed (not finalized, elapsed={fmt_duration(elapsed)})"
 
@@ -1784,27 +2350,126 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
                 f"{existing_lookup.comment_url}",
                 flush=True,
             )
-    if comment_lookup.status != "found" or not comment_lookup.comment_url:
+    def fail_review(reason: str) -> str:
+        """No review will be published by this run: release the claim now."""
+        # The caller (tick / --force) saves state right after we return,
+        # still under the per-PR flock, so the release is durable at once.
+        attempts = _record_review_failure(state, pr, reason=reason, now=datetime.now())
         print(
-            f"      warn: no AI-marked review comment found after this run "
-            f"(status={comment_lookup.status}); keeping pending sha={pr.head_sha[:8]}",
+            f"      review failed for sha={pr.head_sha[:8]} (attempt {attempts}/"
+            f"{MAX_REVIEW_ATTEMPTS_PER_SHA}): {reason}; pending released",
             flush=True,
         )
-        try:
-            with result.jsonl_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "type": "_review_comment_missing",
-                    "lookup_status": comment_lookup.status,
-                    "head_sha": pr.head_sha,
-                }, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
+        _append_jsonl(result.jsonl_path, {
+            "type": "_review_failed",
+            "head_sha": pr.head_sha,
+            "reason": reason,
+            "attempt": attempts,
+        })
+        if attempts >= MAX_REVIEW_ATTEMPTS_PER_SHA:
+            notify(
+                title="🙋 PR review 连续失败，需要人工",
+                subtitle=pr.repo,
+                message=f"#{pr.number} {pr.head_sha[:7]} 已失败 {attempts} 次：{reason[:80]}",
+                open_url=pr.url,
+                group=notify_group,
+            )
+        else:
+            notify(
+                title="⚠️ PR review 失败，稍后自动重试",
+                subtitle=pr.repo,
+                message=f"#{pr.number} {reason[:100]}",
+                open_url=pr.url,
+                group=notify_group,
+            )
         try:
             shutil.rmtree(result.scratch_dir, ignore_errors=True)
         except Exception:
             pass
-        _refresh_dashboard(reason="comment-missing")
-        return f"review comment missing (status={comment_lookup.status}, elapsed={fmt_duration(elapsed)})"
+        _refresh_dashboard(reason="review-failed")
+        return f"review failed (attempt {attempts}, {reason}, elapsed={fmt_duration(elapsed)})"
+
+    def cancelled_before_publish(where: str) -> str:
+        _append_jsonl(result.jsonl_path, {"type": "_killed_by_watcher", "reason": f"cancelled_{where}"})
+        notify(
+            title="🛑 PR review 已取消",
+            subtitle=pr.repo,
+            message=f"#{pr.number} 检测到新 commit，已取消进行中的 review",
+            open_url=pr.url,
+            group=notify_group,
+        )
+        try:
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        _refresh_dashboard(reason="cancelled")
+        return f"cancelled (new commit {where}, elapsed={fmt_duration(elapsed)})"
+
+    if comment_lookup.status == "failed":
+        # Cannot tell whether this SHA already has a review; posting now could
+        # create a second one. Release the claim and let the next attempt retry.
+        return fail_review("GitHub comment lookup failed before publish")
+
+    if comment_lookup.status != "found":
+        reviewer = "codex"
+        model_marker: str | None = None
+        drafted = normalize_review_body(result.last_message, pr.head_sha) if result.exit_code == 0 else None
+        if drafted is None:
+            codex_reason = _codex_failure_reason(result)
+            print(f"      codex produced no review ({codex_reason}); falling back to Opus", flush=True)
+            _append_jsonl(result.jsonl_path, {
+                "type": "_codex_review_failed",
+                "head_sha": pr.head_sha,
+                "reason": codex_reason,
+            })
+            fallback = run_opus_fallback_review(pr, work_dir=result.scratch_dir)
+            if fallback.cancelled:
+                return cancelled_before_publish("during opus fallback")
+            if fallback.body is None or fallback.verdict is None:
+                return fail_review(f"codex: {codex_reason}; opus: {fallback.reason}")
+            drafted = (fallback.body, fallback.verdict)
+            model_marker = fallback.model_marker
+            reviewer = "opus"
+            # The fallback can take many minutes; re-check the head before
+            # publishing a verdict for it.
+            try:
+                moved_pr = _gh_view_force_pr(pr.url)
+            except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError) as e:
+                return fail_review(f"cannot revalidate head after opus fallback: {e}")
+            if moved_pr.head_sha and moved_pr.head_sha != pr.head_sha:
+                return restart_from_moved_head(
+                    moved_pr,
+                    marker_type="_head_moved_during_fallback",
+                    dashboard_reason="head-moved",
+                    source="post-review-head-moved",
+                )
+
+        try:
+            cancel_requested = _pr_cancel_path(pr.url).exists()
+        except OSError:
+            cancel_requested = False
+        if cancel_requested:
+            # A newer commit already asked for a restart; do not publish a
+            # verdict for the superseded one. Consume the marker like
+            # run_codex's watcher does; the waiting --force takes over.
+            try:
+                _pr_cancel_path(pr.url).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return cancelled_before_publish("before publish")
+
+        published, publish_action = publish_review_comment(pr, drafted[0], model_marker=model_marker)
+        if published.status != "found" or not published.comment_url:
+            return fail_review(f"{reviewer} review drafted but publishing to GitHub failed")
+        comment_lookup = published
+        print(f"      {publish_action} {reviewer} review comment {published.comment_url}", flush=True)
+        _append_jsonl(result.jsonl_path, {
+            "type": "_review_published",
+            "head_sha": pr.head_sha,
+            "reviewer": reviewer,
+            "action": publish_action,
+            "comment_url": published.comment_url,
+        })
 
     comment_url = comment_lookup.comment_url
     comment_body = comment_lookup.comment_body
@@ -1956,6 +2621,8 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
                         # 同时记录"我们见过这个 sha"，用于 first-run 兼容
                         entry["last_seen_sha"] = pr.head_sha
                         _clear_pending_review(entry)
+                        _clear_review_failures(entry)
+                        record_review_round(entry, pr.head_sha, parse_verdict(comment_body))
 
                         try:
                             final_pr = _gh_view_force_pr(pr.url)
@@ -2054,7 +2721,19 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
     except Exception:
         pass
 
-    return f"codex ran, calendar={cal_action}"
+    # Next round of the fix loop: ❌/⚠️ → launch MyCalFix on the PR branch
+    # (its push triggers the next review), or hand off after the round budget.
+    auto_fix_action = maybe_start_auto_fix(
+        state,
+        pr,
+        verdict=parse_verdict(comment_body),
+        comment_url=comment_url,
+        origin_cwd=origin_cwd,
+        now=datetime.now(),
+    )
+    print(f"      {auto_fix_action}", flush=True)
+
+    return f"codex ran, calendar={cal_action}, {auto_fix_action}"
 
 
 def _gh_view_force_pr(pr_url: str) -> PRSnap:
@@ -2237,6 +2916,23 @@ def _run_force(args, now: datetime) -> int:
     return 0
 
 
+def _reset_auto_fix(pr_url: str) -> int:
+    state = load_state()
+    entry = state.get("prs", {}).get(pr_url)
+    if entry is None:
+        print(f"[pr-watcher] {pr_url} is not in pr_state.json; nothing to reset")
+        return 1
+    for key in (
+        "review_rounds_without_pass", "review_round_sha", "auto_fix_launched_sha",
+        "auto_fix_launched_at", "needs_human_sha", "needs_human_at", "needs_human_reason",
+    ):
+        entry.pop(key, None)
+    _clear_review_failures(entry)
+    save_state(state, touched_prs={pr_url})
+    print(f"[pr-watcher] reset auto-fix rounds for {pr_url}")
+    return 0
+
+
 def main() -> int:
     redirect_stdio_to_log()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2250,7 +2946,14 @@ def main() -> int:
              " Typically passed by the pre-push hook; ignored on the launchd tick path.",
     )
     parser.add_argument("--ignore-throttle", action="store_true", help="ignore nighttime throttle (useful for manual runs)")
+    parser.add_argument(
+        "--reset-auto-fix", type=str, default=None, metavar="PR_URL",
+        help="clear a PR's auto-fix round budget and needs-human mark (after a human took over)",
+    )
     args = parser.parse_args()
+
+    if args.reset_auto_fix:
+        return _reset_auto_fix(args.reset_auto_fix)
 
     if args.origin_cwd and not args.force:
         # Easy mistake when debugging manually: passing --origin-cwd to a tick run
@@ -2412,14 +3115,34 @@ def main() -> int:
                     print(f"    {guard_action}  {pr.url}")
                     continue
 
+            # A SHA whose review failed (Codex and the Opus fallback both) is
+            # retried on later ticks until MAX_REVIEW_ATTEMPTS_PER_SHA, then left
+            # for a human (the failure notification already fired); --force
+            # still retries it.
+            if prev.get("last_commented_sha") != pr.head_sha and _review_attempts_exhausted(prev, pr.head_sha):
+                print(
+                    f"    review failed {prev.get('review_failed_attempts')}x for sha={pr.head_sha[:8]}, "
+                    f"needs human / --force  {pr.url}"
+                )
+                continue
+            retry_after_failure = (
+                prev.get("review_failed_sha") == pr.head_sha
+                and prev.get("last_commented_sha") != pr.head_sha
+            )
+
             # 已 seed 过：若 head_sha 自上次"评论或 seed"以来未变 → 跳过
             baseline = prev.get("last_commented_sha") or prev.get("last_seen_sha")
-            if baseline == pr.head_sha and not retry_after_pending_clear:
+            if baseline == pr.head_sha and not retry_after_pending_clear and not retry_after_failure:
                 print(f"    unchanged  {pr.url}  sha={pr.head_sha[:8]}")
                 continue
 
             # 有新 commit → 触发 codex
-            if retry_after_pending_clear:
+            if retry_after_failure:
+                print(
+                    f"    FAILED REVIEW RETRY  {pr.url}  sha={pr.head_sha[:8]}  "
+                    f"attempt={int(prev.get('review_failed_attempts') or 0) + 1}"
+                )
+            elif retry_after_pending_clear:
                 print(f"    STALE PENDING RETRY  {pr.url}  sha={pr.head_sha[:8]}")
             else:
                 print(f"    NEW COMMIT  {pr.url}  {baseline[:8] if baseline else 'NEW'} → {pr.head_sha[:8]}")
