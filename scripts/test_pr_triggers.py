@@ -1533,14 +1533,19 @@ class WaitForReviewResultTests(unittest.TestCase):
     SCRIPT = ROOT / ".agents" / "skills" / "pr" / "scripts" / "wait_for_review.sh"
     HEAD = "abc1234def5678"
 
-    def _run(self, conclusion: str, *, flaky: bool = False) -> subprocess.CompletedProcess:
+    def _run(self, conclusion: str, *, flaky: bool = False, reviews=None, heads=None) -> subprocess.CompletedProcess:
+        """reviews: [(sha, conclusion)] on the PR; heads: successive `gh pr view` heads (last one sticks)."""
+        reviews = reviews or [(self.HEAD, conclusion)]
+        heads = heads or [self.HEAD]
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            body = f"<!-- pr-watcher-head-sha: {self.HEAD} -->\n**评审模型** x\n\n{conclusion}\n"
             comments = tmp / "comments.json"
             comments.write_text(json.dumps([
-                {"user": {"login": "me"}, "html_url": "https://github.com/o/r/pull/1#issuecomment-9", "body": body},
+                {"user": {"login": "me"}, "html_url": f"https://github.com/o/r/pull/1#issuecomment-{i}",
+                 "body": f"<!-- pr-watcher-head-sha: {sha} -->\n**评审模型** x\n\n{c}\n"}
+                for i, (sha, c) in enumerate(reviews, start=9)
             ]), encoding="utf-8")
+            (tmp / "heads").write_text("\n".join(heads) + "\n", encoding="utf-8")
             fake = tmp / "bin"
             fake.mkdir()
             gh = fake / "gh"
@@ -1551,7 +1556,11 @@ class WaitForReviewResultTests(unittest.TestCase):
                     touch "$flag"; echo 'Post "https://api.github.com/graphql": net/http: TLS handshake timeout' >&2; exit 1
                 fi
                 if [[ "$1 $2" == "api user" ]]; then echo me; exit 0; fi
-                if [[ "$1 $2" == "pr view" ]]; then echo '{{"state":"OPEN","headRefOid":"{self.HEAD}"}}'; exit 0; fi
+                if [[ "$1 $2" == "pr view" ]]; then
+                    h=$(head -1 {tmp}/heads)
+                    if [[ $(wc -l < {tmp}/heads) -gt 1 ]]; then tail -n +2 {tmp}/heads > {tmp}/heads.n; mv {tmp}/heads.n {tmp}/heads; fi
+                    echo '{{"state":"OPEN","headRefOid":"'"$h"'"}}'; exit 0
+                fi
                 if [[ "$1" == "api" ]]; then
                     while [[ $# -gt 0 && "$1" != "--jq" ]]; do shift; done
                     jq -c "$2" {comments}
@@ -1582,6 +1591,16 @@ class WaitForReviewResultTests(unittest.TestCase):
                 self.assertIn(f"REVIEW_HEAD_SHA={self.HEAD}", result.stdout)
                 self.assertIn("REVIEW_COMMENT_URL=https://github.com/o/r/pull/1#issuecomment-9", result.stdout)
                 self.assertIn(f"REVIEW_RESULT={expected}", result.stdout)
+
+    def test_review_for_a_head_that_moved_during_the_lookup_is_not_reported(self):
+        # Head is A when the poll starts, B by the time the comments are read.
+        # A's ✅ must not be reported; the wait follows B and returns B's result.
+        a, b = "aaaa1111", "bbbb2222"
+        result = self._run("", reviews=[(a, "结论：✅ 可以合并"), (b, "结论：❌ 暂不可合并")], heads=[a, b])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"REVIEW_HEAD_SHA={b}", result.stdout)
+        self.assertIn("REVIEW_RESULT=fix", result.stdout)
+        self.assertNotIn(f"REVIEW_HEAD_SHA={a}", result.stdout)
 
     def test_transient_github_errors_are_retried_not_fatal(self):
         # Every gh call (user, pr view, comments) fails once with a TLS timeout.

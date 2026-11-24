@@ -88,6 +88,21 @@ while :; do
     fi
     found="$(jq -s 'last // empty' <<<"$comments")"
     if [[ -n "$found" ]]; then
+        # The head can move while the comments page in. Re-read it and only
+        # report a review that is still for the current head; otherwise a ✅
+        # for A would be reported as the result for an unreviewed B.
+        if ! recheck="$(gh pr view "$PR_URL" --json state,headRefOid)"; then
+            gh_retry_or_timeout "gh pr view (recheck)"
+            continue
+        fi
+        if [[ "$(jq -r '.state' <<<"$recheck")" != "OPEN" ]]; then
+            echo "REVIEW_HEAD_SHA=$(jq -r '.headRefOid' <<<"$recheck")"
+            echo "ERROR: PR is $(jq -r '.state' <<<"$recheck"); no review to wait for" >&2
+            exit 4
+        fi
+        if [[ "$(jq -r '.headRefOid' <<<"$recheck")" != "$head" ]]; then
+            continue
+        fi
         body="$(jq -r '.body' <<<"$found")"
         echo "REVIEW_HEAD_SHA=$head"
         echo "REVIEW_COMMENT_URL=$(jq -r '.url' <<<"$found")"
