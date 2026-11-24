@@ -284,9 +284,10 @@ def _read_auto_fix_config(config_path: Path = USER_CONFIG_PATH) -> dict:
 # Code written by one agent is reviewed by the other family: a PR Claude Code wrote
 # gets the Codex CLI reviewer, a PR Codex wrote gets the Claude Code (Opus)
 # reviewer. Model ids are parameters so a model upgrade is a config edit, not a
-# code change. Each reviewer runs on its subscription first (ChatGPT login for
-# Codex, claude.ai login for Claude Code) and only on failure on the API
-# (Teamorouter by default).
+# code change. The Codex reviewer runs on the API (Teamorouter by default):
+# the ChatGPT subscription backend stalls ~5 minutes per hang and "auto" only
+# falls back after 5 such reconnects. The Claude reviewer runs on its
+# claude.ai subscription first and only on failure on the API.
 #
 # ~/.config/my-calendar/config.json:
 #   "review_routing": {
@@ -294,7 +295,7 @@ def _read_auto_fix_config(config_path: Path = USER_CONFIG_PATH) -> dict:
 #     "same_family_fallback": false,
 #     "reviewers": {
 #       "codex":  {"model": "gpt-6.2-astra", "model_reasoning_effort": "medium",
-#                  "auth": "auto", "api_base_url": "https://api.teamorouter.com/v1",
+#                  "auth": "api", "api_base_url": "https://api.teamorouter.com/v1",
 #                  "api_key_env": "", "api_key_file": ""},
 #       "claude": {"model": "claude-opus-5-5", "auth": "auto"}
 #     }
@@ -311,7 +312,7 @@ DEFAULT_REVIEW_ROUTING: dict = {
     "reviewers": {
         REVIEWER_CODEX: {
             "model": "gpt-6.2-astra",
-            "auth": "auto",
+            "auth": "api",
             "api_base_url": "https://api.teamorouter.com/v1",
             "api_key_env": "",
             "api_key_file": "",

@@ -5759,6 +5759,7 @@ class CrossModelRoutingTests(unittest.TestCase):
     def test_subscription_failure_retries_on_the_api(self):
         pr = _snap613()
         routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+        routing["reviewers"][pr_watcher.REVIEWER_CODEX]["auth"] = "auto"
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             calls = []
@@ -5778,6 +5779,7 @@ class CrossModelRoutingTests(unittest.TestCase):
     def test_subscription_success_or_cancel_does_not_touch_the_api(self):
         pr = _snap613()
         routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+        routing["reviewers"][pr_watcher.REVIEWER_CODEX]["auth"] = "auto"
         for outcome in ("ok", "cancelled"):
             with self.subTest(outcome), tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
@@ -5794,6 +5796,24 @@ class CrossModelRoutingTests(unittest.TestCase):
                     result = pr_watcher.run_codex_review("p", pr)
                 self.assertEqual(calls, ["subscription"])
                 self.assertEqual(result.provider, "chatgpt-subscription")
+
+    def test_codex_reviewer_defaults_to_the_api_only(self):
+        pr = _snap613()
+        routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+        self.assertEqual(pr_watcher.codex_auth_plan(routing), ["api"])
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            calls = []
+
+            def fake_run(prompt, pr_, *, auth="subscription"):
+                calls.append(auth)
+                return self._codex_result(tmp, last_message=OPUS_DRAFT_PASS)
+
+            with mock.patch.object(pr_watcher, "REVIEW_ROUTING", routing), \
+                    mock.patch.object(pr_watcher, "run_codex", fake_run):
+                result = pr_watcher.run_codex_review("p", pr)
+        self.assertEqual(calls, ["api"])
+        self.assertEqual(result.provider, "teamorouter-api")
 
     def test_codex_written_pr_goes_to_the_claude_reviewer_without_running_codex(self):
         pr = _snap613(head_branch="codex/fix-login")

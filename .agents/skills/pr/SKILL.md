@@ -1,6 +1,6 @@
 ---
 name: pr
-description: Create or update a lightweight GitHub PR and get exactly one cross-model code review from the my-calendar watcher — Claude-written PRs are reviewed by Codex CLI (gpt-6.2-astra), Codex-written PRs by Claude Code (claude-opus-5-5), each on its subscription first and the Teamorouter API only as fallback. Use for /pr, create/open/update PR, quick PR handoff, rerun code review, or my-calendar review requests.
+description: Create or update a lightweight GitHub PR and get exactly one cross-model code review from the my-calendar watcher — Claude-written PRs are reviewed by Codex CLI (gpt-6.2-astra), Codex-written PRs by Claude Code (claude-opus-5-5), Codex on the Teamorouter API, Claude on its subscription first with the API as fallback. Use for /pr, create/open/update PR, quick PR handoff, rerun code review, or my-calendar review requests.
 ---
 
 # PR
@@ -19,7 +19,7 @@ The watcher is the **only** publisher. It decides who wrote the PR and sends it 
 | Codex | branch `codex/…`, or `Co-authored-by: Codex` | Claude Code, model `review_routing.reviewers.claude.model` (default `claude-opus-5-5`) |
 | unknown | neither | `review_routing.reviewer_for_author.unknown` (default Claude) |
 
-- Each reviewer runs on its subscription first (ChatGPT login for Codex, claude.ai login for Claude Code). Only if that run fails does it retry on the API (Teamorouter: the token in `~/.claude/settings.json`, or `api_key_env` / `api_key_file`).
+- The Codex reviewer runs on the API (Teamorouter: the token in `~/.claude/settings.json`, or `api_key_env` / `api_key_file`), because the ChatGPT subscription backend stalls too often. The Claude reviewer runs on its claude.ai subscription first and retries on the API only if that run fails.
 - Model ids and auth order live in `~/.config/my-calendar/config.json` under `review_routing`; a model upgrade is a config edit.
 - If the cross-family reviewer fails on both subscription and API, the SHA is retried later; it is not handed to the family that wrote it (`same_family_fallback: false`).
 - The comment starts with a `**评审模型**` line naming the model, the account it ran on, and the code author.
