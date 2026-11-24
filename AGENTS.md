@@ -406,7 +406,7 @@ my-calendar = 多个互相独立的模块（节日 / PR 监控 / health / 未来
 
 ### 评审不过谁来修：原会话（2026-11-24 起）
 
-- 修复在写这个 PR 的会话里做：`/pr` 第 4 步 `wait_for_review.sh` 等到评论，按 `REVIEW_RESULT` 走——`pass` 停；`fix` 在原会话里修 Blocker / P0、跑自检、普通 `git push`，pre-push hook 触发下一轮评审，再等；连续 5 轮不过、推送被别人抢先且 `--ff-only` 合不上、要做设计决定、或连续两次等超时，就停下交给人。
+- 修复在写这个 PR 的会话里做：`/pr` 第 4 步 `wait_for_review.sh` 等到评论，按 `REVIEW_RESULT` 走——`pass` 停；`fix` 先核对本地 `HEAD` 就是被评审的 SHA（落后且工作区干净就快进，否则停），再在原会话里修 Blocker / P0、跑自检、普通 `git push`，pre-push hook 触发下一轮评审，再等；连续 5 轮不过、推送被别人抢先且 `--ff-only` 合不上、要做设计决定、或连续两次等超时，就停下交给人。
 - watcher **不再**自己起修复会话。原先的自动修复循环（`maybe_start_auto_fix` → `MYCALFIX_MODE=yolo launch_fix.sh`）已删：它在 Terminal 新开一个 claude 会话，从当时的远端头部建临时 worktree，和还在等评审的原会话同时修同一组 blocker。原会话先推，临时会话就基于旧提交、推送被拒，停在没人看的窗口里问人（11-24 晚 teamo-tag#772、teamo-router#1425、askmanyai#652 各开了 1–3 个，一个都没进 PR）。
 - 没人在等的 PR（原会话已关、launchd 首评）：照旧只写日历事件 + 通知，事件描述里的 MyCalFix 链接由人点了再修。
 - 配置里的 `auto_fix` 和 `--reset-auto-fix` 一并删除；旧 config 里残留的 `auto_fix` 键会被忽略。
