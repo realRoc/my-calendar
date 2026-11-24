@@ -279,9 +279,253 @@ def _read_auto_fix_config(config_path: Path = USER_CONFIG_PATH) -> dict:
     return out
 
 
+# ─── cross-model review routing ────────────────────────────────────────────────
+#
+# Code written by one agent is reviewed by the other family: a PR Claude Code wrote
+# gets the Codex CLI reviewer, a PR Codex wrote gets the Claude Code (Opus)
+# reviewer. Model ids are parameters so a model upgrade is a config edit, not a
+# code change. Each reviewer runs on its subscription first (ChatGPT login for
+# Codex, claude.ai login for Claude Code) and only on failure on the API
+# (Teamorouter by default).
+#
+# ~/.config/my-calendar/config.json:
+#   "review_routing": {
+#     "reviewer_for_author": {"claude": "codex", "codex": "claude", "unknown": "claude"},
+#     "same_family_fallback": false,
+#     "reviewers": {
+#       "codex":  {"model": "gpt-6.2-astra", "model_reasoning_effort": "medium",
+#                  "auth": "auto", "api_base_url": "https://api.teamorouter.com/v1",
+#                  "api_key_env": "", "api_key_file": ""},
+#       "claude": {"model": "claude-opus-5-5", "auth": "auto"}
+#     }
+#   }
+REVIEWER_CODEX = "codex"
+REVIEWER_CLAUDE = "claude"
+AUTHOR_AGENTS = ("claude", "codex", "unknown")
+DEFAULT_REVIEW_ROUTING: dict = {
+    "reviewer_for_author": {"claude": REVIEWER_CODEX, "codex": REVIEWER_CLAUDE, "unknown": REVIEWER_CLAUDE},
+    # Off by default: when the cross-family reviewer fails on both subscription
+    # and API, the SHA is retried later instead of being reviewed by the same
+    # family that wrote it.
+    "same_family_fallback": False,
+    "reviewers": {
+        REVIEWER_CODEX: {
+            "model": "gpt-6.2-astra",
+            "auth": "auto",
+            "api_base_url": "https://api.teamorouter.com/v1",
+            "api_key_env": "",
+            "api_key_file": "",
+        },
+        REVIEWER_CLAUDE: {"model": "claude-opus-5-5", "auth": "auto"},
+    },
+}
+REVIEW_AUTH_MODES = ("auto", "subscription", "api")
+CODEX_API_PROVIDER_ID = "pr_review_api"
+CODEX_API_KEY_ENV = "PR_REVIEW_CODEX_API_KEY"
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+# Keys of reviewers.codex that steer routing/auth; every other scalar is passed to
+# `codex exec` as `-c key=value` (model_reasoning_effort, service_tier, ...).
+_CODEX_ROUTING_KEYS = {"model", "auth", "api_base_url", "api_key_env", "api_key_file"}
+
+
+def _read_review_routing_config(config_path: Path = USER_CONFIG_PATH) -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_REVIEW_ROUTING))  # deep copy
+    raw = _read_user_config(config_path).get("review_routing")
+    if raw is None:
+        return cfg
+    if not isinstance(raw, dict):
+        print(f"[pr-watcher] warn: review_routing={raw!r} in {config_path} is not an object; using defaults", file=sys.stderr)
+        return cfg
+    mapping = raw.get("reviewer_for_author")
+    if isinstance(mapping, dict):
+        for author, reviewer in mapping.items():
+            if author in AUTHOR_AGENTS and reviewer in (REVIEWER_CODEX, REVIEWER_CLAUDE):
+                cfg["reviewer_for_author"][author] = reviewer
+            else:
+                print(f"[pr-watcher] warn: review_routing.reviewer_for_author.{author}={reviewer!r} ignored", file=sys.stderr)
+    elif mapping is not None:
+        print("[pr-watcher] warn: review_routing.reviewer_for_author is not an object; ignoring", file=sys.stderr)
+    if "same_family_fallback" in raw:
+        if isinstance(raw["same_family_fallback"], bool):
+            cfg["same_family_fallback"] = raw["same_family_fallback"]
+        else:
+            print("[pr-watcher] warn: review_routing.same_family_fallback is not a boolean; ignoring", file=sys.stderr)
+    reviewers = raw.get("reviewers")
+    if isinstance(reviewers, dict):
+        for name in (REVIEWER_CODEX, REVIEWER_CLAUDE):
+            item = reviewers.get(name)
+            if item is None:
+                continue
+            if not isinstance(item, dict):
+                print(f"[pr-watcher] warn: review_routing.reviewers.{name} is not an object; ignoring", file=sys.stderr)
+                continue
+            for key, value in item.items():
+                if key == "auth" and value not in REVIEW_AUTH_MODES:
+                    print(f"[pr-watcher] warn: review_routing.reviewers.{name}.auth={value!r} ignored", file=sys.stderr)
+                    continue
+                if key == "model" and not (isinstance(value, str) and value.strip()):
+                    print(f"[pr-watcher] warn: review_routing.reviewers.{name}.model={value!r} ignored", file=sys.stderr)
+                    continue
+                cfg["reviewers"][name][key] = value.strip() if isinstance(value, str) else value
+    elif reviewers is not None:
+        print("[pr-watcher] warn: review_routing.reviewers is not an object; ignoring", file=sys.stderr)
+    return cfg
+
+
+def _codex_exec_args_for(routing: dict, legacy_args: list[str]) -> list[str]:
+    """`codex exec` model/config args for the Codex reviewer.
+
+    The routing config's model wins; the legacy `codex_exec` block still supplies
+    any other keys (effort, service tier) the routing block does not set.
+    """
+    rcfg = routing["reviewers"][REVIEWER_CODEX]
+    own_keys = {k for k in rcfg if k not in _CODEX_ROUTING_KEYS}
+    args: list[str] = ["-m", str(rcfg["model"])]
+    i = 0
+    while i < len(legacy_args):  # keep legacy -c pairs the routing block does not override
+        flag = legacy_args[i]
+        if flag == "-m":
+            i += 2
+            continue
+        if flag == "-c" and i + 1 < len(legacy_args):
+            key = legacy_args[i + 1].split("=", 1)[0]
+            if key not in own_keys:
+                args.extend(["-c", legacy_args[i + 1]])
+            i += 2
+            continue
+        i += 1
+    for key in sorted(own_keys):
+        value = rcfg[key]
+        if isinstance(value, bool):
+            args.extend(["-c", f"{key}={'true' if value else 'false'}"])
+        elif type(value) in (int, float):
+            args.extend(["-c", f"{key}={value}"])
+        elif isinstance(value, str) and value:
+            args.extend(["-c", f"{key}={_toml_string(value)}"])
+    return args
+
+
+def _resolve_codex_api_key(rcfg: dict) -> tuple[str | None, str]:
+    """Return (key, source) for the Codex API fallback; key None when unavailable.
+
+    Order: the env var named by api_key_env, the file at api_key_file, then the
+    API token Claude Code is configured with (one Teamorouter key serves both
+    the Anthropic and the OpenAI Responses protocol).
+    """
+    env_name = rcfg.get("api_key_env") or ""
+    if env_name and os.environ.get(env_name):
+        return os.environ[env_name].strip(), f"env:{env_name}"
+    key_file = rcfg.get("api_key_file") or ""
+    if key_file:
+        try:
+            value = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError:
+            value = ""
+        if value:
+            return value, f"file:{key_file}"
+    try:
+        settings = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        env = settings.get("env") or {}
+        token = (env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY") or "").strip()
+    except (OSError, json.JSONDecodeError, AttributeError):
+        token = ""
+    if token:
+        return token, "claude-settings"
+    return None, "none"
+
+
+def codex_auth_plan(routing: dict) -> list[str]:
+    """Auth modes the Codex reviewer tries, in order."""
+    mode = routing["reviewers"][REVIEWER_CODEX].get("auth", "auto")
+    if mode == "subscription":
+        return ["subscription"]
+    if mode == "api":
+        return ["api"]
+    return ["subscription", "api"]
+
+
+def codex_invocation(routing: dict, legacy_args: list[str], auth: str) -> tuple[list[str], dict[str, str], str]:
+    """(extra `codex exec` args, extra env, provider label) for one auth mode.
+
+    subscription = whatever Codex is logged in with (ChatGPT login). api = a
+    one-off provider pointing at api_base_url with the resolved key passed via
+    env, never argv. Raises RuntimeError when the API mode has no key.
+    """
+    args = _codex_exec_args_for(routing, legacy_args)
+    if auth != "api":
+        return args, {}, "chatgpt-subscription"
+    rcfg = routing["reviewers"][REVIEWER_CODEX]
+    key, _source = _resolve_codex_api_key(rcfg)
+    if not key:
+        raise RuntimeError("no API key for the Codex reviewer (api_key_env / api_key_file / ~/.claude/settings.json)")
+    base_url = str(rcfg.get("api_base_url") or DEFAULT_REVIEW_ROUTING["reviewers"][REVIEWER_CODEX]["api_base_url"])
+    pid = CODEX_API_PROVIDER_ID
+    args += [
+        "-c", f"model_provider={_toml_string(pid)}",
+        "-c", f"model_providers.{pid}.name={_toml_string('pr-review-api')}",
+        "-c", f"model_providers.{pid}.base_url={_toml_string(base_url)}",
+        "-c", f"model_providers.{pid}.env_key={_toml_string(CODEX_API_KEY_ENV)}",
+        "-c", f"model_providers.{pid}.wire_api={_toml_string('responses')}",
+    ]
+    return args, {CODEX_API_KEY_ENV: key}, "teamorouter-api"
+
+
+_CLAUDE_BRANCH_PREFIXES = ("claude/",)
+_CODEX_BRANCH_PREFIXES = ("codex/",)
+_CLAUDE_TEXT_MARKERS = ("co-authored-by: claude", "generated with [claude code]", "generated with claude code")
+_CODEX_TEXT_MARKERS = ("co-authored-by: codex", "generated with codex", "generated by codex", "codex-generated")
+
+
+def classify_author_agent(head_branch: str, texts: list[str]) -> str:
+    """'claude' | 'codex' | 'unknown' from the branch name, then PR body / commit messages.
+
+    Branch prefix decides first (Claude Code names branches claude/..., Codex
+    codex/...). Otherwise the text markers each tool leaves (commit trailer,
+    PR footer). Both families present = 'unknown' rather than a guess.
+    """
+    branch = (head_branch or "").lower()
+    if branch.startswith(_CLAUDE_BRANCH_PREFIXES):
+        return "claude"
+    if branch.startswith(_CODEX_BRANCH_PREFIXES):
+        return "codex"
+    blob = "\n".join(t for t in texts if t).lower()
+    has_claude = any(m in blob for m in _CLAUDE_TEXT_MARKERS)
+    has_codex = any(m in blob for m in _CODEX_TEXT_MARKERS)
+    if has_claude and not has_codex:
+        return "claude"
+    if has_codex and not has_claude:
+        return "codex"
+    return "unknown"
+
+
+def detect_author_agent(pr: "PRSnap") -> str:
+    branch_guess = classify_author_agent(pr.head_branch, [])
+    if branch_guess != "unknown":
+        return branch_guess
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", pr.url, "--json", "body,commits"],
+            capture_output=True, text=True, check=True, timeout=60,
+        )
+        data = json.loads(proc.stdout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        print(f"      warn: cannot read PR body/commits to detect author agent: {e}", flush=True)
+        return "unknown"
+    texts = [data.get("body") or ""]
+    for c in data.get("commits") or []:
+        texts.append(c.get("messageHeadline") or "")
+        texts.append(c.get("messageBody") or "")
+    return classify_author_agent(pr.head_branch, texts)
+
+
+def reviewer_for_author(routing: dict, author: str) -> str:
+    return routing["reviewer_for_author"].get(author, routing["reviewer_for_author"]["unknown"])
+
+
 CODEX_CONCURRENCY_CAP = _read_codex_cap()    # max codex executions in flight across all PRs
 CODEX_EXEC_CONFIG_ARGS = _read_codex_exec_config()
 REVIEW_FALLBACK_CONFIG = _read_review_fallback_config()
+REVIEW_ROUTING = _read_review_routing_config()
 AUTO_FIX_CONFIG = _read_auto_fix_config()
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
@@ -299,8 +543,10 @@ AI_COAUTHOR_BLOCKQUOTE_MARKER = "> 🤖 由 Codex 自动生成"
 AI_COAUTHOR_METADATA_MARKER = "<!-- ai-coauthor: codex; agent: pr_watcher; mode: automated -->"
 HEAD_SHA_METADATA_PREFIX = "<!-- pr-watcher-head-sha:"
 REVIEW_MODEL_METADATA_PREFIX = "<!-- pr-review-model:"
-# The Opus fallback must bill the Claude subscription, never a Teamorouter key.
+# The Claude reviewer runs on the Claude subscription first; the Teamorouter API
+# is accepted only as the script's own fallback (review_with_opus.sh --auth auto).
 OPUS_FALLBACK_REQUIRED_PROVIDER = "claude-subscription"
+CLAUDE_REVIEW_PROVIDERS = frozenset({"claude-subscription", "teamorouter-api"})
 # The fallback runs after Codex already spent its time, inside a tick that
 # reviews PRs one by one, so cap it: 2 reviewer attempts × 900s + gh round
 # trips (REVIEW_MAX_ATTEMPTS in the environment still wins).
@@ -1179,6 +1425,8 @@ class CodexResult:
     cancelled: bool = False     # True iff a cancel marker (issue #26 reset)
                                 # killed the codex subprocess mid-run; callers
                                 # must skip calendar event + state mutation.
+    provider: str = ""          # chatgpt-subscription | teamorouter-api | "" (codex not run)
+    skipped_reason: str = ""    # set when routing sent the PR to the Claude reviewer
 
 
 def _refresh_dashboard(*, reason: str) -> None:
@@ -1212,7 +1460,10 @@ def _sweep_stale_running_sidecars(now_ts: float) -> None:
                 pass
 
 
-def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
+def run_codex(prompt: str, pr: PRSnap, *, auth: str = "subscription") -> CodexResult:
+    """Run the Codex reviewer once. auth="subscription" uses Codex's own login
+    (ChatGPT); auth="api" points it at the configured API (see codex_invocation)."""
+    exec_args, exec_env, provider = codex_invocation(REVIEW_ROUTING, CODEX_EXEC_CONFIG_ARGS, auth)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1345,7 +1596,7 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
         "--dangerously-bypass-approvals-and-sandbox",
         "-s", "danger-full-access",
         "--skip-git-repo-check",
-        *CODEX_EXEC_CONFIG_ARGS,
+        *exec_args,
         "-C", str(scratch),
         "-o", str(last_msg_path),
         prompt,
@@ -1354,6 +1605,9 @@ def run_codex(prompt: str, pr: PRSnap) -> CodexResult:
     env = os.environ.copy()
     # Make sure brew bins are reachable when run from launchd
     env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    # The API key travels in env (named by the provider's env_key), never argv.
+    env.update(exec_env)
+    print(f"      codex reviewer model={REVIEW_ROUTING['reviewers'][REVIEWER_CODEX]['model']} auth={auth} provider={provider}", flush=True)
 
     thread_id: str | None = None
     cancelled = False
@@ -1760,6 +2014,26 @@ def build_event(
 # after a same-author same-SHA dedup lookup.
 
 
+PROVIDER_LABELS = {
+    "chatgpt-subscription": "ChatGPT 订阅",
+    "claude-subscription": "Claude 订阅",
+    "teamorouter-api": "Teamorouter API",
+}
+AUTHOR_LABELS = {"claude": "Claude Code", "codex": "Codex", "unknown": "未识别"}
+
+
+def reviewer_note(model_marker: str | None, author_agent: str | None) -> str | None:
+    """Visible 「评审模型」 line built from the hidden model marker."""
+    m = re.match(r"<!-- pr-review-model:\s*(\S+);\s*provider:\s*(\S+)\s*-->", model_marker or "")
+    if not m:
+        return None
+    provider = PROVIDER_LABELS.get(m.group(2), m.group(2))
+    note = f"**评审模型**：`{m.group(1)}`（{provider}）"
+    if author_agent:
+        note += f" · 代码作者：{AUTHOR_LABELS.get(author_agent, author_agent)}"
+    return note
+
+
 def render_review_comment(head_sha: str, body: str, *, model_marker: str | None = None) -> str:
     """Wrap a drafted review body in the canonical AI co-author header.
 
@@ -1977,6 +2251,52 @@ def _run_cancellable(
     return proc.returncode, stdout, outcome
 
 
+def run_codex_review(prompt: str, pr: PRSnap) -> CodexResult:
+    """Codex reviewer with the configured auth order: subscription, then API.
+
+    The API attempt runs only when the subscription attempt produced no usable
+    review and was not cancelled by a new commit. The superseded attempt's
+    scratch dir is removed; its jsonl stays for forensics.
+    """
+    plan = codex_auth_plan(REVIEW_ROUTING)
+    result: CodexResult | None = None
+    for i, auth in enumerate(plan):
+        if result is not None:
+            reason = _codex_failure_reason(result)
+            print(f"      codex on {result.provider or plan[i - 1]} gave no review ({reason}); retrying on {auth}", flush=True)
+            _append_jsonl(result.jsonl_path, {"type": "_codex_auth_fallback", "from": plan[i - 1], "to": auth, "reason": reason})
+            shutil.rmtree(result.scratch_dir, ignore_errors=True)
+        try:
+            attempt = run_codex(prompt, pr) if auth == "subscription" else run_codex(prompt, pr, auth=auth)
+        except RuntimeError as e:
+            if result is None:
+                raise
+            print(f"      codex {auth} fallback unavailable: {e}", flush=True)
+            break
+        attempt.provider = "teamorouter-api" if auth == "api" else "chatgpt-subscription"
+        result = attempt
+        if result.cancelled:
+            return result
+        if result.exit_code == 0 and normalize_review_body(result.last_message, pr.head_sha) is not None:
+            return result
+    assert result is not None
+    return result
+
+
+def skipped_codex_result(pr: PRSnap, reason: str) -> CodexResult:
+    """Stand-in CodexResult when routing sends the PR straight to the Claude
+    reviewer: gives the rest of process_pr the jsonl/scratch paths it expects."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    jsonl_path = LOG_DIR / f"{stamp}__{_pr_safe_id(pr.url)}.jsonl"
+    scratch = SCRATCH_BASE / f"{stamp}-{uuid.uuid4().hex[:8]}"
+    scratch.mkdir(parents=True, exist_ok=True)
+    _append_jsonl(jsonl_path, {"type": "_routed_to_claude", "head_sha": pr.head_sha, "reason": reason})
+    return CodexResult(thread_id=None, last_message="", exit_code=-2, jsonl_path=jsonl_path,
+                       scratch_dir=scratch, skipped_reason=reason)
+
+
 def run_opus_fallback_review(pr: PRSnap, *, work_dir: Path) -> FallbackReview:
     """Draft the review with the `/pr` skill's Opus reviewer (Claude subscription).
 
@@ -1991,10 +2311,18 @@ def run_opus_fallback_review(pr: PRSnap, *, work_dir: Path) -> FallbackReview:
         script_text = script.read_text(encoding="utf-8")
     except OSError as e:
         return FallbackReview(reason=f"opus reviewer missing: {script} ({e})")
-    if f'REVIEW_PROVIDER="{OPUS_FALLBACK_REQUIRED_PROVIDER}"' not in script_text:
+    if OPUS_FALLBACK_REQUIRED_PROVIDER not in script_text:
         return FallbackReview(
-            reason=f"opus reviewer {script} does not bill the Claude subscription; refusing to use it",
+            reason=f"claude reviewer {script} does not run on the Claude subscription; refusing to use it",
         )
+    claude_cfg = REVIEW_ROUTING["reviewers"][REVIEWER_CLAUDE]
+    # Older copies of the script take neither flag; they review with their own
+    # built-in model on the subscription only.
+    script_args: list[str] = []
+    if "--model)" in script_text:
+        script_args += ["--model", str(claude_cfg["model"])]
+    if "--auth)" in script_text:
+        script_args += ["--auth", str(claude_cfg.get("auth", "auto"))]
 
     # review_with_opus.sh only needs *a* git work tree to cd into (it reads the
     # PR through `gh pr view/diff <url>`), so a throwaway repo avoids depending
@@ -2014,7 +2342,7 @@ def run_opus_fallback_review(pr: PRSnap, *, work_dir: Path) -> FallbackReview:
     env.setdefault("REVIEW_MAX_ATTEMPTS", OPUS_FALLBACK_MAX_ATTEMPTS)
     try:
         code, stdout, outcome = _run_cancellable(
-            ["bash", str(script), "--pr-url", pr.url, "--output", str(out_file)],
+            ["bash", str(script), "--pr-url", pr.url, "--output", str(out_file), *script_args],
             cwd=repo_dir,
             env=env,
             cancel_marker=_pr_cancel_path(pr.url),
@@ -2035,8 +2363,9 @@ def run_opus_fallback_review(pr: PRSnap, *, work_dir: Path) -> FallbackReview:
             fields[k.strip()] = v.strip()
     if code != 0 or fields.get("REVIEW_GENERATION") != "ok":
         return FallbackReview(reason=f"opus reviewer failed (exit={code}); see {log_path.name}")
-    if fields.get("REVIEW_PROVIDER") != OPUS_FALLBACK_REQUIRED_PROVIDER:
-        return FallbackReview(reason=f"opus reviewer reported provider={fields.get('REVIEW_PROVIDER')!r}; refusing")
+    provider = fields.get("REVIEW_PROVIDER") or ""
+    if provider not in CLAUDE_REVIEW_PROVIDERS:
+        return FallbackReview(reason=f"claude reviewer reported provider={provider!r}; refusing")
     if fields.get("REVIEW_HEAD_SHA") != pr.head_sha:
         return FallbackReview(
             reason=f"opus reviewed sha={fields.get('REVIEW_HEAD_SHA', '')[:8]} but run is for {pr.head_sha[:8]}",
@@ -2048,11 +2377,11 @@ def run_opus_fallback_review(pr: PRSnap, *, work_dir: Path) -> FallbackReview:
     normalized = normalize_review_body(drafted, pr.head_sha)
     if normalized is None:
         return FallbackReview(reason="opus review output is not a canonical review body")
-    model = fields.get("REVIEW_MODEL") or "claude-opus"
+    model = fields.get("REVIEW_MODEL") or str(claude_cfg["model"])
     return FallbackReview(
         body=normalized[0],
         verdict=normalized[1],
-        model_marker=f"{REVIEW_MODEL_METADATA_PREFIX} {model}; provider: {OPUS_FALLBACK_REQUIRED_PROVIDER} -->",
+        model_marker=f"{REVIEW_MODEL_METADATA_PREFIX} {model}; provider: {provider} -->",
     )
 
 
@@ -2223,7 +2552,9 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
     if _retry_pending_calendar_deletes(state, pr.url):
         save_state(state, touched_prs={pr.url})
 
-    print(f"    → codex exec on {pr.url}", flush=True)
+    author_agent = detect_author_agent(pr)
+    primary_reviewer = reviewer_for_author(REVIEW_ROUTING, author_agent)
+    print(f"    → review {pr.url}: author={author_agent} reviewer={primary_reviewer}", flush=True)
     started_at = datetime.now().isoformat(timespec="seconds")
 
     notify_group = f"pr-watcher:{pr.url}"
@@ -2236,7 +2567,10 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
     )
 
     t0 = time.time()
-    result = run_codex(prompt, pr)
+    if primary_reviewer == REVIEWER_CODEX:
+        result = run_codex_review(prompt, pr)
+    else:
+        result = skipped_codex_result(pr, f"author={author_agent} → claude reviewer")
     elapsed = time.time() - t0
     print(f"      exit={result.exit_code} thread_id={result.thread_id} log={result.jsonl_path.name} elapsed={fmt_duration(elapsed)} cancelled={result.cancelled}", flush=True)
 
@@ -2412,21 +2746,36 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
 
     if comment_lookup.status != "found":
         reviewer = "codex"
-        model_marker: str | None = None
+        codex_model = REVIEW_ROUTING["reviewers"][REVIEWER_CODEX]["model"]
+        model_marker: str | None = (
+            f"{REVIEW_MODEL_METADATA_PREFIX} {codex_model}; provider: {result.provider} -->" if result.provider else None
+        )
         drafted = normalize_review_body(result.last_message, pr.head_sha) if result.exit_code == 0 else None
         if drafted is None:
-            codex_reason = _codex_failure_reason(result)
-            print(f"      codex produced no review ({codex_reason}); falling back to Opus", flush=True)
-            _append_jsonl(result.jsonl_path, {
-                "type": "_codex_review_failed",
-                "head_sha": pr.head_sha,
-                "reason": codex_reason,
-            })
+            if result.skipped_reason:
+                codex_reason = result.skipped_reason
+                print(f"      routed to the Claude reviewer ({codex_reason})", flush=True)
+            else:
+                codex_reason = _codex_failure_reason(result)
+                _append_jsonl(result.jsonl_path, {
+                    "type": "_codex_review_failed",
+                    "head_sha": pr.head_sha,
+                    "reason": codex_reason,
+                })
+                if not REVIEW_ROUTING["same_family_fallback"] and author_agent == "claude":
+                    # Cross-review rule: Claude-written code is not reviewed by Claude.
+                    # Release the claim; the next tick / --force retries the Codex reviewer.
+                    return fail_review(f"codex (subscription and API): {codex_reason}; same-family fallback off")
+                print(f"      codex produced no review ({codex_reason}); falling back to the Claude reviewer", flush=True)
             fallback = run_opus_fallback_review(pr, work_dir=result.scratch_dir)
             if fallback.cancelled:
-                return cancelled_before_publish("during opus fallback")
+                return cancelled_before_publish("during claude review")
             if fallback.body is None or fallback.verdict is None:
-                return fail_review(f"codex: {codex_reason}; opus: {fallback.reason}")
+                if result.skipped_reason:
+                    # Codex-written (or unknown) code goes to Claude only; a failure is
+                    # retried on a later tick rather than handed to Codex itself.
+                    return fail_review(f"claude reviewer: {fallback.reason}")
+                return fail_review(f"codex: {codex_reason}; claude: {fallback.reason}")
             drafted = (fallback.body, fallback.verdict)
             model_marker = fallback.model_marker
             reviewer = "opus"
@@ -2458,7 +2807,11 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
                 pass
             return cancelled_before_publish("before publish")
 
-        published, publish_action = publish_review_comment(pr, drafted[0], model_marker=model_marker)
+        # Say who reviewed whose code at the top of the body: the review header
+        # is shared with older comments, so the line rides in the body.
+        note = reviewer_note(model_marker, author_agent)
+        review_body = f"{note}\n\n{drafted[0]}" if note else drafted[0]
+        published, publish_action = publish_review_comment(pr, review_body, model_marker=model_marker)
         if published.status != "found" or not published.comment_url:
             return fail_review(f"{reviewer} review drafted but publishing to GitHub failed")
         comment_lookup = published

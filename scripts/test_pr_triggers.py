@@ -1301,8 +1301,11 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
         otherwise check-config fails outright and the child reports "Not logged in".
         """
         reviewer = (self.SKILL / "scripts" / "review_with_opus.sh").read_text(encoding="utf-8")
-        self.assertIn("settings_base_url", reviewer)
-        self.assertIn("review_auth_token", reviewer)
+        # Every run scrubs the host's ANTHROPIC_*/CLAUDE_CODE_* first; the API
+        # fallback then reads the endpoint and token from the user settings file.
+        self.assertIn("compgen -e | grep -E '^(ANTHROPIC_|CLAUDE_CODE_|CLAUDECODE$)'", reviewer)
+        self.assertIn(".env.ANTHROPIC_BASE_URL // empty", reviewer)
+        self.assertIn('export ANTHROPIC_AUTH_TOKEN="$api_token"', reviewer)
         # The credential is exported for the child, never passed as argv.
         self.assertNotIn('env ANTHROPIC_AUTH_TOKEN=', reviewer)
 
@@ -1377,8 +1380,8 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
     def test_reviewer_model_matches_the_documented_model(self):
         reviewer = (self.SKILL / "scripts" / "review_with_opus.sh").read_text(encoding="utf-8")
         skill = (self.SKILL / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn('readonly REVIEW_MODEL="claude-opus-5-5"', reviewer)
-        self.assertIn("`REVIEW_MODEL=claude-opus-5-5`", skill)
+        self.assertIn('REVIEW_MODEL="${PR_REVIEW_CLAUDE_MODEL:-claude-opus-5-5}"', reviewer)
+        self.assertIn("claude-opus-5-5", skill)
 
     def test_poster_requires_the_reviewer_credential_before_claiming(self):
         """The comment lookup keys on the authenticated author, not on markers.

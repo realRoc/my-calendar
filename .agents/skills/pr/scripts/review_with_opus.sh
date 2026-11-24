@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
-# Generate a deterministic, read-only PR review with Claude Opus 5.5 through Teamorouter.
+# Generate a deterministic, read-only PR review with a Claude model (default Opus 5.5).
+# Auth order: the user's Claude subscription (claude.ai login / setup-token) first;
+# only when that fails, the API configured for Claude Code (Teamorouter in
+# ~/.claude/settings.json). `--auth subscription` or `--auth api` pins one of them.
 
 set -euo pipefail
 export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-readonly REVIEW_MODEL="claude-opus-5-5"
-readonly REVIEW_PROVIDER="teamorouter"
-readonly TEAMOROUTER_BASE_URL="https://api.teamorouter.com"
+# Model id is a parameter: --model, else PR_REVIEW_CLAUDE_MODEL, else this default.
+REVIEW_MODEL="${PR_REVIEW_CLAUDE_MODEL:-claude-opus-5-5}"
+# auto = subscription, then API on failure; subscription / api = only that one.
+REVIEW_AUTH_MODE="${PR_REVIEW_AUTH:-auto}"
+readonly PROVIDER_SUBSCRIPTION="claude-subscription"
+readonly PROVIDER_API="teamorouter-api"
+# The provider that actually produced the review; printed last so callers that
+# parse KEY=VALUE lines (last one wins) see the real one.
+REVIEW_PROVIDER="$PROVIDER_SUBSCRIPTION"
+# Optional long-lived subscription token from `claude setup-token`. Without it the
+# reviewer falls back to the claude.ai login stored by `claude auth login`.
+readonly SUBSCRIPTION_TOKEN_FILE="${PR_REVIEW_OAUTH_TOKEN_FILE:-$HOME/.config/pr-review/claude-oauth-token}"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly RENDERER="$SCRIPT_DIR/render_review.py"
 readonly REVIEW_MAX_ATTEMPTS="${REVIEW_MAX_ATTEMPTS:-3}"
@@ -28,6 +40,10 @@ PR_URL=""
 OUTPUT_FILE=""
 CHECK_CONFIG=0
 VALIDATION_FEEDBACK_FILE=""
+# Globs (fnmatch, matched against the repo-relative path) of generated files to leave
+# out of the review, e.g. bundled single-file builds and lockfiles that would
+# otherwise swamp the diff. Findings on these files are rejected by the renderer.
+EXCLUDE_PATHS=()
 PROMPT_FILE=""
 DIFF_FILE=""
 RAW_OUTPUT_FILE=""
@@ -45,12 +61,22 @@ trap cleanup EXIT
 usage() {
     cat <<'EOF'
 Usage:
-  review_with_opus.sh --check-config
+  review_with_opus.sh --check-config [--model <id>] [--auth auto|subscription|api]
   review_with_opus.sh --pr-url <github-pr-url> --output <review-file> [--validation-feedback-file <file>]
+                     [--exclude-path <glob> ...] [--model <id>] [--auth auto|subscription|api]
 
 Fetch PR metadata and diff with gh, ask Claude Opus 5.5 for JSON-Schema-validated
 findings, then render deterministic publishable Markdown locally. Free-form model
 text is never copied into the review comment.
+
+--exclude-path (repeatable) drops generated files such as bundled builds or
+lockfiles from the diff Opus sees; the prompt lists what was left out.
+
+--model (default $PR_REVIEW_CLAUDE_MODEL or claude-opus-5-5) picks the Claude model.
+--auth (default $PR_REVIEW_AUTH or auto): auto runs on the Claude subscription and,
+only if that fails, on the API configured for Claude Code (Teamorouter:
+ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json, or
+PR_REVIEW_API_BASE_URL / PR_REVIEW_API_TOKEN). REVIEW_PROVIDER reports which one ran.
 EOF
 }
 
@@ -72,6 +98,26 @@ while [[ $# -gt 0 ]]; do
             VALIDATION_FEEDBACK_FILE="${2:-}"
             shift 2
             ;;
+        --exclude-path)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --exclude-path needs a glob" >&2
+                exit 2
+            fi
+            EXCLUDE_PATHS+=("$2")
+            shift 2
+            ;;
+        --model)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --model needs a model id" >&2
+                exit 2
+            fi
+            REVIEW_MODEL="$2"
+            shift 2
+            ;;
+        --auth)
+            REVIEW_AUTH_MODE="${2:-}"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -83,6 +129,15 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+case "$REVIEW_AUTH_MODE" in
+    auto|subscription|api) ;;
+    *)
+        echo "ERROR: --auth must be auto, subscription or api (got: $REVIEW_AUTH_MODE)" >&2
+        exit 2
+        ;;
+esac
+readonly REVIEW_MODEL REVIEW_AUTH_MODE
 
 need_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -139,64 +194,95 @@ run_with_timeout() {
     return "$rc"
 }
 
-claude_config_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-claude_settings="$claude_config_root/settings.json"
-configured_base_url=""
-settings_base_url=""
-settings_auth_token=""
-has_auth=0
+# The reviewer must bill the Claude subscription, never an API key. User
+# settings.json pins ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN to Teamorouter and an
+# enclosing host (Claude Desktop) exports its own ANTHROPIC_*/CLAUDE_CODE_* values,
+# and either one outranks the subscription login. So the child loads no setting
+# sources and runs with every ANTHROPIC_*/CLAUDE_CODE_* variable removed; only a
+# subscription OAuth token, if one is configured, is passed back in.
+review_oauth_token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+if [[ -z "$review_oauth_token" && -s "$SUBSCRIPTION_TOKEN_FILE" ]]; then
+    review_oauth_token="$(tr -d '[:space:]' < "$SUBSCRIPTION_TOKEN_FILE")"
+fi
 
-# Resolve the Teamorouter endpoint and credential from Claude Code user settings
-# first, and only fall back to the ambient environment. An enclosing host may
-# export its own ANTHROPIC_BASE_URL without exporting a token at all (the Claude
-# Desktop host does exactly that: CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 plus a
-# different Teamorouter host). Trusting the environment in that case fails the
-# config check outright and would leave the reviewer child with no credential.
+# Run "$@" with the subscription credential only. A subshell keeps the unsets
+# away from the caller; exporting (rather than an `env VAR=value` prefix) keeps
+# the token out of the child's argv, readable via ps.
+run_on_subscription() {
+    (
+        while IFS= read -r name; do
+            unset "$name"
+        done < <(compgen -e | grep -E '^(ANTHROPIC_|CLAUDE_CODE_|CLAUDECODE$)')
+        if [[ -n "$review_oauth_token" ]]; then
+            export CLAUDE_CODE_OAUTH_TOKEN="$review_oauth_token"
+        fi
+        "$@"
+    )
+}
+
+# API fallback credential: explicit overrides first, then the API that Claude Code
+# itself is configured for (Teamorouter in ~/.claude/settings.json).
+claude_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+api_base_url="${PR_REVIEW_API_BASE_URL:-}"
+api_token="${PR_REVIEW_API_TOKEN:-}"
 if [[ -f "$claude_settings" ]]; then
-    settings_base_url="$(jq -r '.env.ANTHROPIC_BASE_URL // empty' "$claude_settings")"
-    settings_auth_token="$(jq -r '.env.ANTHROPIC_AUTH_TOKEN // empty' "$claude_settings")"
+    [[ -z "$api_base_url" ]] && api_base_url="$(jq -r '.env.ANTHROPIC_BASE_URL // empty' "$claude_settings")"
+    [[ -z "$api_token" ]] && api_token="$(jq -r '.env.ANTHROPIC_AUTH_TOKEN // .env.ANTHROPIC_API_KEY // empty' "$claude_settings")"
+fi
+api_base_url="${api_base_url%/}"
+api_configured=0
+if [[ -n "$api_base_url" && -n "$api_token" ]]; then
+    api_configured=1
 fi
 
-if [[ -n "$settings_base_url" ]]; then
-    configured_base_url="$settings_base_url"
-else
-    configured_base_url="${ANTHROPIC_BASE_URL:-}"
-fi
-configured_base_url="${configured_base_url%/}"
+# Run "$@" against the API fallback only: same scrubbing as the subscription run,
+# then the API endpoint and token are exported back in (never put on argv).
+run_on_api() {
+    (
+        while IFS= read -r name; do
+            unset "$name"
+        done < <(compgen -e | grep -E '^(ANTHROPIC_|CLAUDE_CODE_|CLAUDECODE$)')
+        export ANTHROPIC_BASE_URL="$api_base_url"
+        export ANTHROPIC_AUTH_TOKEN="$api_token"
+        "$@"
+    )
+}
 
-# The reviewer child must receive this credential explicitly: a host-managed
-# session does not pass it down, so an unexported token makes `claude --print`
-# exit with "Not logged in" even though user settings hold a valid one.
-review_auth_token=""
-if [[ -n "$settings_auth_token" ]]; then
-    review_auth_token="$settings_auth_token"
-elif [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
-    review_auth_token="$ANTHROPIC_AUTH_TOKEN"
-fi
+# Providers to try, in order.
+providers=()
+case "$REVIEW_AUTH_MODE" in
+    auto)
+        providers=("$PROVIDER_SUBSCRIPTION")
+        [[ "$api_configured" -eq 1 ]] && providers+=("$PROVIDER_API")
+        ;;
+    subscription) providers=("$PROVIDER_SUBSCRIPTION") ;;
+    api)
+        if [[ "$api_configured" -ne 1 ]]; then
+            echo "ERROR: --auth api but no API endpoint/token is configured (PR_REVIEW_API_* or ~/.claude/settings.json env)" >&2
+            exit 1
+        fi
+        providers=("$PROVIDER_API")
+        ;;
+esac
 
-if [[ -n "$review_auth_token" || -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    has_auth=1
-elif [[ -f "$claude_settings" ]] && jq -e '
-    ((.env.ANTHROPIC_API_KEY // "") | length > 0) or
-    ((.apiKeyHelper // "") | length > 0)
-' "$claude_settings" >/dev/null; then
-    has_auth=1
-fi
-
-if [[ "$configured_base_url" != "$TEAMOROUTER_BASE_URL" ]]; then
-    echo "ERROR: Claude Code is not configured for Teamorouter." >&2
-    echo "       Expected ANTHROPIC_BASE_URL=$TEAMOROUTER_BASE_URL" >&2
-    echo "       Effective ANTHROPIC_BASE_URL=${configured_base_url:-<unset>}" >&2
-    exit 1
-fi
-if [[ "$has_auth" -ne 1 ]]; then
-    echo "ERROR: no Claude Code API credential is configured for Teamorouter." >&2
-    exit 1
-fi
+run_on_provider() {
+    local provider="$1"
+    shift
+    if [[ "$provider" == "$PROVIDER_API" ]]; then
+        run_on_api "$@"
+    else
+        run_on_subscription "$@"
+    fi
+}
 
 echo "REVIEW_MODEL=$REVIEW_MODEL"
-echo "REVIEW_PROVIDER=$REVIEW_PROVIDER"
-echo "REVIEW_BASE_URL=$TEAMOROUTER_BASE_URL"
+echo "REVIEW_AUTH_MODE=$REVIEW_AUTH_MODE"
+echo "REVIEW_PROVIDER_ORDER=${providers[*]}"
+if [[ -n "$review_oauth_token" ]]; then
+    echo "REVIEW_AUTH=oauth-token"
+else
+    echo "REVIEW_AUTH=claude-ai-login"
+fi
 
 if [[ "$CHECK_CONFIG" -eq 1 ]]; then
     if [[ -n "$PR_URL" || -n "$OUTPUT_FILE" || -n "$VALIDATION_FEEDBACK_FILE" ]]; then
@@ -204,6 +290,36 @@ if [[ "$CHECK_CONFIG" -eq 1 ]]; then
         exit 2
     fi
     claude --version
+    # `claude auth status` reads settings.json env, so it reports the Teamorouter
+    # token as a login. Probe with one tiny request under each provider's exact
+    # auth instead; it also proves that provider can use $REVIEW_MODEL. The first
+    # usable one in order is what a review would run on.
+    usable=""
+    for provider in "${providers[@]}"; do
+        probe="$(cd "${TMPDIR:-/tmp}" && run_on_provider "$provider" run_with_timeout \
+            claude --print \
+            --model "$REVIEW_MODEL" \
+            --effort low \
+            --output-format json \
+            --tools "" \
+            --strict-mcp-config \
+            --disable-slash-commands \
+            --no-session-persistence \
+            --setting-sources "" \
+            "Reply with the single word OK." 2>/dev/null || true)"
+        if jq -e '.is_error == false' >/dev/null 2>&1 <<<"$probe"; then
+            usable="$provider"
+            break
+        fi
+        echo "WARN: $provider is not usable for $REVIEW_MODEL: $(jq -r '.result // empty' <<<"$probe" 2>/dev/null)" >&2
+    done
+    if [[ -z "$usable" ]]; then
+        echo "ERROR: no usable Claude credential for $REVIEW_MODEL (tried: ${providers[*]})." >&2
+        echo "       Run \`claude setup-token\` and save the token to $SUBSCRIPTION_TOKEN_FILE (chmod 600)," >&2
+        echo "       or run \`claude auth login --claudeai\`; the API fallback needs ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json." >&2
+        exit 1
+    fi
+    echo "REVIEW_PROVIDER=$usable"
     echo "REVIEW_TRANSPORT=json-schema"
     echo "REVIEW_CONFIG=ok"
     exit 0
@@ -249,10 +365,45 @@ DIFF_FILE="$(mktemp "${TMPDIR:-/tmp}/opus-pr-review-diff.XXXXXX")"
 RAW_OUTPUT_FILE="$(mktemp "${TMPDIR:-/tmp}/opus-pr-review-output.XXXXXX")"
 CHANGED_FILES_FILE="$(mktemp "${TMPDIR:-/tmp}/opus-pr-review-files.XXXXXX")"
 gh pr diff "$PR_URL" > "$DIFF_FILE"
-jq -r '.files[]?.path // empty' <<<"$pr_json" > "$CHANGED_FILES_FILE"
+# Not `.files` from `gh pr view`: GitHub caps that list at 100 files, so on a bigger PR
+# real findings on later files were rejected as "not changed by this PR".
+gh pr diff "$PR_URL" --name-only > "$CHANGED_FILES_FILE"
 if [[ ! -s "$DIFF_FILE" || ! -s "$CHANGED_FILES_FILE" ]]; then
     echo "ERROR: PR diff or changed-file list is empty" >&2
     exit 1
+fi
+EXCLUDED_LIST=""
+if [[ ${#EXCLUDE_PATHS[@]} -gt 0 ]]; then
+    # Drop whole per-file sections of the unified diff whose path (old or new side)
+    # matches a glob, and drop those paths from the changed-file list too.
+    EXCLUDED_LIST="$(python3 - "$DIFF_FILE" "$CHANGED_FILES_FILE" "${EXCLUDE_PATHS[@]}" <<'PY'
+import fnmatch, re, sys
+diff_path, files_path, globs = sys.argv[1], sys.argv[2], sys.argv[3:]
+hit = lambda p: any(fnmatch.fnmatchcase(p, g) for g in globs)
+out, skipped, keep = [], [], True
+with open(diff_path, encoding="utf-8", errors="surrogateescape") as f:
+    for line in f:
+        m = re.match(r"^diff --git a/(.*) b/(.*)$", line.rstrip("\n"))
+        if m:
+            keep = not (hit(m.group(1)) or hit(m.group(2)))
+            if not keep:
+                skipped.append(m.group(2))
+        if keep:
+            out.append(line)
+with open(diff_path, "w", encoding="utf-8", errors="surrogateescape") as f:
+    f.writelines(out)
+with open(files_path, encoding="utf-8") as f:
+    files = [p for p in f.read().splitlines() if p and not hit(p)]
+with open(files_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(files) + ("\n" if files else ""))
+print("\n".join(skipped))
+PY
+)"
+    if [[ ! -s "$DIFF_FILE" || ! -s "$CHANGED_FILES_FILE" ]]; then
+        echo "ERROR: every changed file matched --exclude-path; nothing left to review" >&2
+        exit 1
+    fi
+    printf 'REVIEW_EXCLUDED_FILES=%s\n' "$(grep -c . <<<"$EXCLUDED_LIST" || true)"
 fi
 
 {
@@ -267,6 +418,11 @@ fi
     printf '%s\n' '<untrusted_pr_diff>'
     command cat "$DIFF_FILE"
     printf '%s\n' '</untrusted_pr_diff>'
+    if [[ -n "$EXCLUDED_LIST" ]]; then
+        printf '%s\n' ''
+        printf '%s\n' 'These changed files are generated artifacts and were left out of the diff on purpose; do not report findings on them:'
+        printf '%s\n' "$EXCLUDED_LIST"
+    fi
     if [[ -n "$VALIDATION_FEEDBACK_FILE" ]]; then
         printf '%s\n' ''
         printf '%s\n' '<review_validation_feedback>'
@@ -284,17 +440,12 @@ fi
 review_system_prompt='You are a dedicated code-review agent. Return only structured output conforming to the supplied JSON schema; never return Markdown or free-form prose. Review only the supplied PR metadata and unified diff. Do not narrate your process, expose chain-of-thought, repeat instructions, or include analysis drafts. Report only concrete P0 and P1 findings. P0 means a reachable defect with severe production impact: exploitable security or permission failure, material data loss or corruption, widespread outage, or critically wrong financial/business results. P1 means a real low-impact bug that is safe to merge and can be fixed later. Ignore style nits, defensive hardening, speculative or rare edge cases, and missing tests unless they directly demonstrate a concrete P0. Each finding must cite a changed file and positive changed-line number, use a concise single-line title, and give a concise single-paragraph reachable failure scenario. Trace helper implementations visible in the diff before making claims. If review_validation_feedback is present, independently verify it and return a complete replacement findings array. Return an empty findings array when no P0/P1 issue exists.'
 
 run_reviewer() {
-    # Export rather than pass as command arguments: an `env VAR=value` prefix
-    # would expose the credential in the child's argv, readable via ps.
-    export ANTHROPIC_BASE_URL="$TEAMOROUTER_BASE_URL"
-    if [[ -n "$review_auth_token" ]]; then
-        export ANTHROPIC_AUTH_TOKEN="$review_auth_token"
-    fi
+    local provider="$1"
     # Bound each attempt. Without a wall-clock limit a stalled CLI (provider
     # hang, wedged child) blocks forever: the retry loop never advances, the
     # claim is never released, and the run leaves no artifact. A timeout is
     # reported like any other failed attempt so the loop can retry.
-    run_with_timeout \
+    run_on_provider "$provider" run_with_timeout \
         claude --print \
         --model "$REVIEW_MODEL" \
         --effort "$REVIEW_EFFORT" \
@@ -305,29 +456,34 @@ run_reviewer() {
         --strict-mcp-config \
         --disable-slash-commands \
         --no-session-persistence \
-        --setting-sources user \
+        --setting-sources "" \
         --system-prompt "$review_system_prompt" \
         < "$PROMPT_FILE" > "$RAW_OUTPUT_FILE"
 }
 
 review_generated=0
-attempt=1
-while [[ "$attempt" -le "$REVIEW_MAX_ATTEMPTS" ]]; do
-    : > "$RAW_OUTPUT_FILE"
-    if run_reviewer && python3 "$RENDERER" \
-        --input "$RAW_OUTPUT_FILE" \
-        --changed-files "$CHANGED_FILES_FILE" \
-        --output "$OUTPUT_FILE"; then
-        review_generated=1
-        echo "REVIEW_ATTEMPT=$attempt"
-        break
-    fi
-    echo "REVIEW_ATTEMPT_${attempt}=retry" >&2
-    attempt=$((attempt + 1))
+for provider in "${providers[@]}"; do
+    attempt=1
+    while [[ "$attempt" -le "$REVIEW_MAX_ATTEMPTS" ]]; do
+        : > "$RAW_OUTPUT_FILE"
+        if run_reviewer "$provider" && python3 "$RENDERER" \
+            --input "$RAW_OUTPUT_FILE" \
+            --changed-files "$CHANGED_FILES_FILE" \
+            --output "$OUTPUT_FILE"; then
+            review_generated=1
+            REVIEW_PROVIDER="$provider"
+            echo "REVIEW_ATTEMPT=$attempt"
+            break
+        fi
+        echo "REVIEW_ATTEMPT_${attempt}=retry provider=$provider" >&2
+        attempt=$((attempt + 1))
+    done
+    [[ "$review_generated" -eq 1 ]] && break
+    echo "WARN: $provider gave no valid review after $REVIEW_MAX_ATTEMPTS attempts" >&2
 done
 
 if [[ "$review_generated" -ne 1 ]]; then
-    echo "ERROR: Claude Opus did not return a valid structured review after $REVIEW_MAX_ATTEMPTS attempts" >&2
+    echo "ERROR: $REVIEW_MODEL did not return a valid structured review (tried: ${providers[*]})" >&2
     exit 1
 fi
 
@@ -338,6 +494,8 @@ if [[ "$conclusion_count" != "1" ]] || [[ ! "$last_nonempty" =~ ^结论：(✅\ 
     exit 1
 fi
 
+echo "REVIEW_MODEL=$REVIEW_MODEL"
+echo "REVIEW_PROVIDER=$REVIEW_PROVIDER"
 echo "REVIEW_HEAD_SHA=$head_sha"
 echo "REVIEW_OUTPUT=$OUTPUT_FILE"
 echo "REVIEW_TRANSPORT=json-schema"
