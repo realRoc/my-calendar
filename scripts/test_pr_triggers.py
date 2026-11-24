@@ -1526,5 +1526,93 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
         self.assertIn('verdict="$published_last"', poster)
 
 
+class WaitForReviewResultTests(unittest.TestCase):
+    """wait_for_review.sh turns the watcher's 结论 line into REVIEW_RESULT,
+    which drives the author session's fix loop in the /pr skill."""
+
+    SCRIPT = ROOT / ".agents" / "skills" / "pr" / "scripts" / "wait_for_review.sh"
+    HEAD = "abc1234def5678"
+
+    def _run(self, conclusion: str, *, flaky: bool = False, reviews=None, heads=None) -> subprocess.CompletedProcess:
+        """reviews: [(sha, conclusion)] on the PR; heads: successive `gh pr view` heads (last one sticks)."""
+        reviews = reviews or [(self.HEAD, conclusion)]
+        heads = heads or [self.HEAD]
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            comments = tmp / "comments.json"
+            comments.write_text(json.dumps([
+                {"user": {"login": "me"}, "html_url": f"https://github.com/o/r/pull/1#issuecomment-{i}",
+                 "body": f"<!-- pr-watcher-head-sha: {sha} -->\n**评审模型** x\n\n{c}\n"}
+                for i, (sha, c) in enumerate(reviews, start=9)
+            ]), encoding="utf-8")
+            (tmp / "heads").write_text("\n".join(heads) + "\n", encoding="utf-8")
+            fake = tmp / "bin"
+            fake.mkdir()
+            gh = fake / "gh"
+            gh.write_text(textwrap.dedent(f"""\
+                #!/bin/bash
+                flag={tmp}/failed-once-$(printf '%s' "$1-$2" | tr '/' '_')
+                if [[ "{'1' if flaky else ''}" == 1 && ! -e "$flag" ]]; then
+                    touch "$flag"; echo 'Post "https://api.github.com/graphql": net/http: TLS handshake timeout' >&2; exit 1
+                fi
+                if [[ "$1 $2" == "api user" ]]; then echo me; exit 0; fi
+                if [[ "$1 $2" == "pr view" ]]; then
+                    h=$(head -1 {tmp}/heads)
+                    if [[ $(wc -l < {tmp}/heads) -gt 1 ]]; then tail -n +2 {tmp}/heads > {tmp}/heads.n; mv {tmp}/heads.n {tmp}/heads; fi
+                    echo '{{"state":"OPEN","headRefOid":"'"$h"'"}}'; exit 0
+                fi
+                if [[ "$1" == "api" ]]; then
+                    while [[ $# -gt 0 && "$1" != "--jq" ]]; do shift; done
+                    jq -c "$2" {comments}
+                    exit 0
+                fi
+                exit 1
+                """), encoding="utf-8")
+            gh.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{fake}:{env['PATH']}"
+            env["PR_REVIEW_WAIT_INTERVAL_SEC"] = "0"
+            return subprocess.run(
+                ["bash", str(self.SCRIPT), "--pr-url", "https://github.com/o/r/pull/1", "--timeout", "5"],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+
+    def test_result_maps_verdict_to_pass_fix_or_unknown(self):
+        cases = {
+            "结论：✅ 可以合并": "pass",
+            "结论：❌ 暂不可合并": "fix",
+            "结论：⚠️ 修完再合": "fix",
+            "没有结论行": "unknown",
+            # Last round's ✅ quoted at column 0, this round's verdict indented last.
+            "结论：✅ 可以合并\n\n上轮的结论见上；本轮：\n\n  结论：❌ 暂不可合并  ": "fix",
+            # A 结论 line that is not the last non-empty line does not count.
+            "结论：✅ 可以合并\n\n补充说明": "unknown",
+        }
+        for conclusion, expected in cases.items():
+            with self.subTest(conclusion=conclusion):
+                result = self._run(conclusion)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"REVIEW_HEAD_SHA={self.HEAD}", result.stdout)
+                self.assertIn("REVIEW_COMMENT_URL=https://github.com/o/r/pull/1#issuecomment-9", result.stdout)
+                self.assertIn(f"REVIEW_RESULT={expected}", result.stdout)
+
+    def test_review_for_a_head_that_moved_during_the_lookup_is_not_reported(self):
+        # Head is A when the poll starts, B by the time the comments are read.
+        # A's ✅ must not be reported; the wait follows B and returns B's result.
+        a, b = "aaaa1111", "bbbb2222"
+        result = self._run("", reviews=[(a, "结论：✅ 可以合并"), (b, "结论：❌ 暂不可合并")], heads=[a, b])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"REVIEW_HEAD_SHA={b}", result.stdout)
+        self.assertIn("REVIEW_RESULT=fix", result.stdout)
+        self.assertNotIn(f"REVIEW_HEAD_SHA={a}", result.stdout)
+
+    def test_transient_github_errors_are_retried_not_fatal(self):
+        # Every gh call (user, pr view, comments) fails once with a TLS timeout.
+        result = self._run("结论：✅ 可以合并", flaky=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REVIEW_RESULT=pass", result.stdout)
+        self.assertEqual(result.stderr.count("WARN:"), 3, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

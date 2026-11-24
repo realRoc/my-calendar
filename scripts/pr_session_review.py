@@ -264,11 +264,6 @@ def record_review(
                 fresh_entry["origin_cwd"] = resolved_origin
             pr_watcher._clear_pending_review(fresh_entry)
             pr_watcher._clear_review_failures(fresh_entry)
-            # Same per-PR round budget as the watcher path: a `/pr` review
-            # counts toward the "N rounds without a pass → human" limit.
-            pr_watcher.record_review_round(
-                fresh_entry, pr.head_sha, pr_watcher.parse_verdict(comment_body),
-            )
             pr_watcher.save_state(fresh_state, touched_prs={pr.url})
         finally:
             pr_watcher.release_lock_fd(persist_fd)

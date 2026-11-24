@@ -214,7 +214,6 @@ def _read_codex_exec_config(config_path: Path = USER_CONFIG_PATH) -> list[str]:
 
 
 DEFAULT_OPUS_REVIEW_SCRIPT = Path.home() / ".claude" / "skills" / "pr" / "scripts" / "review_with_opus.sh"
-DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS = 5
 
 
 def _read_review_fallback_config(config_path: Path = USER_CONFIG_PATH) -> dict:
@@ -244,38 +243,6 @@ def _read_review_fallback_config(config_path: Path = USER_CONFIG_PATH) -> dict:
             out["opus_script"] = Path(script.strip()).expanduser()
         else:
             print(f"[pr-watcher] warn: review_fallback.opus_script={script!r} is not a non-empty string; ignoring", file=sys.stderr)
-    return out
-
-
-def _read_auto_fix_config(config_path: Path = USER_CONFIG_PATH) -> dict:
-    """Load the auto-fix loop settings.
-
-    A ❌/⚠️ review launches MyCalFix (launch_fix.sh, yolo mode) on the PR
-    branch; the fix push triggers the next review. After
-    `max_review_rounds` reviews on one PR that still do not pass, the loop
-    stops and asks a human. `auto_fix: {"enabled": false}` disables it.
-    """
-    out = {"enabled": True, "max_review_rounds": DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS}
-    raw = _read_user_config(config_path).get("auto_fix")
-    if raw is None:
-        return out
-    if not isinstance(raw, dict):
-        print(f"[pr-watcher] warn: auto_fix={raw!r} in {config_path} is not an object; using defaults", file=sys.stderr)
-        return out
-    enabled = raw.get("enabled", True)
-    if isinstance(enabled, bool):
-        out["enabled"] = enabled
-    else:
-        print(f"[pr-watcher] warn: auto_fix.enabled={enabled!r} is not a boolean; using true", file=sys.stderr)
-    rounds = raw.get("max_review_rounds", DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS)
-    if type(rounds) is int and rounds >= 1:
-        out["max_review_rounds"] = rounds
-    else:
-        print(
-            f"[pr-watcher] warn: auto_fix.max_review_rounds={rounds!r} is not a positive JSON integer; "
-            f"using {DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS}",
-            file=sys.stderr,
-        )
     return out
 
 
@@ -527,7 +494,6 @@ CODEX_CONCURRENCY_CAP = _read_codex_cap()    # max codex executions in flight ac
 CODEX_EXEC_CONFIG_ARGS = _read_codex_exec_config()
 REVIEW_FALLBACK_CONFIG = _read_review_fallback_config()
 REVIEW_ROUTING = _read_review_routing_config()
-AUTO_FIX_CONFIG = _read_auto_fix_config()
 
 # terminal-notifier: absolute paths so this works under launchd's stripped PATH.
 NOTIFIER_CANDIDATES = ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
@@ -1339,7 +1305,6 @@ def _complete_recovered_pending(
     })
     _clear_pending_review(entry)
     _clear_review_failures(entry)
-    record_review_round(entry, pr.head_sha, parse_verdict(comment_body))
     cache_comment_body(comment_url, comment_body)
 
 
@@ -2461,118 +2426,6 @@ def _record_review_failure(state: dict, pr: PRSnap, *, reason: str, now: datetim
     return attempts
 
 
-# ─── auto-fix loop (review ❌/⚠️ → MyCalFix fix → push → next review) ──────────
-
-
-def record_review_round(entry: dict, head_sha: str, verdict: str) -> None:
-    """Count a recorded review toward the per-PR auto-fix round budget.
-
-    Shared by both review entrypoints (watcher and `/pr` record) so the
-    5-round limit counts every review of the PR, whoever produced it. One SHA
-    counts once. A pass resets the budget.
-    """
-    if verdict not in ("✅", "⚠️", "❌"):
-        return
-    if entry.get("review_round_sha") == head_sha:
-        return
-    entry["review_round_sha"] = head_sha
-    if verdict == "✅":
-        entry["review_rounds_without_pass"] = 0
-        for key in ("needs_human_sha", "needs_human_at", "needs_human_reason"):
-            entry.pop(key, None)
-    else:
-        entry["review_rounds_without_pass"] = int(entry.get("review_rounds_without_pass") or 0) + 1
-
-
-def _launch_auto_fix(fix_url: str) -> None:
-    """Start MyCalFix in yolo mode without blocking the watcher.
-
-    Same launcher as the calendar link (worktree + fix_prompt.md + push to
-    the PR branch); MYCALFIX_MODE=yolo skips the per-click dialog because
-    nobody is clicking. Its push re-enters the review via the pre-push hook.
-    """
-    env = os.environ.copy()
-    env["MYCALFIX_MODE"] = "yolo"
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
-    subprocess.Popen(
-        ["bash", str(HERE / "launch_fix.sh"), fix_url],
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-
-def maybe_start_auto_fix(
-    state: dict,
-    pr: PRSnap,
-    *,
-    verdict: str,
-    comment_url: str | None,
-    origin_cwd: str | None,
-    now: datetime,
-) -> str:
-    """After a recorded review: launch the next fix round or hand off to a human."""
-    entry = state.setdefault("prs", {}).setdefault(pr.url, {})
-    cfg = AUTO_FIX_CONFIG
-    if verdict not in ("⚠️", "❌"):
-        return "auto-fix: not needed"
-    if not cfg.get("enabled", True):
-        return "auto-fix: disabled"
-    max_rounds = int(cfg.get("max_review_rounds") or DEFAULT_AUTO_FIX_MAX_REVIEW_ROUNDS)
-    rounds = int(entry.get("review_rounds_without_pass") or 0)
-    group = f"pr-watcher:{pr.url}"
-    if rounds >= max_rounds:
-        if entry.get("needs_human_sha") != pr.head_sha:
-            entry.update({
-                "needs_human_sha": pr.head_sha,
-                "needs_human_at": now.isoformat(timespec="seconds"),
-                "needs_human_reason": f"{rounds} 轮评审仍未通过",
-            })
-            notify(
-                title="🙋 PR 需要人工介入",
-                subtitle=pr.repo,
-                message=f"#{pr.number} 已 {rounds} 轮评审仍未通过，自动修复已停止",
-                open_url=comment_url or pr.url,
-                group=group,
-            )
-        return f"auto-fix: stopped after {rounds} rounds, needs human"
-    if entry.get("auto_fix_launched_sha") == pr.head_sha:
-        return "auto-fix: already launched for this sha"
-    if _is_fork_pr(pr):
-        return "auto-fix: skipped (fork PR)"
-    if not origin_cwd:
-        notify(
-            title="⚠️ PR 无法自动修复",
-            subtitle=pr.repo,
-            message=f"#{pr.number} 不知道本地仓库路径；本地 push 一次或用日历里的 MyCalFix 链接",
-            open_url=comment_url or pr.url,
-            group=group,
-        )
-        return "auto-fix: skipped (origin_cwd unknown)"
-    fix_url = _build_fix_url(pr=pr, comment_url=comment_url, origin_cwd=origin_cwd)
-    if not fix_url:
-        return "auto-fix: skipped (no fix url)"
-    try:
-        _launch_auto_fix(fix_url)
-    except OSError as e:
-        print(f"      warn: auto-fix launch failed: {e}", flush=True)
-        return f"auto-fix: launch failed ({e})"
-    entry.update({
-        "auto_fix_launched_sha": pr.head_sha,
-        "auto_fix_launched_at": now.isoformat(timespec="seconds"),
-    })
-    notify(
-        title="🛠 PR 自动修复已启动",
-        subtitle=pr.repo,
-        message=f"#{pr.number} 第 {rounds}/{max_rounds} 轮评审未通过，正在自动修复",
-        open_url=comment_url or pr.url,
-        group=group,
-    )
-    return f"auto-fix: launched (round {rounds}/{max_rounds})"
-
-
 # ─── main flow ─────────────────────────────────────────────────────────────────
 
 
@@ -3014,7 +2867,6 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
                         entry["last_seen_sha"] = pr.head_sha
                         _clear_pending_review(entry)
                         _clear_review_failures(entry)
-                        record_review_round(entry, pr.head_sha, parse_verdict(comment_body))
 
                         try:
                             final_pr = _gh_view_force_pr(pr.url)
@@ -3113,19 +2965,7 @@ def process_pr(pr: PRSnap, state: dict, dry_run: bool, *, restart_depth: int = 0
     except Exception:
         pass
 
-    # Next round of the fix loop: ❌/⚠️ → launch MyCalFix on the PR branch
-    # (its push triggers the next review), or hand off after the round budget.
-    auto_fix_action = maybe_start_auto_fix(
-        state,
-        pr,
-        verdict=parse_verdict(comment_body),
-        comment_url=comment_url,
-        origin_cwd=origin_cwd,
-        now=datetime.now(),
-    )
-    print(f"      {auto_fix_action}", flush=True)
-
-    return f"codex ran, calendar={cal_action}, {auto_fix_action}"
+    return f"codex ran, calendar={cal_action}"
 
 
 def _gh_view_force_pr(pr_url: str) -> PRSnap:
@@ -3308,23 +3148,6 @@ def _run_force(args, now: datetime) -> int:
     return 0
 
 
-def _reset_auto_fix(pr_url: str) -> int:
-    state = load_state()
-    entry = state.get("prs", {}).get(pr_url)
-    if entry is None:
-        print(f"[pr-watcher] {pr_url} is not in pr_state.json; nothing to reset")
-        return 1
-    for key in (
-        "review_rounds_without_pass", "review_round_sha", "auto_fix_launched_sha",
-        "auto_fix_launched_at", "needs_human_sha", "needs_human_at", "needs_human_reason",
-    ):
-        entry.pop(key, None)
-    _clear_review_failures(entry)
-    save_state(state, touched_prs={pr_url})
-    print(f"[pr-watcher] reset auto-fix rounds for {pr_url}")
-    return 0
-
-
 def main() -> int:
     redirect_stdio_to_log()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3338,14 +3161,7 @@ def main() -> int:
              " Typically passed by the pre-push hook; ignored on the launchd tick path.",
     )
     parser.add_argument("--ignore-throttle", action="store_true", help="ignore nighttime throttle (useful for manual runs)")
-    parser.add_argument(
-        "--reset-auto-fix", type=str, default=None, metavar="PR_URL",
-        help="clear a PR's auto-fix round budget and needs-human mark (after a human took over)",
-    )
     args = parser.parse_args()
-
-    if args.reset_auto_fix:
-        return _reset_auto_fix(args.reset_auto_fix)
 
     if args.origin_cwd and not args.force:
         # Easy mistake when debugging manually: passing --origin-cwd to a tick run

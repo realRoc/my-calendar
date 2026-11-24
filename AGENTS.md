@@ -402,16 +402,14 @@ my-calendar = 多个互相独立的模块（节日 / PR 监控 / health / 未来
    - **同轮兜底**：codex 没给出可用草稿（非 0 退出、`turn.failed` 如 "Selected model is at capacity"、超时、正文缺结论行）→ 同一次运行里改用 `/pr` 的 Opus 评审 `~/.claude/skills/pr/scripts/review_with_opus.sh`（在 scratch 里 `git init` 的临时仓库跑，不依赖 origin_cwd；脚本必须声明 `REVIEW_PROVIDER="claude-subscription"` 且输出同值，否则拒用——**只走 Claude 订阅，不用 Teamorouter key**）。兜底期间新 commit 的 cancel marker 同样会杀掉它；兜底结束后再复验 head。评论带 `<!-- pr-review-model: claude-opus-5-5; provider: claude-subscription -->`。
    - **失败立即释放**：codex 和 Opus 都没出评审（或发布 / dedup 查询失败）→ 立刻清掉本次 `pending_review_sha`、记 `review_failed_*`、发"⚠️ PR review 失败，稍后自动重试"通知；下一轮 tick / `/pr` 可以马上接手。
 8. EventKit 写到独立日历 **"PR 监控"**，UID = `my-calendar:pr-comment:<pr_url>:<sha>`
-9. **自动修复循环**（见下节）：结论 ❌ / ⚠️ → 启动下一轮修复；✅ → 计数清零
+9. watcher 只评审、不修复：结论 ❌ / ⚠️ 由写这个 PR 的原会话自己修（见下节）
 
-### 自动修复循环（默认开启）
+### 评审不过谁来修：原会话（2026-11-24 起）
 
-- 每次评审落盘（watcher 路径与 `/pr` record 路径共用 `record_review_round`）都计一轮：同一 SHA 只计一次，❌/⚠️ 让 `review_rounds_without_pass` +1，✅ 清零
-- watcher 路径落盘 ❌/⚠️ 后 `maybe_start_auto_fix`：复用 MyCalFix —— 用 `MYCALFIX_MODE=yolo bash scripts/launch_fix.sh '<mycalfix://...>'` 起修复（建临时 worktree → `fix_prompt.md` → `git push origin HEAD:<branch>`），push 经 pre-push hook 触发新 SHA 的评审，循环直到 ✅
-- **同一 PR 第 5 轮评审仍未通过**（`auto_fix.max_review_rounds`，默认 5）→ 发"🙋 PR 需要人工介入"通知、记 `needs_human_*`、不再自动修；人工接手后 `pr_watcher.py --reset-auto-fix <pr-url>` 清零
-- 同一 SHA 只起一次修复（`auto_fix_launched_sha`）；fork PR、`origin_cwd` 未知（launchd 首评、没本地 push 过）不自动修，后者发通知提示
-- `/pr` 路径只计轮数、不自动起修复：当前会话本身就在负责修
-- **风险**：yolo 模式下 claude 无审批执行，review 正文和 PR 内容里的注入指令会被直接执行（见 MyCalFix 设计取舍）。范围只有 `author:@me` 的 PR；不想要就在 config 里 `"auto_fix": {"enabled": false}`
+- 修复在写这个 PR 的会话里做：`/pr` 第 4 步 `wait_for_review.sh` 等到评论，按 `REVIEW_RESULT` 走——`pass` 停；`fix` 先核对远端头部和本地 `HEAD` 都是被评审的 SHA（远端已变就回去等；本地落后就快进；超前或分叉就停），再在原会话里修 Blocker / P0、跑自检、普通 `git push`，pre-push hook 触发下一轮评审，再等；连续 5 轮不过、推送被别人抢先且 `--ff-only` 合不上、要做设计决定、或连续两次等超时，就停下交给人。
+- watcher **不再**自己起修复会话。原先的自动修复循环（`maybe_start_auto_fix` → `MYCALFIX_MODE=yolo launch_fix.sh`）已删：它在 Terminal 新开一个 claude 会话，从当时的远端头部建临时 worktree，和还在等评审的原会话同时修同一组 blocker。原会话先推，临时会话就基于旧提交、推送被拒，停在没人看的窗口里问人（11-24 晚 teamo-tag#772、teamo-router#1425、askmanyai#652 各开了 1–3 个，一个都没进 PR）。
+- 没人在等的 PR（原会话已关、launchd 首评）：照旧只写日历事件 + 通知，事件描述里的 MyCalFix 链接由人点了再修。
+- 配置里的 `auto_fix` 和 `--reset-auto-fix` 一并删除；旧 config 里残留的 `auto_fix` 键会被忽略。
 
 ### 进行中收到新 commit：cancel + restart（issue #26）
 
@@ -480,9 +478,6 @@ bash scripts/install_launchd.sh          # 节日 daily + PR 兜底 launchd
 
 # 忽略夜间节流，立即执行
 .venv/bin/python scripts/pr_watcher.py --ignore-throttle
-
-# 人工接手修完后，清掉某 PR 的自动修复轮数 / 需人工标记
-.venv/bin/python scripts/pr_watcher.py --reset-auto-fix https://github.com/<owner>/<repo>/pull/<n>
 ```
 
 ### per-repo opt-out
@@ -503,7 +498,6 @@ git -C <repo-path> config core.hooksPath .git/hooks
 |---|---|---|
 | `codex_concurrency_cap` | `10` | 全机器同时跑 codex 的最大数量。pr_watcher 用 `locks/codex-slot-{1..N}.lock` 实现 N 个 slot 的信号量；想给小机器/紧预算降并发就把这个数调小（如 `4`）。**调大也不会被拦**，但 codex 同时执行数、CPU/网络和 LLM 调用成本会随之线性上升——自行评估机器和预算能承受。**严格 JSON integer** 校验：`2.5` / `"4"` / `true` / 负数 / 0 都会落回默认 10 + 一行 stderr 警告，不会崩 |
 | `review_fallback` | `{"enabled": true, "opus_script": "~/.claude/skills/pr/scripts/review_with_opus.sh"}` | codex 没出评审时同轮改用 Opus（Claude 订阅）。脚本不是订阅版（没有 `REVIEW_PROVIDER="claude-subscription"`）会被拒用并记失败 |
-| `auto_fix` | `{"enabled": true, "max_review_rounds": 5}` | ❌/⚠️ 后自动起 MyCalFix yolo 修复；同一 PR 第 `max_review_rounds` 轮仍未通过就停下叫人。`max_review_rounds` 严格正整数 |
 | `codex_exec` | `"inherit"` | PR 自动 review 调 `codex exec` 时默认不传 `-m` / `-c` 模型参数，直接继承 Codex CLI 的 `$CODEX_HOME/config.toml`（也就是手动 `codex exec` 的默认模型/推理/速度配置）。如果 Codex Desktop 当前选择尚未同步到 CLI config，可在这里显式镜像：`{"model":"gpt-5.6-sol","model_reasoning_effort":"medium","service_tier":"priority"}`。除 `model` 会转成 `-m` 外，其他 scalar key 会按 `-c key=value` 透传给 Codex CLI；复杂对象会被忽略并 warning |
 
 > ⚠️ 已移除：`mycalfix_interactive_claude`。MyCalFix 现在用 osascript 对话框 per-click 选 mode，不再读 config 文件。写在 config.json 里也会被忽略。想跳过对话框（脚本化用途 / sticky preference）请 `export MYCALFIX_MODE=yolo|interactive|cancel` 给 launcher 进程。
@@ -713,7 +707,7 @@ launchd 兜底路径触发的评论（比如安装后新 PR 的首次漏网 revi
    - **E：预取 codex review comment body 到本地缓存**。pr_watcher 在写完日历事件之前调 `cache_comment_body()`，把 codex 的整段 review body 写到 `~/.cache/my-calendar/fix-comments/<comment_id>.md`。launch_fix.sh 把这个路径作为 `{comment_body_path}` 渲染进 fix_prompt.md，claude 用 Read 工具读它而不是 `gh api` 跑网络拉一遍。两个效果：(a) Interactive 模式的 Approve 对话框会显示具体被读的文件名，用户能看出 claude 想读什么，而不是看到一条 prompt 注入可以重定向的 `gh api ...` shell 命令；(b) comment 内容在 review 完成时被冻结到磁盘——上面的 GitHub 评论后来被人编辑加了 prompt-injection payload 也污染不到这次会话。缓存缺失时（老日历事件 / 缓存被清）fix_prompt.md 有 `gh api` 兜底，老 URL 仍能用。
    - **剩余的风险，必须承认**：Yolo 按钮还在，被点了就还是无审批执行。`git worktree` 只隔离 git checkout 不限制 Claude Code 读 `~/.ssh` / `~/.config` 或改写 worktree 外文件，`fix_prompt.md` 的约束不是安全边界。option C 的设计选择：让 yolo 是**显式 per-session 决定**而不是默认值，把"你是否真的想给这次会话无审批"这个问题摆到每次点击的 critical path 上。
    - **辅助工程边界（任何模式都成立）**：(a) worktree 一次性隔离在 `~/.cache/my-calendar/worktrees/`，改坏一删就回去；(b) `.command` 在 fetch/worktree-add 之前已经校验 `git remote get-url origin` 与 URL 的 repo 一致，push 推不到错的 remote；(c) `fix_prompt.md` 硬约束 diff >1000 行 abort、只改 review 点名处、不 --force push。
-- **自动修复循环默认开启（2026-11 起，用户明确要求"默认持续自动修复直到通过"）**：watcher 在 ❌/⚠️ 后以 `MYCALFIX_MODE=yolo` 调同一个 `launch_fix.sh`，修复会话在新 Terminal 窗口里跑、可随时看 / 停；同一 PR 第 5 轮评审仍未通过就停下叫人（见"PR 监控 → 自动修复循环"）。日历里的 MyCalFix 链接仍是人工入口，点击时照旧弹 Yolo / Interactive / Cancel
+- **持续修复直到通过（用户要求）由原会话来做（2026-11-24 起）**：11-13 起曾由 watcher 在 ❌/⚠️ 后以 `MYCALFIX_MODE=yolo` 调 `launch_fix.sh` 在新 Terminal 里修，结果和原会话重复修、基于旧提交推不上去，已删（见"评审不过谁来修"）。现在 `/pr` 让原会话等评审 → 修 → 推 → 再等，5 轮封顶。日历里的 MyCalFix 链接仍是人工入口，点击时照旧弹 Yolo / Interactive / Cancel
 - **默认 Terminal 不侦测 iTerm2**：减少配置面；用户用 iTerm2 想接管，改 launch_fix.sh 末尾的 `open -a Terminal` 为 `open -a iTerm` 即可（记得改完重装 .app）
 - **用 `.command` 文件 + `open -a Terminal`，不用 `osascript do script Terminal`**：osascript do script 走 AppleEvents (Automation TCC)，未签名 osacompile 应用经常被静默拒绝 -1743 errAEEventNotPermitted，连授权对话框都不弹。`.command` 是 LaunchServices 文档打开，没有 TCC 门槛，第一次点链接就能用。.command 文件首行 `rm -f $0` 自删避免堆积
 - **`launch_fix.sh` 不做 `git rev-parse` 校验 origin_cwd**：launcher 跑在 .app 的 TCC 沙箱里，`git -C ~/Desktop/<repo>` 会 EPERM（即使 Info.plist 声明了 `NSDesktopFolderUsageDescription`，一旦 TCC 库记下 deny 就不再弹框，重装 .app 也不清）。校验会把每次点击都打去 picker，违背"URL 里给的路径应该被用上"的语义。URL 来源是本地 pre-push hook，攻击面≈0，直接信任。路径错了在 Terminal 里 `git -C <wrong> fetch` 失败，用户能看到
