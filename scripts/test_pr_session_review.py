@@ -215,7 +215,6 @@ class CurrentSessionReviewTests(unittest.TestCase):
                             "pending_review_source": "current-session",
                             "review_failed_sha": pr.head_sha,
                             "review_failed_attempts": 1,
-                            "review_rounds_without_pass": 3,
                         }
                     },
                 }), encoding="utf-8")
@@ -241,8 +240,6 @@ class CurrentSessionReviewTests(unittest.TestCase):
             self.assertTrue(Path(result["meta_path"]).exists())
             # Shared per-PR bookkeeping with the watcher path.
             self.assertNotIn("review_failed_sha", entry)
-            self.assertEqual(entry["review_rounds_without_pass"], 0, "a ✅ resets the round budget")
-            self.assertEqual(entry["review_round_sha"], pr.head_sha)
 
     def test_record_review_rejects_missing_current_head_marker(self):
         pr = self._pr()

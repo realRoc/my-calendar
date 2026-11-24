@@ -31,23 +31,16 @@ import calendar_sync  # noqa: E402
 
 
 _MODULE_PATCHES: list = []
-_REAL_LAUNCH_AUTO_FIX = pr_watcher._launch_auto_fix
 
 
 def setUpModule():
-    """Keep the auto-fix loop and the Opus fallback inert unless a test opts in.
+    """Keep the Opus fallback inert unless a test opts in.
 
-    A ❌ verdict on the success path would otherwise spawn launch_fix.sh (a
-    real Terminal + yolo claude session), and a failed Codex draft would run
-    the real review_with_opus.sh against GitHub.
+    A failed Codex draft would otherwise run the real review_with_opus.sh
+    against GitHub.
     """
     _MODULE_PATCHES[:] = [
-        mock.patch.object(pr_watcher, "AUTO_FIX_CONFIG", {"enabled": False, "max_review_rounds": 5}),
         mock.patch.object(pr_watcher, "REVIEW_FALLBACK_CONFIG", {"enabled": False, "opus_script": Path("/nonexistent")}),
-        mock.patch.object(
-            pr_watcher, "_launch_auto_fix",
-            lambda url: (_ for _ in ()).throw(AssertionError(f"test tried to launch a real fix: {url}")),
-        ),
     ]
     for p in _MODULE_PATCHES:
         p.start()
@@ -5100,7 +5093,7 @@ class _ProcessPrHarness:
         self.upserts: list = []
         self.fallback_calls = 0
         self.notifications: list[str] = []
-        self.launched: list[str] = []
+        self.spawned: list = []
         # GitHub comments for this PR: list of (head_sha, url, body)
         self.github_comments: list[tuple[str, str, str]] = []
 
@@ -5130,7 +5123,7 @@ class _ProcessPrHarness:
         self.github_comments.append((pr.head_sha, url, rendered))
         return pr_watcher.AICommentLookup("found", comment_url=url, comment_body=rendered), "posted"
 
-    def run(self, state: dict, result: pr_watcher.CodexResult, *, fallback=None, auto_fix=None):
+    def run(self, state: dict, result: pr_watcher.CodexResult, *, fallback=None):
         def fake_fallback(pr, *, work_dir):
             self.fallback_calls += 1
             if fallback is None:
@@ -5157,10 +5150,9 @@ class _ProcessPrHarness:
             mock.patch.object(pr_watcher, "save_state", lambda s, *, touched_prs=None: None),
             mock.patch.object(pr_watcher, "upsert_events", fake_upsert),
             mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None),
-            mock.patch.object(pr_watcher, "_launch_auto_fix", lambda url: self.launched.append(url)),
+            mock.patch.object(pr_watcher.subprocess, "Popen",
+                              lambda cmd, **kw: self.spawned.append(cmd)),
         ]
-        if auto_fix is not None:
-            patches.append(mock.patch.object(pr_watcher, "AUTO_FIX_CONFIG", auto_fix))
         for p in patches:
             p.start()
         try:
@@ -5434,99 +5426,29 @@ class TickFailedReviewRetryTests(unittest.TestCase):
             self.assertEqual(self._tick(state, pr), [pr.head_sha])
 
 
-class AutoFixLoopTests(unittest.TestCase):
-    CFG = {"enabled": True, "max_review_rounds": 5}
+class NoWatcherFixSessionTests(unittest.TestCase):
+    """A failing review is fixed by the session that wrote the PR (the `/pr`
+    skill's wait → fix → push loop), never by a session the watcher spawns."""
 
-    def _start(self, entry: dict, pr=None, *, verdict="❌", origin_cwd="/tmp/askmanyai", cfg=None):
-        pr = pr or _snap613()
-        state = {"prs": {pr.url: entry}}
-        launched: list[str] = []
-        notes: list[str] = []
-        with mock.patch.object(pr_watcher, "AUTO_FIX_CONFIG", cfg or self.CFG), \
-                mock.patch.object(pr_watcher, "_launch_auto_fix", lambda url: launched.append(url)), \
-                mock.patch.object(pr_watcher, "notify", lambda *, title="", **kw: notes.append(title)):
-            action = pr_watcher.maybe_start_auto_fix(
-                state, pr, verdict=verdict,
-                comment_url=f"{pr.url}#issuecomment-1", origin_cwd=origin_cwd, now=datetime_now(),
-            )
-        return action, launched, notes, state["prs"][pr.url]
-
-    def test_round_counter_counts_each_sha_once_and_resets_on_pass(self):
-        entry: dict = {}
-        pr_watcher.record_review_round(entry, "s1", "❌")
-        pr_watcher.record_review_round(entry, "s1", "❌")
-        pr_watcher.record_review_round(entry, "s2", "⚠️")
-        self.assertEqual(entry["review_rounds_without_pass"], 2)
-        entry["needs_human_sha"] = "s2"
-        pr_watcher.record_review_round(entry, "s3", "✅")
-        self.assertEqual(entry["review_rounds_without_pass"], 0)
-        self.assertNotIn("needs_human_sha", entry)
-
-    def test_failing_review_launches_mycalfix_once_per_sha(self):
-        action, launched, notes, entry = self._start({"review_rounds_without_pass": 1})
-        self.assertIn("launched", action)
-        self.assertEqual(len(launched), 1)
-        self.assertTrue(launched[0].startswith("mycalfix://fix?"))
-        self.assertIn("origin_cwd=%2Ftmp%2Faskmanyai", launched[0])
-        self.assertIn("🛠 PR 自动修复已启动", notes)
-        again, launched2, _, _ = self._start(entry)
-        self.assertIn("already launched", again)
-        self.assertEqual(launched2, [])
-
-    def test_fifth_failing_round_hands_off_to_a_human_and_stops(self):
-        action, launched, notes, entry = self._start({"review_rounds_without_pass": 5})
-        self.assertIn("needs human", action)
-        self.assertEqual(launched, [])
-        self.assertIn("🙋 PR 需要人工介入", notes)
-        self.assertEqual(entry["needs_human_sha"], _snap613().head_sha)
-        # Notified once per SHA, not on every recovery/tick.
-        _, _, notes2, _ = self._start(entry)
-        self.assertEqual(notes2, [])
-
-    def test_four_failing_rounds_still_fix(self):
-        _action, launched, _notes, _entry = self._start({"review_rounds_without_pass": 4})
-        self.assertEqual(len(launched), 1)
-
-    def test_no_fix_for_pass_disabled_fork_or_unknown_checkout(self):
-        cases = [
-            dict(verdict="✅"),
-            dict(cfg={"enabled": False, "max_review_rounds": 5}),
-            dict(pr=_snap613(head_repo="someone/fork")),
-            dict(origin_cwd=None),
-        ]
-        for kw in cases:
-            with self.subTest(**{k: str(v) for k, v in kw.items()}):
-                _action, launched, _notes, _entry = self._start({"review_rounds_without_pass": 1}, **kw)
-                self.assertEqual(launched, [])
-
-    def test_launch_uses_mycalfix_launcher_in_yolo_mode_without_blocking(self):
-        seen = {}
-
-        class FakePopen:
-            def __init__(self, cmd, **kw):
-                seen["cmd"] = cmd
-                seen["kw"] = kw
-
-        # The module-level guard replaced _launch_auto_fix; exercise the real
-        # helper with Popen faked so nothing is actually spawned.
-        with mock.patch.object(pr_watcher.subprocess, "Popen", FakePopen):
-            _REAL_LAUNCH_AUTO_FIX("mycalfix://fix?x=1")
-        self.assertEqual(seen["cmd"][1], str(pr_watcher.HERE / "launch_fix.sh"))
-        self.assertEqual(seen["cmd"][2], "mycalfix://fix?x=1")
-        self.assertEqual(seen["kw"]["env"]["MYCALFIX_MODE"], "yolo")
-        self.assertTrue(seen["kw"]["start_new_session"])
-
-    def test_process_pr_failing_verdict_starts_the_next_fix_round(self):
+    def test_failing_verdict_spawns_nothing_and_only_records_the_review(self):
         pr = _snap613()
         with tempfile.TemporaryDirectory() as td:
             h = _ProcessPrHarness(self, Path(td), pr)
-            state = _pending_state(pr, origin_cwd="/tmp/askmanyai", review_rounds_without_pass=0)
-            ret = h.run(state, h.codex(last_message=CODEX_DRAFT_BLOCKER), auto_fix=self.CFG)
+            state = _pending_state(pr, origin_cwd="/tmp/askmanyai")
+            ret = h.run(state, h.codex(last_message=CODEX_DRAFT_BLOCKER))
             entry = state["prs"][pr.url]
-            self.assertEqual(entry["review_rounds_without_pass"], 1)
-            self.assertEqual(len(h.launched), 1)
-            self.assertEqual(entry["auto_fix_launched_sha"], pr.head_sha)
-            self.assertIn("auto-fix: launched (round 1/5)", ret)
+            self.assertEqual(h.spawned, [])
+            self.assertEqual(len(h.posted), 1)
+            self.assertEqual(entry["last_commented_sha"], pr.head_sha)
+            self.assertTrue(ret.startswith("codex ran, calendar="), ret)
+            self.assertNotIn("auto-fix", ret)
+            for key in ("auto_fix_launched_sha", "review_rounds_without_pass", "needs_human_sha"):
+                self.assertNotIn(key, entry)
+
+    def test_watcher_has_no_fix_launcher_or_round_budget(self):
+        for name in ("maybe_start_auto_fix", "_launch_auto_fix", "record_review_round",
+                     "AUTO_FIX_CONFIG", "_reset_auto_fix"):
+            self.assertFalse(hasattr(pr_watcher, name), name)
 
 
 class OpusFallbackRunnerTests(unittest.TestCase):

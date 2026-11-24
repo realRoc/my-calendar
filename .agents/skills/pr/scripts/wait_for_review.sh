@@ -20,7 +20,8 @@ Usage:
 
 Polls the PR until a watcher review comment for the current head SHA exists
 (default timeout 3600s, poll every 30s). Prints:
-  REVIEW_HEAD_SHA, REVIEW_COMMENT_URL, REVIEW_REVIEWER (评审模型 line), REVIEW_VERDICT
+  REVIEW_HEAD_SHA, REVIEW_COMMENT_URL, REVIEW_REVIEWER (评审模型 line), REVIEW_VERDICT,
+  REVIEW_RESULT = pass (✅) | fix (❌/⚠️) | unknown (no recognizable 结论 line)
 Exit 0 when found, 3 on timeout, 4 when the PR is no longer open.
 A new commit during the wait restarts the wait for the new head.
 EOF
@@ -69,7 +70,14 @@ while :; do
         echo "REVIEW_HEAD_SHA=$head"
         echo "REVIEW_COMMENT_URL=$(jq -r '.url' <<<"$found")"
         echo "REVIEW_REVIEWER=$(grep -m1 '^\*\*评审模型\*\*' <<<"$body" || echo 'unknown (comment predates cross-model routing)')"
-        echo "REVIEW_VERDICT=$(grep -E '^结论[：:]' <<<"$body" | tail -1)"
+        verdict="$(grep -E '^结论[：:]' <<<"$body" | tail -1 || true)"
+        case "$verdict" in
+            *❌*|*⚠*) result=fix ;;
+            *✅*) result=pass ;;
+            *) result=unknown ;;
+        esac
+        echo "REVIEW_VERDICT=$verdict"
+        echo "REVIEW_RESULT=$result"
         exit 0
     fi
     if [[ "$(date +%s)" -ge "$deadline" ]]; then

@@ -1526,5 +1526,58 @@ class PrSkillReviewerConsolidationTests(unittest.TestCase):
         self.assertIn('verdict="$published_last"', poster)
 
 
+class WaitForReviewResultTests(unittest.TestCase):
+    """wait_for_review.sh turns the watcher's 结论 line into REVIEW_RESULT,
+    which drives the author session's fix loop in the /pr skill."""
+
+    SCRIPT = ROOT / ".agents" / "skills" / "pr" / "scripts" / "wait_for_review.sh"
+    HEAD = "abc1234def5678"
+
+    def _run(self, conclusion: str) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            body = f"<!-- pr-watcher-head-sha: {self.HEAD} -->\n**评审模型** x\n\n{conclusion}\n"
+            comments = tmp / "comments.json"
+            comments.write_text(json.dumps([
+                {"user": {"login": "me"}, "html_url": "https://github.com/o/r/pull/1#issuecomment-9", "body": body},
+            ]), encoding="utf-8")
+            fake = tmp / "bin"
+            fake.mkdir()
+            gh = fake / "gh"
+            gh.write_text(textwrap.dedent(f"""\
+                #!/bin/bash
+                if [[ "$1 $2" == "api user" ]]; then echo me; exit 0; fi
+                if [[ "$1 $2" == "pr view" ]]; then echo '{{"state":"OPEN","headRefOid":"{self.HEAD}"}}'; exit 0; fi
+                if [[ "$1" == "api" ]]; then
+                    while [[ $# -gt 0 && "$1" != "--jq" ]]; do shift; done
+                    jq -c "$2" {comments}
+                    exit 0
+                fi
+                exit 1
+                """), encoding="utf-8")
+            gh.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{fake}:{env['PATH']}"
+            return subprocess.run(
+                ["bash", str(self.SCRIPT), "--pr-url", "https://github.com/o/r/pull/1", "--timeout", "5"],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+
+    def test_result_maps_verdict_to_pass_fix_or_unknown(self):
+        cases = {
+            "结论：✅ 可以合并": "pass",
+            "结论：❌ 暂不可合并": "fix",
+            "结论：⚠️ 修完再合": "fix",
+            "没有结论行": "unknown",
+        }
+        for conclusion, expected in cases.items():
+            with self.subTest(conclusion=conclusion):
+                result = self._run(conclusion)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"REVIEW_HEAD_SHA={self.HEAD}", result.stdout)
+                self.assertIn("REVIEW_COMMENT_URL=https://github.com/o/r/pull/1#issuecomment-9", result.stdout)
+                self.assertIn(f"REVIEW_RESULT={expected}", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
