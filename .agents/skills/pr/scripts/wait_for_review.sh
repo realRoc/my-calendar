@@ -107,12 +107,19 @@ while :; do
         echo "REVIEW_HEAD_SHA=$head"
         echo "REVIEW_COMMENT_URL=$(jq -r '.url' <<<"$found")"
         echo "REVIEW_REVIEWER=$(grep -m1 '^\*\*评审模型\*\*' <<<"$body" || echo 'unknown (comment predates cross-model routing)')"
-        verdict="$(grep -E '^结论[：:]' <<<"$body" | tail -1 || true)"
-        case "$verdict" in
-            *❌*|*⚠*) result=fix ;;
-            *✅*) result=pass ;;
-            *) result=unknown ;;
-        esac
+        # Same rule as the watcher's normalize_review_body: the verdict is the
+        # last non-empty line, trimmed, and must be a 结论 line. A quoted 结论
+        # earlier in the body (e.g. last round's ✅) never counts.
+        last_line="$(grep -v '^[[:space:]]*$' <<<"$body" | tail -1 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' || true)"
+        verdict=""
+        result=unknown
+        if [[ "$last_line" =~ ^结论[：:] ]]; then
+            verdict="$last_line"
+            case "$verdict" in
+                *❌*|*⚠*) result=fix ;;
+                *✅*) result=pass ;;
+            esac
+        fi
         echo "REVIEW_VERDICT=$verdict"
         echo "REVIEW_RESULT=$result"
         exit 0

@@ -1583,6 +1583,10 @@ class WaitForReviewResultTests(unittest.TestCase):
             "结论：❌ 暂不可合并": "fix",
             "结论：⚠️ 修完再合": "fix",
             "没有结论行": "unknown",
+            # Last round's ✅ quoted at column 0, this round's verdict indented last.
+            "结论：✅ 可以合并\n\n上轮的结论见上；本轮：\n\n  结论：❌ 暂不可合并  ": "fix",
+            # A 结论 line that is not the last non-empty line does not count.
+            "结论：✅ 可以合并\n\n补充说明": "unknown",
         }
         for conclusion, expected in cases.items():
             with self.subTest(conclusion=conclusion):
