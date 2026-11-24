@@ -284,9 +284,10 @@ def _read_auto_fix_config(config_path: Path = USER_CONFIG_PATH) -> dict:
 # Code written by one agent is reviewed by the other family: a PR Claude Code wrote
 # gets the Codex CLI reviewer, a PR Codex wrote gets the Claude Code (Opus)
 # reviewer. Model ids are parameters so a model upgrade is a config edit, not a
-# code change. Each reviewer runs on its subscription first (ChatGPT login for
-# Codex, claude.ai login for Claude Code) and only on failure on the API
-# (Teamorouter by default).
+# code change. The Codex reviewer runs on the API (Teamorouter by default):
+# the ChatGPT subscription backend stalls ~5 minutes per hang and "auto" only
+# falls back after 5 such reconnects. The Claude reviewer runs on its
+# claude.ai subscription first and only on failure on the API.
 #
 # ~/.config/my-calendar/config.json:
 #   "review_routing": {
@@ -294,7 +295,7 @@ def _read_auto_fix_config(config_path: Path = USER_CONFIG_PATH) -> dict:
 #     "same_family_fallback": false,
 #     "reviewers": {
 #       "codex":  {"model": "gpt-6.2-astra", "model_reasoning_effort": "medium",
-#                  "auth": "auto", "api_base_url": "https://api.teamorouter.com/v1",
+#                  "auth": "api", "api_base_url": "https://api.teamorouter.com/v1",
 #                  "api_key_env": "", "api_key_file": ""},
 #       "claude": {"model": "claude-opus-5-5", "auth": "auto"}
 #     }
@@ -311,7 +312,7 @@ DEFAULT_REVIEW_ROUTING: dict = {
     "reviewers": {
         REVIEWER_CODEX: {
             "model": "gpt-6.2-astra",
-            "auth": "auto",
+            "auth": "api",
             "api_base_url": "https://api.teamorouter.com/v1",
             "api_key_env": "",
             "api_key_file": "",
@@ -436,7 +437,7 @@ def _resolve_codex_api_key(rcfg: dict) -> tuple[str | None, str]:
 
 def codex_auth_plan(routing: dict) -> list[str]:
     """Auth modes the Codex reviewer tries, in order."""
-    mode = routing["reviewers"][REVIEWER_CODEX].get("auth", "auto")
+    mode = routing["reviewers"][REVIEWER_CODEX].get("auth", "api")
     if mode == "subscription":
         return ["subscription"]
     if mode == "api":
@@ -2287,10 +2288,13 @@ def _run_cancellable(
 
 
 def run_codex_review(prompt: str, pr: PRSnap) -> CodexResult:
-    """Codex reviewer with the configured auth order: subscription, then API.
+    """Codex reviewer with the configured auth order (codex_auth_plan).
 
-    The API attempt runs only when the subscription attempt produced no usable
-    review and was not cancelled by a new commit. The superseded attempt's
+    Default "api" runs only on the API and never tries the subscription; a
+    missing API key fails the run instead of falling back. Only "auto" tries
+    the subscription first, and then the API attempt runs only when the
+    subscription attempt produced no usable review and was not cancelled by a
+    new commit. The superseded attempt's
     scratch dir is removed; its jsonl stays for forensics.
     """
     plan = codex_auth_plan(REVIEW_ROUTING)

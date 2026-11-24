@@ -1,4 +1,4 @@
 interface:
   display_name: "PR"
   short_description: "Create/update a PR and get one cross-model review from the my-calendar watcher."
-  default_prompt: "Create a lightweight PR, trigger the my-calendar watcher (Codex gpt-6.2-astra reviews Claude-written PRs, Claude Opus 5.5 reviews Codex-written PRs; subscription first, Teamorouter API fallback), wait for its comment, and report the verdict."
+  default_prompt: "Create a lightweight PR, trigger the my-calendar watcher (Codex gpt-6.2-astra reviews Claude-written PRs, Claude Opus 5.5 reviews Codex-written PRs; Codex on the Teamorouter API, Claude subscription-first), wait for its comment, and report the verdict."
