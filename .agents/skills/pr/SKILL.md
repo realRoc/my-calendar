@@ -1,26 +1,32 @@
 ---
 name: pr
-description: Create or update a lightweight GitHub PR, review an open PR with Claude Opus 5.5 through Teamorouter, post a deterministic code-review comment, and record it in my-calendar. Use for /pr, create/open/update PR, quick PR handoff, rerun code review, or my-calendar review requests.
+description: Create or update a lightweight GitHub PR and get exactly one cross-model code review from the my-calendar watcher — Claude-written PRs are reviewed by Codex CLI (gpt-6.2-astra), Codex-written PRs by Claude Code (claude-opus-5-5), each on its subscription first and the Teamorouter API only as fallback. Use for /pr, create/open/update PR, quick PR handoff, rerun code review, or my-calendar review requests.
 ---
 
 # PR
 
-Create or update a GitHub PR, delegate review to `claude-opus-5-5` through Teamorouter, post the validated result, and record the comment in my-calendar. Never merge the PR.
+Create or update a GitHub PR, hand the review to the my-calendar PR watcher, wait for its one comment on the current head SHA, and report it. Never merge the PR.
 
 Do not run `/ship`: no version bump, changelog, release promotion, or review army.
 
-## Reliability contract
+## Who reviews (cross-model)
 
-- Use `scripts/review_with_opus.sh`; never ask the current model to replace Opus.
-- Opus returns JSON-Schema-validated findings only. `scripts/render_review.py` renders the publishable Markdown and derives the conclusion locally.
-- Ignore Claude's free-form `result`; only `structured_output` may reach the renderer. This prevents analysis drafts and format instructions from leaking into GitHub.
-- Retry invalid/API responses up to three fresh, non-persistent Opus calls.
-- Use `scripts/review_and_post.sh` for posting. Do not construct or submit the GitHub comment manually.
-- The posting helper rechecks the PR SHA, uses canonical markers, reuses an existing same-SHA comment, verifies the posted body, and records it in my-calendar.
-- In review-only mode, claim my-calendar only after a valid review exists. A pre-comment failure releases the current-session claim automatically.
-- Never delete or rewrite an existing review comment.
+The watcher is the **only** publisher. It decides who wrote the PR and sends it to the other family:
 
-## Severity policy
+| PR written by | How it is detected | Reviewer |
+| --- | --- | --- |
+| Claude Code | branch `claude/…`, or `Co-Authored-By: Claude` / `Generated with [Claude Code]` | Codex CLI, model `review_routing.reviewers.codex.model` (default `gpt-6.2-astra`) |
+| Codex | branch `codex/…`, or `Co-authored-by: Codex` | Claude Code, model `review_routing.reviewers.claude.model` (default `claude-opus-5-5`) |
+| unknown | neither | `review_routing.reviewer_for_author.unknown` (default Claude) |
+
+- Each reviewer runs on its subscription first (ChatGPT login for Codex, claude.ai login for Claude Code). Only if that run fails does it retry on the API (Teamorouter: the token in `~/.claude/settings.json`, or `api_key_env` / `api_key_file`).
+- Model ids and auth order live in `~/.config/my-calendar/config.json` under `review_routing`; a model upgrade is a config edit.
+- If the cross-family reviewer fails on both subscription and API, the SHA is retried later; it is not handed to the family that wrote it (`same_family_fallback: false`).
+- The comment starts with a `**评审模型**` line naming the model, the account it ran on, and the code author.
+
+Do **not** run `review_with_opus.sh` + `review_and_post.sh` yourself for a PR the watcher handles: that is a second reviewer racing the watcher for the same SHA, and one of them is refused.
+
+## Severity policy (Claude reviewer)
 
 - `P0`: concrete reachable defect with severe production impact: exploitable security/permission failure, material data loss/corruption, widespread outage, or critically wrong financial/business results. Any P0 blocks merge.
 - `P1`: real low-impact bug that is safe to merge and may be fixed later. P1 never blocks merge.
@@ -38,11 +44,7 @@ or, only when a P0 exists:
 结论：❌ 暂不可合并
 ```
 
-## 1. Select mode and preflight
-
-Use handoff mode when creating/updating a PR from the current branch. Use review-only mode when reviewing an existing PR URL without changing its branch or metadata.
-
-Run:
+## 1. Preflight
 
 ```bash
 git rev-parse --show-toplevel
@@ -50,10 +52,9 @@ git branch --show-current
 git remote get-url origin
 git status --short
 gh auth status
-bash "$SKILL_DIR/scripts/review_with_opus.sh" --check-config
 ```
 
-Confirm the PR is `OPEN`. In handoff mode, abort on the default/base branch, a non-GitHub origin, failed tests, or uncommitted changes that are not explicitly allowed. In review-only mode, do not switch/push/edit the user's branch or PR metadata.
+Confirm the PR is `OPEN` (review-only mode). In handoff mode, abort on the default/base branch, a non-GitHub origin, failed tests, or uncommitted changes that are not explicitly allowed. In review-only mode, do not switch/push/edit the user's branch or PR metadata.
 
 ## 2. Understand and verify
 
@@ -65,87 +66,38 @@ In handoff mode, commit only intended files and prepare an intentional title and
 - `实现方式`
 - `验证`
 
-## 3. Create or reserve the PR
+Claude Code sessions keep the `claude/` branch prefix and the `Co-Authored-By: Claude …` trailer; Codex sessions keep `codex/`. That is how the watcher picks the reviewer.
+
+## 3. Create the PR and trigger the watcher
 
 Handoff mode:
 
 ```bash
 bash "$SKILL_DIR/scripts/light_pr.sh" \
   --title "fix(scope): clear outcome" \
-  --body-file /path/to/pr-body.md
+  --body-file /path/to/pr-body.md \
+  --trigger-async-review
 ```
 
-The helper pushes without force, creates or updates only an `OPEN` PR to the default branch, and reserves its current SHA in my-calendar. Never reuse a merged/closed PR.
+The helper pushes without force (the my-calendar pre-push hook starts the watcher), creates or updates only an `OPEN` PR to the default branch, and fires the pr-created trigger. Never reuse a merged/closed PR. Later commits: a plain `git push` re-triggers the review for the new head.
 
-Review-only mode: do not claim yet. Review first so a malformed/provider failure cannot leave a stale pending marker.
-
-## 4. Generate and inspect the review
+Review-only mode (existing PR):
 
 ```bash
-REVIEW_FILE="$(mktemp "${TMPDIR:-/tmp}/pr-review.XXXXXX")"
-REVIEW_STATUS="$(bash "$SKILL_DIR/scripts/review_with_opus.sh" \
-  --pr-url <pr-url> \
-  --output "$REVIEW_FILE")"
-printf '%s\n' "$REVIEW_STATUS"
-REVIEW_HEAD_SHA="$(awk -F= '$1 == "REVIEW_HEAD_SHA" { print $2 }' <<<"$REVIEW_STATUS" | tail -1)"
+bash "$SKILL_DIR/scripts/light_pr.sh" --trigger-only <pr-url>
 ```
 
-Require all of:
-
-- `REVIEW_MODEL=claude-opus-5-5`
-- `REVIEW_PROVIDER=teamorouter`
-- `REVIEW_TRANSPORT=json-schema`
-- `REVIEW_GENERATION=ok`
-- one final canonical conclusion line
-
-Inspect each finding against the visible diff. If a finding is materially unsupported, write factual feedback and run exactly one replacement review:
+## 4. Wait for the review
 
 ```bash
-FEEDBACK_FILE="$(mktemp "${TMPDIR:-/tmp}/pr-review-feedback.XXXXXX")"
-CORRECTED_FILE="$(mktemp "${TMPDIR:-/tmp}/pr-review-corrected.XXXXXX")"
-bash "$SKILL_DIR/scripts/review_with_opus.sh" \
-  --pr-url <pr-url> \
-  --output "$CORRECTED_FILE" \
-  --validation-feedback-file "$FEEDBACK_FILE"
+bash "$SKILL_DIR/scripts/wait_for_review.sh" --pr-url <pr-url>
 ```
 
-Use the corrected file unchanged when it validates. Never manually edit, delete, reorder, or change Opus findings or verdicts.
+Run it in the background; a review takes roughly 5–30 minutes. It prints `REVIEW_HEAD_SHA`, `REVIEW_COMMENT_URL`, `REVIEW_REVIEWER` and `REVIEW_VERDICT` once the watcher's comment for the current head exists, and follows a new head if one is pushed meanwhile. Exit 3 = timeout: read `~/Desktop/my-calendar/logs/pr-watcher.log`, then retrigger with `--trigger-only`.
 
-## 5. Post, verify, and record
+## 5. Report
 
-Review-only mode:
-
-```bash
-bash "$SKILL_DIR/scripts/review_and_post.sh" \
-  --pr-url <pr-url> \
-  --repo-root <repo-root> \
-  --review-file "$REVIEW_FILE" \
-  --review-head-sha "$REVIEW_HEAD_SHA"
-```
-
-Handoff mode passes the claim created by `light_pr.sh`:
-
-```bash
-bash "$SKILL_DIR/scripts/review_and_post.sh" \
-  --pr-url <pr-url> \
-  --repo-root <repo-root> \
-  --review-file "$REVIEW_FILE" \
-  --review-head-sha "$REVIEW_HEAD_SHA" \
-  --already-claimed
-```
-
-Require:
-
-- `GITHUB_COMMENT=posted` or `GITHUB_COMMENT=reused`
-- a canonical `REVIEW_COMMENT_URL`
-- `MY_CALENDAR_RECORD=...success`
-- `REVIEW_AND_POST=ok`
-
-If GitHub returns an ambiguous failure, the helper queries the canonical SHA marker before retrying, preventing duplicate comments. If posting fails before a comment exists, it safely releases only the matching `current-session` claim.
-
-## 6. Report
-
-Return only the PR URL, review verdict, comment URL, my-calendar result, and focused verification. Do not merge.
+Return only the PR URL, the reviewer line, the verdict, the comment URL, and the focused verification you ran. Do not merge.
 
 ## Safety
 
@@ -154,4 +106,5 @@ Return only the PR URL, review verdict, comment URL, my-calendar result, and foc
 - Never target a non-default base unless explicitly requested.
 - Never reuse merged/closed PRs.
 - Preserve unrelated local changes.
-- If my-calendar is unavailable, keep the verified GitHub comment and report the recording failure; do not post a duplicate.
+- Never post a review comment yourself; the watcher publishes exactly one per head SHA.
+- If the watcher is not installed or the review keeps failing, report that to the user instead of reviewing with the same model family that wrote the code.

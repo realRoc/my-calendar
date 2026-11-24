@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import uuid
 import shlex
 import shutil
 import subprocess
@@ -56,6 +57,37 @@ def tearDownModule():
     for p in reversed(_MODULE_PATCHES):
         p.stop()
 
+
+
+# Cross-model routing asks GitHub who wrote a PR whose branch name does not
+# say. The legacy process_pr tests predate that and model a Claude-written PR
+# reviewed by Codex, so pin the author for them; routing has its own tests.
+_author_patcher = None
+
+
+_routing_patcher = None
+
+
+def _legacy_routing() -> dict:
+    """Default routing, but the Codex reviewer on its subscription only: these
+    tests mock a single Codex run, and the API retry has its own tests."""
+    routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+    routing["reviewers"][pr_watcher.REVIEWER_CODEX]["auth"] = "subscription"
+    return routing
+
+
+def setUpModule():
+    global _author_patcher, _routing_patcher
+    _author_patcher = mock.patch.object(pr_watcher, "detect_author_agent", return_value="claude")
+    _author_patcher.start()
+    _routing_patcher = mock.patch.object(pr_watcher, "REVIEW_ROUTING", _legacy_routing())
+    _routing_patcher.start()
+
+
+def tearDownModule():
+    for patcher in (_author_patcher, _routing_patcher):
+        if patcher is not None:
+            patcher.stop()
 
 class CalendarRemoveEventTests(unittest.TestCase):
     def test_remove_event_keeps_state_when_eventkit_delete_fails(self):
@@ -5143,12 +5175,20 @@ def _pending_state(pr: pr_watcher.PRSnap, **extra) -> dict:
     return {"_meta": {"installed_at": "2026-05-22T00:00:00+00:00"}, "prs": {pr.url: entry}}
 
 
+def _same_family_fallback_on():
+    routing = _legacy_routing()
+    routing["same_family_fallback"] = True
+    return mock.patch.object(pr_watcher, "REVIEW_ROUTING", routing)
+
+
 class ReviewFallbackAndReleaseTests(unittest.TestCase):
     """Codex at capacity must not leave a head SHA without a review."""
 
     def test_capacity_failure_falls_back_to_opus_and_publishes_exactly_once(self):
+        # Same-family fallback is opt-in since cross-model routing; these cover
+        # the fallback mechanics with it switched on.
         pr = _snap613()
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, _same_family_fallback_on():
             h = _ProcessPrHarness(self, Path(td), pr)
             state = _pending_state(pr)
             result = h.codex(exit_code=1, failed_with="Selected model is at capacity. Please try a different model.")
@@ -5169,8 +5209,10 @@ class ReviewFallbackAndReleaseTests(unittest.TestCase):
             self.assertIn("capacity", h.jsonl.read_text(encoding="utf-8"))
 
     def test_capacity_and_fallback_failure_releases_pending_immediately(self):
+        # Same-family fallback is opt-in since cross-model routing; these cover
+        # the fallback mechanics with it switched on.
         pr = _snap613()
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, _same_family_fallback_on():
             h = _ProcessPrHarness(self, Path(td), pr)
             state = _pending_state(pr)
             result = h.codex(exit_code=1, failed_with="Selected model is at capacity. Please try a different model.")
@@ -5200,7 +5242,11 @@ class ReviewFallbackAndReleaseTests(unittest.TestCase):
 
             self.assertEqual(h.fallback_calls, 0)
             self.assertEqual(len(h.posted), 1)
-            self.assertIsNone(h.posted[0]["model_marker"])
+            # The Codex reviewer now names its model and auth in the comment too.
+            self.assertEqual(
+                h.posted[0]["model_marker"],
+                "<!-- pr-review-model: gpt-6.2-astra; provider: chatgpt-subscription -->",
+            )
             self.assertTrue(h.posted[0]["body"].startswith(pr_watcher.AI_COAUTHOR_BLOCKQUOTE_MARKER))
             self.assertEqual(state["prs"][pr.url]["last_commented_sha"], pr.head_sha)
             self.assertIn("codex ran", ret)
@@ -5549,3 +5595,153 @@ class OpusFallbackRunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrossModelRoutingTests(unittest.TestCase):
+    """Claude-written code is reviewed by Codex, Codex-written code by Claude."""
+
+    def test_branch_prefix_decides_the_author(self):
+        c = pr_watcher.classify_author_agent
+        self.assertEqual(c("claude/overview", []), "claude")
+        self.assertEqual(c("codex/fix-login", []), "codex")
+        self.assertEqual(c("Codex/Upper", []), "codex")
+
+    def test_text_markers_decide_when_the_branch_does_not(self):
+        c = pr_watcher.classify_author_agent
+        self.assertEqual(c("feat/x", ["fix\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"]), "claude")
+        self.assertEqual(c("feat/x", ["🤖 Generated with [Claude Code](https://claude.com/claude-code)"]), "claude")
+        self.assertEqual(c("feat/x", ["Co-authored-by: Codex <codex@openai.com>"]), "codex")
+        self.assertEqual(c("feat/x", ["plain human commit"]), "unknown")
+        # Both families present: do not guess.
+        self.assertEqual(c("feat/x", ["Co-Authored-By: Claude", "Co-authored-by: Codex"]), "unknown")
+
+    def test_default_routing_is_cross_family(self):
+        routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+        self.assertEqual(pr_watcher.reviewer_for_author(routing, "claude"), "codex")
+        self.assertEqual(pr_watcher.reviewer_for_author(routing, "codex"), "claude")
+        self.assertEqual(routing["reviewers"]["codex"]["model"], "gpt-6.2-astra")
+        self.assertEqual(routing["reviewers"]["claude"]["model"], "claude-opus-5-5")
+        self.assertFalse(routing["same_family_fallback"])
+
+    def test_model_ids_are_parameters(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            cfg.write_text(json.dumps({"review_routing": {
+                "reviewers": {"codex": {"model": "gpt-7-astra", "model_reasoning_effort": "high"},
+                              "claude": {"model": "claude-opus-6", "auth": "subscription"}},
+                "reviewer_for_author": {"unknown": "codex", "bogus": "codex"},
+            }}), encoding="utf-8")
+            routing = pr_watcher._read_review_routing_config(cfg)
+        self.assertEqual(routing["reviewers"]["codex"]["model"], "gpt-7-astra")
+        self.assertEqual(routing["reviewers"]["claude"]["model"], "claude-opus-6")
+        self.assertEqual(routing["reviewers"]["claude"]["auth"], "subscription")
+        self.assertEqual(routing["reviewer_for_author"]["unknown"], "codex")
+        self.assertNotIn("bogus", routing["reviewer_for_author"])
+        args = pr_watcher._codex_exec_args_for(routing, ["-m", "gpt-5.6-sol", "-c", 'service_tier="priority"',
+                                                         "-c", 'model_reasoning_effort="medium"'])
+        self.assertEqual(args[:2], ["-m", "gpt-7-astra"])
+        self.assertIn('service_tier="priority"', args)          # legacy key kept
+        self.assertIn('model_reasoning_effort="high"', args)     # routing key wins
+        self.assertNotIn('model_reasoning_effort="medium"', args)
+
+    def test_codex_api_mode_passes_the_key_in_env_not_argv(self):
+        routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+        routing["reviewers"]["codex"]["api_key_env"] = "TEST_PR_REVIEW_KEY"
+        with mock.patch.dict(os.environ, {"TEST_PR_REVIEW_KEY": "sk-secret-123"}):
+            args, env, provider = pr_watcher.codex_invocation(routing, [], "api")
+            sub_args, sub_env, sub_provider = pr_watcher.codex_invocation(routing, [], "subscription")
+        self.assertEqual(provider, "teamorouter-api")
+        self.assertEqual(env, {pr_watcher.CODEX_API_KEY_ENV: "sk-secret-123"})
+        self.assertNotIn("sk-secret-123", " ".join(args))
+        self.assertIn('model_providers.pr_review_api.base_url="https://api.teamorouter.com/v1"', args)
+        self.assertEqual(sub_provider, "chatgpt-subscription")
+        self.assertEqual(sub_env, {})
+        self.assertFalse(any("model_provider" in a for a in sub_args))
+
+    def test_codex_api_mode_without_any_key_is_refused(self):
+        routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+        with mock.patch.object(pr_watcher, "CLAUDE_SETTINGS_PATH", Path("/nonexistent/settings.json")):
+            with self.assertRaises(RuntimeError):
+                pr_watcher.codex_invocation(routing, [], "api")
+
+    def _codex_result(self, tmp: Path, *, last_message="", exit_code=0, cancelled=False):
+        jsonl = tmp / f"{uuid.uuid4().hex}.jsonl"
+        jsonl.write_text("", encoding="utf-8")
+        scratch = tmp / uuid.uuid4().hex
+        scratch.mkdir()
+        return pr_watcher.CodexResult(thread_id="t", last_message=last_message, exit_code=exit_code,
+                                      jsonl_path=jsonl, scratch_dir=scratch, cancelled=cancelled)
+
+    def test_subscription_failure_retries_on_the_api(self):
+        pr = _snap613()
+        routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            calls = []
+            outcomes = {"subscription": self._codex_result(tmp, exit_code=1),
+                        "api": self._codex_result(tmp, last_message=OPUS_DRAFT_PASS)}
+
+            def fake_run(prompt, pr_, *, auth="subscription"):
+                calls.append(auth)
+                return outcomes[auth]
+
+            with mock.patch.object(pr_watcher, "REVIEW_ROUTING", routing), \
+                    mock.patch.object(pr_watcher, "run_codex", fake_run):
+                result = pr_watcher.run_codex_review("p", pr)
+        self.assertEqual(calls, ["subscription", "api"])
+        self.assertEqual(result.provider, "teamorouter-api")
+
+    def test_subscription_success_or_cancel_does_not_touch_the_api(self):
+        pr = _snap613()
+        routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
+        for outcome in ("ok", "cancelled"):
+            with self.subTest(outcome), tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                calls = []
+                res = (self._codex_result(tmp, last_message=OPUS_DRAFT_PASS) if outcome == "ok"
+                       else self._codex_result(tmp, exit_code=-1, cancelled=True))
+
+                def fake_run(prompt, pr_, *, auth="subscription"):
+                    calls.append(auth)
+                    return res
+
+                with mock.patch.object(pr_watcher, "REVIEW_ROUTING", routing), \
+                        mock.patch.object(pr_watcher, "run_codex", fake_run):
+                    result = pr_watcher.run_codex_review("p", pr)
+                self.assertEqual(calls, ["subscription"])
+                self.assertEqual(result.provider, "chatgpt-subscription")
+
+    def test_codex_written_pr_goes_to_the_claude_reviewer_without_running_codex(self):
+        pr = _snap613(head_branch="codex/fix-login")
+        with tempfile.TemporaryDirectory() as td:
+            h = _ProcessPrHarness(self, Path(td), pr)
+            state = _pending_state(pr)
+            marker = "<!-- pr-review-model: claude-opus-5-5; provider: claude-subscription -->"
+            with mock.patch.object(pr_watcher, "detect_author_agent", return_value="codex"), \
+                    mock.patch.object(pr_watcher, "run_codex_review",
+                                      side_effect=AssertionError("codex must not review codex code")), \
+                    mock.patch.object(pr_watcher, "LOG_DIR", Path(td) / "logs"), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", Path(td) / "runs"):
+                h.run(state, h.codex(), fallback=pr_watcher.FallbackReview(
+                    body=OPUS_DRAFT_PASS, verdict="✅", model_marker=marker))
+            self.assertEqual(h.fallback_calls, 1)
+            self.assertEqual(len(h.posted), 1)
+            self.assertEqual(h.posted[0]["model_marker"], marker)
+            self.assertIn("**评审模型**：`claude-opus-5-5`（Claude 订阅） · 代码作者：Codex", h.posted[0]["body"])
+
+    def test_claude_written_pr_is_not_reviewed_by_claude_when_codex_fails(self):
+        pr = _snap613()  # claude/... branch; module default pins author=claude
+        with tempfile.TemporaryDirectory() as td:
+            h = _ProcessPrHarness(self, Path(td), pr)
+            state = _pending_state(pr)
+            ret = h.run(state, h.codex(exit_code=1, failed_with="usage limit reached"),
+                        fallback=pr_watcher.FallbackReview(body=OPUS_DRAFT_PASS, verdict="✅"))
+        self.assertEqual(h.fallback_calls, 0)
+        self.assertEqual(h.posted, [])
+        self.assertIn("same-family fallback off", ret)
+
+    def test_reviewer_note_names_model_auth_and_author(self):
+        note = pr_watcher.reviewer_note(
+            "<!-- pr-review-model: gpt-6.2-astra; provider: teamorouter-api -->", "claude")
+        self.assertEqual(note, "**评审模型**：`gpt-6.2-astra`（Teamorouter API） · 代码作者：Claude Code")
+        self.assertIsNone(pr_watcher.reviewer_note(None, "claude"))
