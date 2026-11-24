@@ -2,7 +2,7 @@
 
 一套围绕 **Claude Code / codex 等 AI agent 的本地软件协作工作流**，借苹果日历当"通知总线"落地。核心是三条 AI workflow：
 
-1. **PR 自动 review（pr_watcher）** — 每次 `git push` 触发 `codex` 给该 PR 做跨 org 代码评审，自动发到 PR comment，并往日历写一条带 `codex resume <id>` 的事件。
+1. **PR 自动 review（pr_watcher）** — 每次 `git push` 触发 `codex` 给该 PR 做跨 org 代码评审，自动发到 PR comment，并往日历写一条带 `codex unarchive <id> && codex resume <id>` 的事件。
 2. **一键 AI 修复（MyCalFix.app + `mycalfix://` URL scheme）** — review 给出 ⚠️/❌ 后，从日历事件直接一键起本地 `claude` 修复会话，自动 checkout / 建 worktree / 灌入 fix prompt。
 3. **AI 共著标记约定** — 所有"AI 生成、人类未介入"的 PR 评论 / commit 都带可机器识别的共著标记，便于下游 dashboard 区分 AI 与人类活跃度。
 
@@ -396,7 +396,7 @@ my-calendar = 多个互相独立的模块（节日 / PR 监控 / health / 未来
    - 失效的 `pending_review_sha` → 先查 GitHub 是否已有本 watcher 的 AI 评论；查到则推进 state 防重复，确认没有才清 pending 并重试，查询失败则保留 pending 等下轮。**watcher 自己的 pending（source=`poll` / `poll-first-seen` / `force` / `*-head-moved`）只在持 per-PR flock 的进程活着时有效**：谁拿到了 flock 就说明 owner 已退出，立即按失效处理，不等 35 分钟；只有 `/pr` 的 `current-session` claim（claim 后会放开 flock）才走 `PENDING_REVIEW_STALE_SEC` 计时
    - 上一次评审失败（`review_failed_sha == head`）→ 即使 baseline 没变也重试；同一 SHA 失败满 `MAX_REVIEW_ATTEMPTS_PER_SHA`（3）次后 tick 不再重试、通知人工，`--force` 仍可重试
 4. codex 调用：`codex exec --json --dangerously-bypass-approvals-and-sandbox -s danger-full-access --skip-git-repo-check -C /tmp/codex-pr-runs/<uuid> "<prompt>"`，用 `start_new_session=True` 起独立进程组以便 cancel 时能 `killpg` 整片
-5. 从 JSONL 第一行抓 `thread_id`（用于 `codex resume`）
+5. 从 JSONL 第一行抓 `thread_id`（用于 `codex resume`）；跑完后 `codex archive <thread_id>`，不让评审线程堆在 Codex App 任务列表里（2026-11-24 曾堆到约 1.8k 条）
 6. codex 退出后先重新 `gh pr view` 校验当前 `headRefOid`；进入 persist 锁临界区、真正写日历 / `.meta` / state 之前再复验一次；本地 artifact 写完后还会最后复验一次。如果 head 已经变了，即使没收到 cancel marker，也丢弃或回滚旧 run 的日历 / `.meta` / state 写入，标记最新 SHA 为 pending，并在同一 per-PR 串行上下文里重启 review。
 7. **codex 只起草、不发评论**：`pr_prompt.md` 要求 codex 把评论正文作为最终回复（`-o last.txt`），禁止 `gh pr comment` / 删除 / 编辑评论。由 watcher 统一发布（`publish_review_comment`）：先按"当前登录账号 + AI marker + 当前 head SHA marker"查 GitHub，已有就复用（同 SHA 只一条）；查询失败就不发（无法证明没有重复）；否则 `gh pr comment --body-file` 发一条，正文前由 `render_review_comment` 加 AI 共著标记 + head SHA 标记 + 可见的"评审 commit：`<sha8>`"行。**永不删除 / 编辑已发评论**——旧 SHA 的评论留着，靠 SHA 标记和可见行说明它只针对那个 commit（askmanyai#613 11-13 15:42：codex 先发了格式坏的评论、自己 DELETE、再撞 capacity 失败，该 SHA 最终没有评审）。
    - **同轮兜底**：codex 没给出可用草稿（非 0 退出、`turn.failed` 如 "Selected model is at capacity"、超时、正文缺结论行）→ 同一次运行里改用 `/pr` 的 Opus 评审 `~/.claude/skills/pr/scripts/review_with_opus.sh`（在 scratch 里 `git init` 的临时仓库跑，不依赖 origin_cwd；脚本必须声明 `REVIEW_PROVIDER="claude-subscription"` 且输出同值，否则拒用——**只走 Claude 订阅，不用 Teamorouter key**）。兜底期间新 commit 的 cancel marker 同样会杀掉它；兜底结束后再复验 head。评论带 `<!-- pr-review-model: claude-opus-5-5; provider: claude-subscription -->`。
@@ -528,7 +528,7 @@ git -C <repo-path> config core.hooksPath .git/hooks
 - 验证 hook 装好：`git config --global --get core.hooksPath` 应该返回 `~/.config/my-calendar/git-hooks`
 - 某个 PR 想要 re-review：直接用 `--force`；如果删 `pr_state.json` 里那条记录，安装后创建/更新或有新 head commit 的 PR 下次 tick 会当 first-seen 重新 review，静态历史 PR 会重新 seed
 - codex 单次卡死：进程会被 25min 超时杀掉，state 不会更新，下轮会重试
-- 想 resume 某次 codex session：日历事件描述里有 `codex resume <thread_id>` 命令，直接复制执行
+- 想 resume 某次 codex session：日历事件描述里有 `codex unarchive <thread_id> && codex resume <thread_id>` 命令，直接复制执行（评审线程跑完即归档，`codex resume` 不接受已归档的会话，所以要先 unarchive）
 - 模拟 push 测试 hook：`echo "refs/heads/<branch> sha refs/heads/<branch> sha" | bash ~/.config/my-calendar/git-hooks/pre-push origin <remote-url>`
 
 ### 设计取舍

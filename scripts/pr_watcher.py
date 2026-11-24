@@ -1460,6 +1460,39 @@ def _sweep_stale_running_sidecars(now_ts: float) -> None:
                 pass
 
 
+CODEX_ARCHIVE_TIMEOUT_S = 30
+
+
+def resume_command(thread_id: str) -> str:
+    """Review threads are archived after each run (see archive_codex_thread),
+    and `codex resume` refuses archived sessions, so unarchive first."""
+    return f"codex unarchive {thread_id} && codex resume {thread_id}"
+
+
+def archive_codex_thread(thread_id: str | None, env: dict[str, str]) -> None:
+    """Archive a finished review thread so it stops piling up in the Codex
+    app's task list (one per review run; ~1.8k had accumulated by 2026-11-24).
+    Subagent threads spawned by the review are archived with it. The rollout
+    is kept under ~/.codex/archived_sessions, so `resume_command` still works.
+    Best-effort: a failure here must never affect the review result."""
+    if not thread_id:
+        return
+    try:
+        proc = subprocess.run(
+            ["codex", "archive", thread_id],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=CODEX_ARCHIVE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"      warn: codex archive {thread_id} failed: {e}", flush=True)
+        return
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
+        print(f"      warn: codex archive {thread_id} exited {proc.returncode}: {err[0]}", flush=True)
+
+
 def run_codex(prompt: str, pr: PRSnap, *, auth: str = "subscription") -> CodexResult:
     """Run the Codex reviewer once. auth="subscription" uses Codex's own login
     (ChatGPT); auth="api" points it at the configured API (see codex_invocation)."""
@@ -1789,6 +1822,8 @@ def run_codex(prompt: str, pr: PRSnap, *, auth: str = "subscription") -> CodexRe
             except OSError:
                 pass
 
+    archive_codex_thread(thread_id, env)
+
     last_msg = ""
     if last_msg_path.exists():
         last_msg = last_msg_path.read_text(encoding="utf-8").strip()
@@ -1986,7 +2021,7 @@ def build_event(
         metadata.append("评论：     （未抓到 URL，请到 PR 页面查看）")
     if result.thread_id:
         metadata.append(f"session：  {result.thread_id}")
-        metadata.append(f"resume：   codex resume {result.thread_id}")
+        metadata.append(f"resume：   {resume_command(result.thread_id)}")
     else:
         metadata.append("session：  （未抓到 thread_id）")
     metadata.append(f"JSONL：    {result.jsonl_path}")
