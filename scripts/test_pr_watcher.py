@@ -5801,6 +5801,8 @@ class CrossModelRoutingTests(unittest.TestCase):
         pr = _snap613()
         routing = pr_watcher._read_review_routing_config(Path("/nonexistent/config.json"))
         self.assertEqual(pr_watcher.codex_auth_plan(routing), ["api"])
+        partial = {"reviewers": {pr_watcher.REVIEWER_CODEX: {"model": "gpt-6.2-astra"}}}
+        self.assertEqual(pr_watcher.codex_auth_plan(partial), ["api"])
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             calls = []

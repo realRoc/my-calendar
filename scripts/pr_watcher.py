@@ -437,7 +437,7 @@ def _resolve_codex_api_key(rcfg: dict) -> tuple[str | None, str]:
 
 def codex_auth_plan(routing: dict) -> list[str]:
     """Auth modes the Codex reviewer tries, in order."""
-    mode = routing["reviewers"][REVIEWER_CODEX].get("auth", "auto")
+    mode = routing["reviewers"][REVIEWER_CODEX].get("auth", "api")
     if mode == "subscription":
         return ["subscription"]
     if mode == "api":
@@ -2288,10 +2288,13 @@ def _run_cancellable(
 
 
 def run_codex_review(prompt: str, pr: PRSnap) -> CodexResult:
-    """Codex reviewer with the configured auth order: subscription, then API.
+    """Codex reviewer with the configured auth order (codex_auth_plan).
 
-    The API attempt runs only when the subscription attempt produced no usable
-    review and was not cancelled by a new commit. The superseded attempt's
+    Default "api" runs only on the API and never tries the subscription; a
+    missing API key fails the run instead of falling back. Only "auto" tries
+    the subscription first, and then the API attempt runs only when the
+    subscription attempt produced no usable review and was not cancelled by a
+    new commit. The superseded attempt's
     scratch dir is removed; its jsonl stays for forensics.
     """
     plan = codex_auth_plan(REVIEW_ROUTING)
