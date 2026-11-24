@@ -23,7 +23,7 @@
 - **跨 org** — 一次 `gh` GraphQL 调用扫所有 organization 下你发起的 open PR。
 - **只看默认分支** — base ≠ 仓库默认分支的 PR 自动剔除（feature → feature 不触发）。
 - **幂等** — 以 `(pr_url, head_sha)` 为键，同一 commit 只评论一次；force-push 重写 SHA 后才会重审。
-- **`codex` 做评审**，自动发到 PR comment；watcher 把一条事件写进独立的 **"PR 监控"** 日历，附评论链接 + `codex resume <thread_id>` 命令，需要二次交互直接接着上次会话。
+- **`codex` 做评审**，自动发到 PR comment；watcher 把一条事件写进独立的 **"PR 监控"** 日历，附评论链接 + `codex unarchive <thread_id> && codex resume <thread_id>` 命令，需要二次交互直接接着上次会话（每次评审跑完会自动归档该线程，免得堆在 Codex App 任务列表里）。
 - **进行中收到新 commit：cancel + restart** — review 进行中又来新 commit，立即取消旧 review、基于最新 SHA 重新开始，不堆队列。
 - **兜底通道** — launchd 每 10 分钟轮询一次，抓本地 hook 漏掉的事件（网页创建的 PR、异机 push、bot 提交）。
 

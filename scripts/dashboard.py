@@ -509,7 +509,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (sPrUrl) {
         links.push('<a href="' + escapeAttr(sPrUrl) + '" target="_blank" rel="noopener noreferrer">PR</a>');
       }
-      if (r.thread_id) links.push('<code>codex resume ' + escapeHtml(r.thread_id) + '</code>');
+      // Review threads are archived after each run; resume needs unarchive first.
+      if (r.thread_id) {
+        const tid = escapeHtml(r.thread_id);
+        links.push('<code>codex unarchive ' + tid + ' &amp;&amp; codex resume ' + tid + '</code>');
+      }
       const rid = reviewId(r);
       const openCls = state.expanded.has(rid) ? ' open' : '';
       return (

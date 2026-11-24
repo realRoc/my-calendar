@@ -66,6 +66,8 @@ _author_patcher = None
 
 
 _routing_patcher = None
+_archive_patcher = None
+_REAL_ARCHIVE_CODEX_THREAD = pr_watcher.archive_codex_thread
 
 
 def _legacy_routing() -> dict:
@@ -77,15 +79,20 @@ def _legacy_routing() -> dict:
 
 
 def setUpModule():
-    global _author_patcher, _routing_patcher
+    global _author_patcher, _routing_patcher, _archive_patcher
     _author_patcher = mock.patch.object(pr_watcher, "detect_author_agent", return_value="claude")
     _author_patcher.start()
     _routing_patcher = mock.patch.object(pr_watcher, "REVIEW_ROUTING", _legacy_routing())
     _routing_patcher.start()
+    # run_codex archives the review thread with the real `codex` CLI; tests
+    # that fake codex via a patched Popen would otherwise run their fake
+    # script a second time. ArchiveCodexThreadTests use the real function.
+    _archive_patcher = mock.patch.object(pr_watcher, "archive_codex_thread", lambda thread_id, env: None)
+    _archive_patcher.start()
 
 
 def tearDownModule():
-    for patcher in (_author_patcher, _routing_patcher):
+    for patcher in (_author_patcher, _routing_patcher, _archive_patcher):
         if patcher is not None:
             patcher.stop()
 
@@ -5591,6 +5598,83 @@ class OpusFallbackRunnerTests(unittest.TestCase):
             self.assertTrue(out.cancelled)
             self.assertLess(time.time() - t0, 10)
             self.assertFalse(marker.exists(), "the consumed cancel marker is removed")
+
+
+class ArchiveCodexThreadTests(unittest.TestCase):
+    """Review threads are archived after each run so they don't pile up in
+    the Codex app task list; resume then needs an unarchive first."""
+
+    def test_resume_command_unarchives_first(self):
+        self.assertEqual(
+            pr_watcher.resume_command("t-1"),
+            "codex unarchive t-1 && codex resume t-1",
+        )
+
+    def test_archives_thread_with_codex_cli(self):
+        env = {"PATH": "/x"}
+        with mock.patch.object(pr_watcher.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            _REAL_ARCHIVE_CODEX_THREAD("t-1", env)
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["codex", "archive", "t-1"])
+        self.assertIs(kwargs["env"], env)
+        self.assertEqual(kwargs["timeout"], pr_watcher.CODEX_ARCHIVE_TIMEOUT_S)
+
+    def test_no_thread_id_skips_archive(self):
+        with mock.patch.object(pr_watcher.subprocess, "run") as run:
+            _REAL_ARCHIVE_CODEX_THREAD(None, {})
+        run.assert_not_called()
+
+    def test_archive_failures_never_raise(self):
+        for side_effect in (
+            subprocess.TimeoutExpired(["codex"], 30),
+            FileNotFoundError("codex"),
+        ):
+            with mock.patch.object(pr_watcher.subprocess, "run", side_effect=side_effect):
+                _REAL_ARCHIVE_CODEX_THREAD("t-1", {})
+        with mock.patch.object(pr_watcher.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 1, "", "Error: failed to archive session")
+            _REAL_ARCHIVE_CODEX_THREAD("t-1", {})
+
+    def test_run_codex_archives_its_thread(self):
+        pr = pr_watcher.PRSnap(
+            url="https://github.com/realRoc/my-calendar/pull/102",
+            number=102, title="t", is_draft=False,
+            repo="realRoc/my-calendar", base="main", default_branch="main",
+            head_sha="abc1234", created_at="2026-05-25T00:00:00Z",
+            head_branch="feat", head_repo="realRoc/my-calendar",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "pr_logs").mkdir()
+            (tmp / "locks").mkdir()
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                "#!/bin/bash\n"
+                'echo \'{"type":"thread.started","thread_id":"t-archive"}\'\n'
+            )
+            fake_codex.chmod(0o755)
+            slot_fd = os.open(str(tmp / "slot.lock"), os.O_CREAT | os.O_WRONLY, 0o644)
+            orig_popen = pr_watcher.subprocess.Popen
+
+            def patched_popen(cmd, *args, **kwargs):
+                if cmd and cmd[0] == "codex":
+                    cmd = [str(fake_codex)] + cmd[1:]
+                return orig_popen(cmd, *args, **kwargs)
+
+            archived = []
+            with mock.patch.object(pr_watcher, "LOG_DIR", tmp / "pr_logs"), \
+                    mock.patch.object(pr_watcher, "SCRATCH_BASE", tmp / "scratch"), \
+                    mock.patch.object(pr_watcher, "LOCK_DIR", tmp / "locks"), \
+                    mock.patch.object(pr_watcher, "acquire_codex_slot", lambda **kw: (slot_fd, 1)), \
+                    mock.patch.object(pr_watcher, "_refresh_dashboard", lambda *, reason: None), \
+                    mock.patch.object(pr_watcher, "archive_codex_thread",
+                                      lambda thread_id, env: archived.append(thread_id)), \
+                    mock.patch.object(pr_watcher.subprocess, "Popen", patched_popen):
+                result = pr_watcher.run_codex("prompt-text", pr)
+
+        self.assertEqual(result.thread_id, "t-archive")
+        self.assertEqual(archived, ["t-archive"])
 
 
 if __name__ == "__main__":
