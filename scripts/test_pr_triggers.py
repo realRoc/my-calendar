@@ -98,6 +98,50 @@ class InstallGitHookTests(unittest.TestCase):
             self.assertIn("skip review trigger", log.read_text(encoding="utf-8"))
 
 
+    def test_pre_push_trigger_never_inherits_the_pushing_worktrees_git_dir(self):
+        """2026-11-25: a push from a teamo-tag worktree ran the trigger with the hook's GIT_DIR; pr_watcher's
+        `git init <tmp>` then re-initialized teamo-tag itself and set core.bare = true (all git broken)."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            main, wt = tmp / "main", tmp / "wt"
+            run = lambda *a, cwd=None: subprocess.run(list(a), cwd=str(cwd) if cwd else None, check=True,  # noqa: E731
+                                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            run("git", "init", "-q", str(main))
+            run("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x", cwd=main)
+            run("git", "worktree", "add", "-q", "-b", "feature", str(wt), cwd=main)
+            gitdir = run("git", "rev-parse", "--git-dir", cwd=wt).stdout.strip()
+
+            seen = tmp / "seen-env"
+            fake_trigger = tmp / "fake_trigger.sh"
+            # Behaves like pr_watcher's opus fallback: records its env and runs `git init <tmp dir>`.
+            _write_exe(fake_trigger, f"""#!/bin/bash
+env > {seen}
+git init -q {tmp / "fresh"} >/dev/null 2>&1
+rm -f "$2"
+""")
+            hook = tmp / "pre-push"
+            text = (ROOT / "templates" / "git-hooks" / "pre-push").read_text(encoding="utf-8")
+            _write_exe(hook, text.replace("__TRIGGER_SCRIPT__", str(fake_trigger)))
+            home = tmp / "home"
+            home.mkdir()
+            env = os.environ.copy()
+            env.update(HOME=str(home), GIT_DIR=os.path.join(str(wt), gitdir) if not os.path.isabs(gitdir) else gitdir)
+            env.pop("MY_CALENDAR_PR_SKIP_PRE_PUSH_REVIEW", None)
+            result = subprocess.run(
+                ["bash", str(hook), "origin", "git@github.com:teamo-lab/teamo-tag.git"], cwd=str(wt), env=env,
+                input="refs/heads/feature 1111111111111111111111111111111111111111 refs/heads/feature "
+                      "0000000000000000000000000000000000000000\n",
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for _ in range(50):
+                if seen.exists() and (tmp / "fresh").exists():
+                    break
+                time.sleep(0.1)
+            self.assertTrue(seen.exists(), "trigger did not run")
+            self.assertNotIn("GIT_DIR=", seen.read_text(encoding="utf-8"))
+            bare = run("git", "config", "--get", "core.bare", cwd=main).stdout.strip()
+            self.assertEqual(bare, "false")
+
 class PrCreatedTriggerTests(unittest.TestCase):
     def test_extracts_pr_url_and_forwards_origin_cwd(self):
         with tempfile.TemporaryDirectory() as td:
