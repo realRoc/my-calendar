@@ -74,8 +74,15 @@ ORIGIN_CWD="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # ── 5. Spawn detached background trigger ──
 # Subshell + & detaches the process group from the hook; redirects close all
 # inherited fds. The trigger script owns the STDIN_TMP cleanup from here.
+# git exports GIT_DIR (the pushing worktree's gitdir, e.g. <repo>/.git/worktrees/<name>) and friends to hooks.
+# The background trigger and pr_watcher must not inherit them: pr_watcher runs `git init <tmp>` for its
+# throwaway review dir, and with GIT_DIR set that re-initializes the *pushing* repository instead and flips
+# its shared .git/config to core.bare = true — every git command in the main checkout and all worktrees then
+# fails with "must be run in a work tree" (teamo-tag, 2026-11-25, three times).
 if [[ -x "$TRIGGER_SCRIPT" ]]; then
-    ( "$TRIGGER_SCRIPT" "$REMOTE_URL" "$STDIN_TMP" "$ORIGIN_CWD" \
+    ( env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX -u GIT_COMMON_DIR \
+          -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_QUARANTINE_PATH \
+          "$TRIGGER_SCRIPT" "$REMOTE_URL" "$STDIN_TMP" "$ORIGIN_CWD" \
         >>"$LOG_DIR/trigger.log" 2>&1 </dev/null &)
 else
     echo "[my-calendar pre-push] WARNING: trigger script not found at $TRIGGER_SCRIPT" >&2

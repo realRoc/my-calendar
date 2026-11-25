@@ -74,6 +74,13 @@ from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
+# A hook's repository variables must never reach the git commands this watcher runs (`git init <tmp>` for the
+# opus fallback review dir would re-initialize the *hook's* repository and set core.bare = true). The trigger
+# scripts already drop them; this covers being started any other way (2026-11-25 teamo-tag incident).
+for _git_var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_QUARANTINE_PATH"):
+    os.environ.pop(_git_var, None)
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))

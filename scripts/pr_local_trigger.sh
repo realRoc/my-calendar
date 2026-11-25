@@ -17,6 +17,11 @@
 
 set -u
 
+# Belt and braces with the pre-push template: never let a hook's GIT_DIR (the pushing worktree) leak into
+# pr_watcher, whose `git init <tmp>` would otherwise re-initialize that repository as bare.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_QUARANTINE_PATH
+
 REMOTE_URL="${1:-}"
 STDIN_FILE="${2:-}"
 ORIGIN_CWD="${3:-}"
